@@ -3490,3 +3490,53 @@ fn add_shows_no_git_progress_on_a_terminal() {
     r.assert_fails();
     assert!(r.err().contains("already exists"), "{}", r.err());
 }
+
+#[test]
+fn install_takes_root_and_a_unique_last_directory_name() {
+    let w = World::new();
+    let main = w.main();
+    w.commit(
+        &main,
+        &[
+            ("package.json", r#"{"name":"top"}"#),
+            ("package-lock.json", &lockfile("top")),
+            ("provision/lambda/package.json", r#"{"name":"lambda"}"#),
+            ("provision/lambda/package-lock.json", &lockfile("lambda")),
+            ("tools/app/package.json", r#"{"name":"app2"}"#),
+            ("tools/app/package-lock.json", &lockfile("app2")),
+        ],
+        "more projects",
+    );
+    let r = w.fw(&main, &["install", "root"]);
+    r.assert_ok();
+    assert!(r.out().contains("npm ci . ("), "{}", r.out());
+    assert!(main.join("node_modules/.package-lock.json").is_file());
+    assert!(!main.join("app/node_modules").exists(), "only the root");
+
+    let r = w.fw(&main, &["install", "lambda"]);
+    r.assert_ok();
+    assert!(r.out().contains("npm ci provision/lambda ("), "{}", r.out());
+
+    // `app` is a project's path, so it is that one, not tools/app.
+    let r = w.fw(&main, &["install", "app"]);
+    r.assert_ok();
+    assert!(!main.join("tools/app/node_modules").exists());
+
+    w.commit(
+        &main,
+        &[
+            ("other/lambda/package.json", r#"{"name":"l2"}"#),
+            ("other/lambda/package-lock.json", &lockfile("l2")),
+        ],
+        "a second lambda",
+    );
+    let r = w.fw(&main, &["install", "lambda"]);
+    r.assert_fails();
+    assert!(
+        r.err()
+            .contains("lambda matches several projects: other/lambda, provision/lambda"),
+        "{}",
+        r.err()
+    );
+    assert!(!main.join("other/lambda/node_modules").exists());
+}
