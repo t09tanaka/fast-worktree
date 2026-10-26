@@ -25,9 +25,14 @@ pub fn run(quiet: bool) -> i32 {
     let Ok(root) = git::toplevel(Path::new(".")) else {
         return 0;
     };
-    let cfg = Config::load(&root).unwrap_or_default();
-    let Ok(projects) = target::targets(&root, &cfg) else {
-        return 0;
+    // A config that cannot be read says nothing about what is listed: not
+    // detecting in its place, which would name projects it may leave out.
+    let projects = match Config::load(&root).and_then(|cfg| target::targets(&root, &cfg)) {
+        Ok(p) => p,
+        Err(e) => {
+            util::warn(&format!("fast-worktree: {e}\n"));
+            return 0;
+        }
     };
     let missing: Vec<String> = missing(&root, &projects)
         .iter()

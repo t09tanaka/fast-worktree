@@ -4623,6 +4623,15 @@ fn config_check_reports_unlisted_lockfiles_missing_files_and_mistakes() {
         "{}",
         r.err()
     );
+    // check exits 0 as always, says why, and lists nothing in place of it.
+    let r = w.fw(&main, &["check"]);
+    r.assert_ok();
+    assert_eq!(r.out(), "");
+    assert!(
+        r.err().contains("clone[0]: path `app/vendor`"),
+        "{}",
+        r.err()
+    );
 }
 
 #[test]
