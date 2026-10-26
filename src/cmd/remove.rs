@@ -8,6 +8,11 @@
 //! registered worktree inside it. Only this worktree's entry is removed
 //! from git; `git worktree prune` would also drop worktrees that are merely
 //! out of sight, such as one on a volume that is not mounted.
+//!
+//! A `.fast-worktree.toml` that cannot be read does not stop it: it says so,
+//! runs no `pre_remove` hook, keeps nothing in the cache and removes the
+//! worktree all the same (`hook remove` does the same). The checks above
+//! are not in that file and still refuse.
 
 use crate::ecosystem::{generic, target};
 use crate::error::{bail, Error, Result};
@@ -167,21 +172,22 @@ pub fn run(opts: Opts) -> Result<i32> {
         );
     }
 
-    let cfg = hooks::Config::load(&path)?;
+    let cfg = config_or_warn(&path);
     // A background install that `hook create` left still writing into it
     // would bring it back after the move.
     pending::report_stop(&pending::stop(&path, pending::STOP_GRACE));
-    let failed = hooks::run(&cfg, Stage::PreRemove, &path, &main);
-    if failed > 0 {
-        errln!("fast-worktree: {failed} pre_remove hook(s) failed; removing anyway");
+    if let Some(cfg) = &cfg {
+        let failed = hooks::run(cfg, Stage::PreRemove, &path, &main);
+        if failed > 0 {
+            errln!("fast-worktree: {failed} pre_remove hook(s) failed; removing anyway");
+        }
     }
 
     if std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
         std::env::set_current_dir(&main)?;
     }
-    reclaim(&path, &main, &cfg);
     trash::sweep();
-    let dest = match trash::trash(&path) {
+    let dest = match trash::move_aside(&path) {
         Ok(d) => d,
         Err(e) => bail!(
             "the pre_remove hooks ran, but {} could not be moved away ({e}): \
@@ -189,6 +195,11 @@ pub fn run(opts: Opts) -> Result<i32> {
             path.display()
         ),
     };
+    // Only once the worktree is surely going.
+    if let Some(cfg) = &cfg {
+        reclaim(&dest, &path, &main, cfg);
+    }
+    trash::spawn_rm(&dest);
     let registered = git::unregister(&admin);
     outln!(
         "removed {} (moved to {}, deleting in background)",
@@ -209,15 +220,32 @@ pub fn run(opts: Opts) -> Result<i32> {
     Ok(0)
 }
 
-/// Right before the worktree `root` goes: move the directories of its
-/// `[[clone]]` entries without a preset into the cache, where the next
-/// worktree with the same key clones them ([`generic::reclaim`]). Prints
-/// what it did; a failure only means they are deleted with the worktree.
-pub fn reclaim(root: &Path, main: &Path, cfg: &Config) {
+/// The worktree's `.fast-worktree.toml`, or `None`, said on stderr, when it
+/// cannot be read: then no `pre_remove` hook runs and nothing is kept in
+/// the cache, and the worktree is removed all the same.
+pub fn config_or_warn(path: &Path) -> Option<Config> {
+    match Config::load(path) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            errln!(
+                "fast-worktree: {e}; removing it without the pre_remove hooks, \
+                 and keeping nothing of it in the cache"
+            );
+            None
+        }
+    }
+}
+
+/// The worktree that was at `was` is in the trash at `at` now, about to
+/// be deleted: move the directories of its `[[clone]]` entries without a
+/// preset into the cache, where the next worktree with the same key clones
+/// them ([`generic::reclaim`]). Prints what it did; a failure only means
+/// they are deleted with the worktree.
+pub fn reclaim(at: &Path, was: &Path, main: &Path, cfg: &Config) {
     if cfg.clone.is_empty() {
         return;
     }
-    let targets = match target::targets(root, cfg) {
+    let targets = match target::targets(at, cfg) {
         Ok(t) => t,
         Err(e) => {
             outln!("note   nothing kept in the cache: {e}");
@@ -225,7 +253,7 @@ pub fn reclaim(root: &Path, main: &Path, cfg: &Config) {
         }
     };
     let cache_repo = paths::cache_root().join(paths::repo_key(main));
-    for line in generic::reclaim(root, main, &cache_repo, &targets) {
+    for line in generic::reclaim(at, was, main, &cache_repo, &targets) {
         outln!("{line}");
     }
 }

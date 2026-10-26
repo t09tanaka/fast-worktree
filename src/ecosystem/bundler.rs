@@ -11,16 +11,22 @@
 //! `.bundle/config`, else from the environment, else from
 //! `~/.bundle/config` (Bundler's own order), else `<dir>/vendor/bundle`. A
 //! relative one is relative to the project directory, as for Bundler. One
-//! outside the worktree (gems shared by every checkout) is not cloned:
-//! there `bundle check` decides, and `bundle install` runs when it fails.
+//! outside the worktree (gems shared by every checkout, or a symlink out of
+//! it), and one that holds tracked files (`BUNDLE_PATH=vendor` next to a
+//! tracked `vendor/javascript`), is not cloned and never moved away: there
+//! `bundle check` decides, and `bundle install` runs when it fails.
 //!
 //! `.bundle/config` is often ignored by git, and without it Bundler looks
 //! for the gems among the system's. So `bundle check` (after a clone) and
 //! `bundle install` run with `BUNDLE_PATH` set to the directory.
 //!
+//! `bundle check` writes `Gemfile.lock` when it lacks the current platform
+//! (or the Bundler version). Every check here is `bundle check --dry-run`,
+//! which does not.
+//!
 //! [`generic`]: super::generic
 
-use super::{generic, Ctx, Mode, Plan, Preset, Report, Target};
+use super::{generic, target, Ctx, Mode, Plan, Preset, Report, Target};
 use crate::util;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -50,29 +56,38 @@ impl Preset for Bundler {
 
     fn is_installed(&self, root: &Path, t: &Target) -> bool {
         match locate(root, t) {
-            Where::Inside(t) => root.join(&t.path).is_dir(),
-            Where::Outside(p) => p.is_dir(),
+            // A `BUNDLE_PATH` of the project's own that fast-worktree did
+            // not make (it may hold tracked files; telling needs git, and
+            // this must be cheap): there when it is a directory, as
+            // outside.
+            Where::Inside(l)
+                if l.path != t.path && !root.join(&l.path).join(generic::KEY_FILE).is_file() =>
+            {
+                root.join(&l.path).is_dir()
+            }
+            Where::Inside(l) => generic::is_installed(root, &l),
+            Where::Outside(p, _) => p.is_dir(),
         }
     }
 
     fn install(&self, ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
-        match locate(&ctx.root, t) {
+        match locate_checked(&ctx.root, t) {
             Where::Inside(t) => generic::Generic.install(ctx, &t, mode),
-            Where::Outside(p) => install_outside(ctx, t, &p, mode),
+            Where::Outside(p, why) => install_outside(ctx, t, &p, why, mode),
         }
     }
 
     fn plan(&self, ctx: &Ctx, t: &Target, mode: Mode, fresh: bool) -> Plan {
-        match locate(&ctx.root, t) {
+        match locate_checked(&ctx.root, t) {
             Where::Inside(t) => generic::Generic.plan(ctx, &t, mode, fresh),
-            Where::Outside(p) => {
+            Where::Outside(p, where_) => {
                 let why = vec![format!(
-                    "clone: the gems are in {}, outside the worktree",
+                    "clone: the gems are in {}, {where_}",
                     util::tilde(&p)
                 )];
                 let project = super::project_path(&ctx.root, &t.dir);
                 let how = t.install.as_deref().unwrap_or("bundle install");
-                if !fresh && super::succeeds(&project, "bundle check", &ctx.root, &ctx.main) {
+                if !fresh && super::succeeds(&project, CHECK, &ctx.root, &ctx.main) {
                     Plan::new("present (bundle check)", why)
                 } else if mode.clone_only() {
                     Plan::new(format!("later, in the background ({how})"), why)
@@ -84,8 +99,8 @@ impl Preset for Bundler {
     }
 
     fn rewrite_moved(&self, root: &Path, t: &Target, from: &[PathBuf]) -> usize {
-        match locate(root, t) {
-            Where::Inside(t) if t.rewrite_paths => {
+        match locate_checked(root, t) {
+            Where::Inside(t) if t.rewrite_paths && target::inside(root, &t.path).is_ok() => {
                 super::rewrite_tree(&root.join(&t.path), from, root)
             }
             _ => 0,
@@ -93,14 +108,35 @@ impl Preset for Bundler {
     }
 }
 
+/// `bundle check`, as every check here runs it: without writing
+/// `Gemfile.lock`.
+const CHECK: &str = "bundle check --dry-run";
+
 /// Where the gems of a target go.
 #[derive(Debug)]
 enum Where {
-    /// In the worktree: the target, with `path` set to the directory and
-    /// Bundler's `install` and `verify` filled in where it has none.
+    /// In the worktree, fast-worktree's to clone and move away: the target,
+    /// with `path` set to the directory and Bundler's `install` and
+    /// `verify` filled in where it has none.
     Inside(Target),
-    /// Outside the worktree.
-    Outside(PathBuf),
+    /// Not fast-worktree's: where, and why (`outside the worktree`).
+    Outside(PathBuf, &'static str),
+}
+
+const OUTSIDE: &str = "outside the worktree";
+const TRACKED: &str = "a directory that holds tracked files";
+
+/// [`locate`], and a `BUNDLE_PATH` in the worktree that holds tracked
+/// files is not fast-worktree's either: moving it away would take them.
+/// (The default `<dir>/vendor/bundle` is checked with the other targets,
+/// [`target::check_fs`].) One `git ls-files`, when `BUNDLE_PATH` is set.
+fn locate_checked(root: &Path, t: &Target) -> Where {
+    match locate(root, t) {
+        Where::Inside(l) if l.path != t.path && target::holds_tracked(root, &l.path) => {
+            Where::Outside(root.join(&l.path), TRACKED)
+        }
+        w => w,
+    }
 }
 
 /// Where the gems of `t` in the worktree `root` go ([`bundle_path`]).
@@ -135,7 +171,7 @@ fn locate_with(root: &Path, t: &Target, env: Option<&str>, global: Option<&str>)
             };
             match inside(root, &abs) {
                 Some(rel) => rel,
-                None => return Where::Outside(lexical(&abs)),
+                None => return Where::Outside(real(&abs), OUTSIDE),
             }
         }
     };
@@ -160,7 +196,7 @@ fn locate_with(root: &Path, t: &Target, env: Option<&str>, global: Option<&str>)
         // with the Gemfile of the worktree it is checked for.
         verify: t.verify.clone().or_else(|| {
             Some(format!(
-                "BUNDLE_PATH=\"$PWD\" BUNDLE_GEMFILE={gemfile} bundle check"
+                "BUNDLE_PATH=\"$PWD\" BUNDLE_GEMFILE={gemfile} {CHECK}"
             ))
         }),
         path,
@@ -212,18 +248,34 @@ fn lexical(p: &Path) -> PathBuf {
     out
 }
 
-/// `p` relative to the worktree `root`, when it is inside it and not the
-/// root itself.
-fn inside(root: &Path, p: &Path) -> Option<String> {
+/// Where `p` really is: the deepest part of it that exists, with every
+/// symlink resolved, and the rest as written.
+fn real(p: &Path) -> PathBuf {
     let p = lexical(p);
-    let rel = match p.strip_prefix(root) {
-        Ok(rel) => rel.to_path_buf(),
-        // Through a symlink, such as macOS's `/var` for `/private/var`.
-        Err(_) => {
-            let (p, root) = (p.canonicalize().ok()?, root.canonicalize().ok()?);
-            p.strip_prefix(root).ok()?.to_path_buf()
+    for base in p.ancestors() {
+        if base.symlink_metadata().is_err() {
+            continue;
         }
-    };
+        let Ok(rest) = p.strip_prefix(base) else {
+            break;
+        };
+        return match base.canonicalize() {
+            Ok(b) if rest.as_os_str().is_empty() => b,
+            Ok(b) => b.join(rest),
+            Err(_) => p.clone(),
+        };
+    }
+    p
+}
+
+/// Where `p` really is ([`real`]) relative to the real path of the
+/// worktree `root`, when that is inside it and not the root itself: a path
+/// that is in the worktree as written but goes out of it through a symlink
+/// is outside.
+fn inside(root: &Path, p: &Path) -> Option<String> {
+    let real_root = root.canonicalize().ok()?;
+    let p = real(p);
+    let rel = p.strip_prefix(&real_root).ok()?;
     let rel = rel.to_string_lossy().trim_end_matches('/').to_string();
     (!rel.is_empty()).then_some(rel)
 }
@@ -240,15 +292,22 @@ fn quote(s: &str) -> String {
     }
 }
 
-/// Gems outside the worktree: nothing to clone. Present when `bundle check`
-/// passes in the project, else `bundle install` (or the target's own).
-fn install_outside(ctx: &Ctx, t: &Target, gems: &Path, mode: Mode) -> Result<Report, String> {
+/// Gems that are not fast-worktree's ([`Where::Outside`]): nothing to
+/// clone or move away. Present when `bundle check` passes in the project,
+/// else `bundle install` (or the target's own).
+fn install_outside(
+    ctx: &Ctx,
+    t: &Target,
+    gems: &Path,
+    where_: &str,
+    mode: Mode,
+) -> Result<Report, String> {
     let start = Instant::now();
     let dir = t.dir.as_str();
     let project = super::project_path(&ctx.root, dir);
-    if super::succeeds(&project, "bundle check", &ctx.root, &ctx.main) {
+    if super::succeeds(&project, CHECK, &ctx.root, &ctx.main) {
         return Ok(Report::kept(format!(
-            "skip   {dir} (gems in {}, outside the worktree)",
+            "skip   {dir} (gems in {}, {where_})",
             util::tilde(gems)
         )));
     }
@@ -322,7 +381,7 @@ mod tests {
         );
         assert_eq!(
             got.verify.as_deref(),
-            Some("BUNDLE_PATH=\"$PWD\" BUNDLE_GEMFILE=\"$FAST_WORKTREE_PATH\"/api/Gemfile bundle check")
+            Some("BUNDLE_PATH=\"$PWD\" BUNDLE_GEMFILE=\"$FAST_WORKTREE_PATH\"/api/Gemfile bundle check --dry-run")
         );
         // The project's .bundle/config, relative to the project.
         fs::create_dir_all(root.join("api/.bundle")).unwrap();
@@ -341,7 +400,7 @@ mod tests {
         );
         // Outside the worktree: shared, not cloned.
         let outside = |t: &Target| match locate_with(&root, t, None, None) {
-            Where::Outside(p) => p,
+            Where::Outside(p, _) => p,
             Where::Inside(t) => panic!("inside: {t:?}"),
         };
         fs::write(
@@ -355,7 +414,33 @@ mod tests {
             "BUNDLE_PATH: \"/opt/gems\"\n",
         )
         .unwrap();
-        assert_eq!(outside(&api), Path::new("/opt/gems"));
+        assert_eq!(outside(&api), real(Path::new("/opt/gems")));
+        // In the worktree as written, out of it through a symlink: outside.
+        let other = tempfile::tempdir().unwrap();
+        let elsewhere = other.path().join("elsewhere");
+        fs::create_dir_all(elsewhere.join("gems")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("api/link")).unwrap();
+        fs::write(
+            root.join("api/.bundle/config"),
+            "BUNDLE_PATH: \"link/gems\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            outside(&api),
+            elsewhere.canonicalize().unwrap().join("gems")
+        );
+        // Into the worktree through one: where it really is.
+        fs::create_dir_all(root.join("api/real")).unwrap();
+        std::os::unix::fs::symlink(root.join("api/real"), root.join("api/inner")).unwrap();
+        fs::write(
+            root.join("api/.bundle/config"),
+            "BUNDLE_PATH: \"inner/gems\"\n",
+        )
+        .unwrap();
+        let Where::Inside(got) = locate_with(&root, &api, None, None) else {
+            panic!("outside");
+        };
+        assert_eq!(got.path, "api/real/gems");
         // The environment, then ~/.bundle/config, for the root project.
         let root_project = tgt(".");
         let Where::Inside(got) = locate_with(&root, &root_project, Some("gems"), None) else {

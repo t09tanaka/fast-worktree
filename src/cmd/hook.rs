@@ -20,11 +20,13 @@
 //! checked-out submodule's `HEAD`, is kept in `refs/fast-worktree/kept/`
 //! ([`kept`]). Only its own entry is removed from git. The
 //! branch `worktree-<name>` is deleted only when its commit is on another
-//! ref.
+//! ref. As with `remove`, a `.fast-worktree.toml` that cannot be read is
+//! reported, and then no `pre_remove` hook runs and nothing is kept in the
+//! cache.
 
 use super::{add, install, kept, remove};
 use crate::error::{bail, Error, Result};
-use crate::hooks::{self, Config, Stage};
+use crate::hooks::{self, Stage};
 use crate::util::{errln, outln};
 use crate::{git, pending, pool, submodules, trash, util};
 use serde_json::Value;
@@ -313,13 +315,12 @@ fn remove_worktree() -> Result<()> {
     let dirty = remove::is_dirty(&git::output(&path, &remove::STATUS_ARGS));
     let keep = dirty || has_subs || !inner.is_empty();
 
-    let cfg = Config::load(&path).unwrap_or_else(|e| {
-        errln!("fast-worktree: {e}");
-        Config::default()
-    });
-    let failed = hooks::run(&cfg, Stage::PreRemove, &path, &main);
-    if failed > 0 {
-        errln!("fast-worktree: {failed} pre_remove hook(s) failed; removing anyway");
+    let cfg = remove::config_or_warn(&path);
+    if let Some(cfg) = &cfg {
+        let failed = hooks::run(cfg, Stage::PreRemove, &path, &main);
+        if failed > 0 {
+            errln!("fast-worktree: {failed} pre_remove hook(s) failed; removing anyway");
+        }
     }
     if std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
         std::env::set_current_dir(&main)?;
@@ -356,16 +357,11 @@ fn remove_worktree() -> Result<()> {
             "{e}; the worktree is still there and still registered"
         ))
     })?;
-    // What is kept is kept whole; only a worktree that goes for good gives
-    // its build caches to the next one.
-    if !keep {
-        remove::reclaim(&path, &main, &cfg);
-    }
     trash::sweep();
     let moved = if keep {
         trash::keep(&path, KEEP_SECS)
     } else {
-        trash::trash(&path)
+        trash::move_aside(&path)
     };
     let dest = moved.map_err(|e| {
         Error(format!(
@@ -374,6 +370,14 @@ fn remove_worktree() -> Result<()> {
             path.display()
         ))
     })?;
+    // What is kept is kept whole; only a worktree that goes for good gives
+    // its build caches to the next one, once it is surely going.
+    if !keep {
+        if let Some(cfg) = &cfg {
+            remove::reclaim(&dest, &path, &main, cfg);
+        }
+        trash::spawn_rm(&dest);
+    }
     // Its lock, if the pool left one, goes with the entry.
     let unregistered = git::unregister(&admin);
     errln!(

@@ -1,8 +1,9 @@
 //! `fast-worktree check`: list projects whose dependencies are missing.
 //!
 //! Meant for a `post-checkout` hook, so it always exits 0. Plain `check`
-//! spawns nothing but `git rev-parse` and one `git ls-files`, and stays
-//! well under 100 ms.
+//! spawns nothing but `git rev-parse` and at most two `git ls-files` (the
+//! tracked lockfiles, when the projects are detected, and whether a
+//! target's `path` holds tracked files), and stays well under 100 ms.
 //!
 //! `check --post-checkout <prev> <new> <flag>` takes the hook's arguments.
 //! Right after `git worktree add` or `git clone` (`<prev>` is all zeros and
@@ -123,10 +124,15 @@ fn clone_missing() {
     let Ok(root) = git::toplevel(Path::new(".")) else {
         return;
     };
-    let cfg = Config::load(&root).unwrap_or_else(|e| {
-        util::warn(&format!("fast-worktree: {e}\n"));
-        Config::default()
-    });
+    // As in `run`: a config that cannot be read is not replaced by
+    // detection, which would clone projects it may leave out.
+    let cfg = match Config::load(&root) {
+        Ok(c) => c,
+        Err(e) => {
+            util::warn(&format!("fast-worktree: {e}\n"));
+            return;
+        }
+    };
     let projects = match target::targets(&root, &cfg) {
         Ok(p) => p,
         Err(e) => {

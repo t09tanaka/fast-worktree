@@ -27,6 +27,14 @@
 //! check` reports it). Without any, every tracked lockfile of a preset is a
 //! target with that preset's defaults ([`discover`]), as before `[[clone]]`
 //! existed.
+//!
+//! What fast-worktree moves away, clones over and rewrites must be its own
+//! and in the worktree. So [`targets`] also refuses ([`check_fs`]) a `dir`,
+//! `path` or `key` that leads out of the worktree through a symlink and a
+//! `path` that holds tracked files, and [`resolve`] a `path` that holds
+//! another target's `path` or `dir`. The presets check `path` again
+//! ([`inside`]) right before they move it away, clone into it, rewrite it
+//! or give it to the cache: a symlink can appear in between.
 
 use super::{generic, Preset};
 use crate::error::{Error, Result};
@@ -176,6 +184,23 @@ pub fn resolve(entries: &[CloneEntry]) -> std::result::Result<Vec<Target>, Vec<S
             ));
         }
     }
+    for (i, t) in &out {
+        for (j, u) in out.iter().filter(|(j, _)| j != i) {
+            if u.path != t.path && under(&u.path, &t.path) {
+                errors.push(format!(
+                    "clone[{i}]: path `{}` holds clone[{j}]'s path `{}`; \
+                     moving one away would take the other",
+                    t.path, u.path
+                ));
+            } else if u.dir != "." && under(&u.dir, &t.path) {
+                errors.push(format!(
+                    "clone[{i}]: path `{}` holds clone[{j}]'s dir `{}`; \
+                     moving it away would take that project",
+                    t.path, u.dir
+                ));
+            }
+        }
+    }
     if errors.is_empty() {
         Ok(out.into_iter().map(|(_, t)| t).collect())
     } else {
@@ -305,16 +330,151 @@ fn resolve_one(e: &CloneEntry) -> std::result::Result<Target, Vec<String>> {
     Ok(t)
 }
 
+/// Whether the relative path `p` is `dir` or below it (`.` holds
+/// everything).
+pub fn under(p: &str, dir: &str) -> bool {
+    dir == "." || p == dir || p.strip_prefix(dir).is_some_and(|r| r.starts_with('/'))
+}
+
+/// Where `rel` (relative to the worktree `root`) really is, relative to the
+/// real path of `root`: each component is looked at in turn
+/// (`symlink_metadata`), a symlink is followed, and what does not exist yet
+/// is taken as written below the deepest part that does. An error, saying
+/// why, when that leads out of the worktree or to its root.
+pub fn real_rel(root: &Path, rel: &str) -> std::result::Result<String, String> {
+    let real_root = root
+        .canonicalize()
+        .map_err(|e| format!("cannot be checked: {}: {e}", root.display()))?;
+    let mut cur = real_root.clone();
+    let mut missing = false;
+    for c in Path::new(rel).components() {
+        let name = match c {
+            Component::CurDir => continue,
+            Component::Normal(n) => n,
+            _ => return Err("must stay in the worktree".into()),
+        };
+        cur.push(name);
+        if missing {
+            continue;
+        }
+        match cur.symlink_metadata() {
+            Ok(m) if m.file_type().is_symlink() => {
+                let to = cur.canonicalize().map_err(|_| {
+                    format!(
+                        "goes through the symlink {}, which points nowhere",
+                        cur.display()
+                    )
+                })?;
+                if !to.starts_with(&real_root) {
+                    return Err(format!(
+                        "goes through the symlink {} to {}, outside the worktree",
+                        cur.display(),
+                        to.display()
+                    ));
+                }
+                cur = to;
+            }
+            Ok(_) => {}
+            Err(_) => missing = true,
+        }
+    }
+    match cur.strip_prefix(&real_root) {
+        Ok(r) if r.as_os_str().is_empty() => Err("is the worktree root".into()),
+        Ok(r) => Ok(r.to_string_lossy().into_owned()),
+        Err(_) => Err("is outside the worktree".into()),
+    }
+}
+
+/// [`real_rel`] of a target's `path`, for its preset to check right before
+/// it moves it away, clones into it, rewrites it or gives it to the cache.
+pub fn inside(root: &Path, path: &str) -> std::result::Result<(), String> {
+    real_rel(root, path)
+        .map(|_| ())
+        .map_err(|why| format!("path `{path}` {why}; not touching it"))
+}
+
+/// What is wrong with `targets` in the worktree `root` on disk, each line
+/// starting with the target's name in `names`: a `dir`, `path` or `key`
+/// that leads out of the worktree through a symlink ([`real_rel`]), and a
+/// `path` that holds tracked files (one `git ls-files`), which moving it
+/// away would take with it.
+pub fn check_fs(root: &Path, targets: &[Target], names: &[String]) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut paths: Vec<(usize, String)> = Vec::new();
+    for (i, t) in targets.iter().enumerate() {
+        let name = &names[i];
+        if t.dir != "." {
+            if let Err(why) = real_rel(root, &t.dir) {
+                errors.push(format!("{name}: dir `{}` {why}", t.dir));
+            }
+        }
+        match real_rel(root, &t.path) {
+            Ok(real) => paths.push((i, real)),
+            Err(why) => errors.push(format!("{name}: path `{}` {why}", t.path)),
+        }
+        for k in &t.key {
+            if let Err(why) = real_rel(root, k) {
+                errors.push(format!("{name}: key `{k}` {why}"));
+            }
+        }
+    }
+    if paths.is_empty() {
+        return errors;
+    }
+    let specs: Vec<String> = paths
+        .iter()
+        .map(|(_, p)| format!(":(literal){p}"))
+        .collect();
+    let spec_refs: Vec<&str> = specs.iter().map(String::as_str).collect();
+    match git::tracked(root, &spec_refs) {
+        Ok(files) => {
+            for (i, p) in &paths {
+                if let Some(f) = files.iter().find(|f| under(f, p)) {
+                    errors.push(format!(
+                        "{}: path `{}` holds tracked files ({f}), \
+                         and fast-worktree moves the whole directory away",
+                        names[*i], targets[*i].path
+                    ));
+                }
+            }
+        }
+        Err(e) => errors.push(format!("cannot list the tracked files: {e}")),
+    }
+    errors
+}
+
+/// Whether the directory `rel` of the worktree `root` holds tracked files.
+/// One that cannot be told counts as holding some.
+pub fn holds_tracked(root: &Path, rel: &str) -> bool {
+    git::tracked(root, &[&format!(":(literal){rel}")]).map_or(true, |f| !f.is_empty())
+}
+
 /// What the worktree at `root` gets: the `[[clone]]` entries of `cfg`, or,
 /// without any, the projects [`discover`] finds, but those `[[ignore]]`
-/// leaves out.
+/// leaves out. An error when one of them would have fast-worktree touch
+/// what is not its own ([`check_fs`]).
 pub fn targets(root: &Path, cfg: &Config) -> Result<Vec<Target>> {
+    let file = crate::hooks::FILE;
     if cfg.clone.is_empty() {
         let mut found = discover(root)?;
         found.retain(|t| !cfg.ignore.iter().any(|i| i.covers(t.preset.name(), &t.dir)));
+        let names: Vec<String> = found.iter().map(Target::label).collect();
+        let errors = check_fs(root, &found, &names);
+        if !errors.is_empty() {
+            return Err(Error(format!(
+                "{}; leave the project out with an [[ignore]] in {file}",
+                errors.join("; ")
+            )));
+        }
         return Ok(found);
     }
-    resolve(&cfg.clone).map_err(|e| Error(format!("{}: {}", crate::hooks::FILE, e.join("; "))))
+    let found = resolve(&cfg.clone).map_err(|e| Error(format!("{file}: {}", e.join("; "))))?;
+    let names: Vec<String> = (0..found.len()).map(|i| format!("clone[{i}]")).collect();
+    let errors = check_fs(root, &found, &names);
+    if !errors.is_empty() {
+        return Err(Error(format!("{file}: {}", errors.join("; "))));
+    }
+    Ok(found)
 }
 
 /// The tracked lockfiles of every preset, relative to `root`, from one
@@ -486,23 +646,113 @@ install = "pod install""#)
 
     #[test]
     fn listed_targets_are_all_there_is() {
-        // With [[clone]] entries nothing is detected: no git runs here.
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(root.join("web")).unwrap();
+        std::fs::write(root.join("web/package-lock.json"), "{}").unwrap();
+        git(&["add", "web/package-lock.json"]);
+        // With [[clone]] entries nothing is detected.
         let cfg = crate::hooks::parse("[[clone]]\npreset = \"npm\"\ndir = \"api\"\n")
             .unwrap()
             .0;
-        let got = targets(Path::new("/nonexistent-root"), &cfg).unwrap();
+        let got = targets(root, &cfg).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "api");
         let bad = crate::hooks::parse("[[clone]]\npreset = \"none\"\n")
             .unwrap()
             .0;
-        let e = targets(Path::new("/nonexistent-root"), &bad).unwrap_err().0;
+        let e = targets(root, &bad).unwrap_err().0;
         assert!(
             e.starts_with(".fast-worktree.toml: clone[0]: unknown preset"),
             "{e}"
         );
-        // Without any, they are detected (and git is asked).
+        // Without any, they are detected.
+        let got = targets(root, &Config::default()).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "web");
         assert!(targets(Path::new("/nonexistent-root"), &Config::default()).is_err());
+    }
+
+    #[test]
+    fn a_path_that_holds_another_targets_path_or_dir_is_refused() {
+        let entries = vec![
+            entry("preset = \"npm\"\ndir = \"app\""),
+            entry("path = \"app/node_modules/.cache/x\"\nkey = [\"k\"]"),
+            entry("path = \"vendor\"\nkey = [\"k\"]"),
+            entry("preset = \"bundler\"\ndir = \"vendor/gemsite\""),
+            entry("path = \"out/x\"\nkey = [\"k\"]\ndir = \"tools/gen\""),
+            entry("path = \"tools\"\nkey = [\"k\"]"),
+        ];
+        let e = resolve(&entries).unwrap_err();
+        assert_eq!(e.len(), 3, "{e:?}");
+        assert!(
+            e[0].starts_with(
+                "clone[0]: path `app/node_modules` holds clone[1]'s path `app/node_modules/.cache/x`"
+            ),
+            "{e:?}"
+        );
+        assert!(
+            e[1].starts_with("clone[2]: path `vendor` holds clone[3]'s path"),
+            "{e:?}"
+        );
+        assert!(
+            e[2].starts_with("clone[5]: path `tools` holds clone[4]'s dir `tools/gen`"),
+            "{e:?}"
+        );
+        // A path under another target's dir is how a project's own
+        // directories are listed.
+        let ok = vec![
+            entry("preset = \"npm\"\ndir = \"mobile\""),
+            entry("path = \"mobile/ios/Pods\"\nkey = [\"k\"]"),
+            entry("path = \"build\"\nkey = [\"k\"]"),
+        ];
+        assert!(resolve(&ok).is_ok());
+        assert!(under("a/b", "a") && under("a", "a") && under("x", "."));
+        assert!(!under("ab", "a") && !under("a", "a/b"));
+    }
+
+    #[test]
+    fn real_paths_stay_in_the_worktree() {
+        let t = tempfile::tempdir().unwrap();
+        let base = t.path().canonicalize().unwrap();
+        let root = base.join("wt");
+        std::fs::create_dir_all(root.join("ios/real")).unwrap();
+        std::fs::create_dir_all(base.join("outside/Pods")).unwrap();
+        let link = |to: &str, at: &str| std::os::unix::fs::symlink(to, root.join(at)).unwrap();
+        link("../outside", "out");
+        link("ios/real", "in");
+        link("..", "up");
+        link("nowhere", "dangling");
+        link(".", "self");
+        assert_eq!(real_rel(&root, "ios/Pods").unwrap(), "ios/Pods");
+        assert_eq!(real_rel(&root, "./ios/real/x/y").unwrap(), "ios/real/x/y");
+        assert_eq!(real_rel(&root, "in/Pods").unwrap(), "ios/real/Pods");
+        assert_eq!(real_rel(&root, "in").unwrap(), "ios/real");
+        assert_eq!(real_rel(&root, "self/ios").unwrap(), "ios");
+        for bad in ["out/Pods", "out", "up/wt/ios", "out/none/deeper"] {
+            let e = real_rel(&root, bad).unwrap_err();
+            assert!(e.contains("outside the worktree"), "{bad}: {e}");
+        }
+        assert!(real_rel(&root, "dangling/x")
+            .unwrap_err()
+            .contains("points nowhere"));
+        assert!(real_rel(&root, "self").unwrap_err().contains("root"));
+        assert!(real_rel(&root, "../wt/ios").is_err());
+        assert!(inside(&root, "out/Pods")
+            .unwrap_err()
+            .starts_with("path `out/Pods` goes through the symlink "));
+        assert!(inside(&root, "ios/Pods").is_ok());
     }
 
     #[test]

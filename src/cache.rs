@@ -103,30 +103,51 @@ pub fn store(
     clone::clone_dir(node_modules, &tmp).map_err(|e| e.to_string())?;
     let _ = fs::remove_dir_all(tmp.join(".cache"));
     touch(&tmp);
-    if fs::rename(&tmp, entry).is_ok() {
-        mark_checked(entry);
-        record_source(entry, made_in);
-    } else {
+    // The records first: an entry is never seen without them.
+    if entry.exists() {
         let _ = trash::trash(&tmp);
+        return Ok(());
+    }
+    mark_checked(entry);
+    record_source(entry, made_in);
+    if fs::rename(&tmp, entry).is_err() {
+        let _ = trash::trash(&tmp);
+        forget_records(entry);
     }
     Ok(())
+}
+
+/// Remove the records of `entry` when there is no such entry: a rename
+/// that did not happen.
+fn forget_records(entry: &Path) {
+    if !entry.exists() {
+        let _ = fs::remove_file(marker(entry));
+        let _ = fs::remove_file(source_record(entry));
+    }
 }
 
 /// Move the directory `dir` into the cache as `entry`, by rename, unless
 /// there is an entry already. `made_in` is the worktree it comes from. An
 /// error when it cannot be renamed there (another volume), in which case it
 /// stays where it is.
+///
+/// Everything is done to it before the rename (the records next to the
+/// entry, its `.cache` removed, its time of last use), so that another
+/// process that finds the entry finds it complete.
 pub fn adopt(dir: &Path, entry: &Path, made_in: &Path) -> Result<bool, String> {
     if entry.exists() {
         return Ok(false);
     }
     let parent = entry.parent().ok_or("no parent")?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    fs::rename(dir, entry).map_err(|e| e.to_string())?;
-    let _ = fs::remove_dir_all(entry.join(".cache"));
-    touch(entry);
+    let _ = fs::remove_dir_all(dir.join(".cache"));
     mark_checked(entry);
     record_source(entry, made_in);
+    touch(dir);
+    if let Err(e) = fs::rename(dir, entry) {
+        forget_records(entry);
+        return Err(e.to_string());
+    }
     Ok(true)
 }
 
@@ -490,6 +511,57 @@ mod tests {
         fs::create_dir_all(wt.join("Pods")).unwrap();
         assert_eq!(adopt(&wt.join("Pods"), &entry, &wt), Ok(false));
         assert!(wt.join("Pods").is_dir(), "left where it is");
+        // A rename that fails leaves no records behind.
+        let other = t.path().join("c/repo/Pods/fedcba9876543210-01234567");
+        assert!(adopt(&wt.join("none"), &other, &wt).is_err());
+        assert!(!marker(&other).exists() && source(&other).is_none());
+    }
+
+    #[test]
+    fn an_adopted_entry_is_never_seen_without_its_records() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let t = tempfile::tempdir().unwrap();
+        let entries: Vec<PathBuf> = (0..5)
+            .map(|i| {
+                t.path()
+                    .join(format!("c/repo/Pods/012345678{i}abcdef-01234567"))
+            })
+            .collect();
+        let done = Arc::new(AtomicBool::new(false));
+        let seen_bare = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (entries, done, seen_bare) = (entries.clone(), done.clone(), seen_bare.clone());
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    // Records read after the entry is seen: they must be
+                    // there already.
+                    for entry in &entries {
+                        if entry.is_dir() && (source(entry).is_none() || !is_checked(entry)) {
+                            seen_bare.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+        };
+        for (round, entry) in entries.iter().enumerate() {
+            let wt = t.path().join(format!("wt{round}"));
+            // A large `.cache`, so that whatever happens after the rename
+            // takes long enough to be seen.
+            fs::create_dir_all(wt.join("Pods/.cache")).unwrap();
+            for i in 0..1500 {
+                fs::write(wt.join(format!("Pods/.cache/{i}")), "x").unwrap();
+            }
+            assert_eq!(adopt(&wt.join("Pods"), entry, &wt), Ok(true));
+            assert_eq!(source(entry), Some(wt.clone()));
+            assert!(!entry.join(".cache").exists());
+        }
+        done.store(true, Ordering::Relaxed);
+        watcher.join().unwrap();
+        assert!(
+            !seen_bare.load(Ordering::Relaxed),
+            "an entry was there without its records"
+        );
     }
 
     #[test]

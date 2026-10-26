@@ -1,8 +1,12 @@
 //! `fast-worktree plan [<path>]`: for each target, where its files would
 //! come from (a cache entry, another worktree, an incremental install, an
-//! install) and why the sources before that one are not used. It changes
-//! nothing: it reads files and runs only the `key_commands` (`node -v` for
-//! npm) and `verify` commands, which look and do not write.
+//! install) and why the sources before that one are not used. It moves,
+//! clones and installs nothing, but it runs the `key_commands` (`node -v`
+//! for npm) and `verify`, here and in another worktree whose `path` has no
+//! record of its key. Those are the repository's own shell commands, as
+//! `install` and `after` are (which the `post-checkout` hook runs too),
+//! trusted as the `post_add` hooks are. `verify` never runs in a cache
+//! entry: a clone is checked once it is made, which `plan` says.
 //!
 //! With `<path>`, for that worktree as it is: what `install` would do
 //! there. Without, for a new worktree with the files of the current one:

@@ -3,12 +3,17 @@
 //!
 //! `init` adds a `[[clone]]` for each tracked lockfile that a preset knows
 //! and that has none yet, nor an `[[ignore]]`, keeping what the file says
-//! (comments included). `check` is for a pre-commit hook or CI: one `git
-//! ls-files` and a look at which files exist, then exit 1 when a tracked
-//! lockfile is in no `[[clone]]` and no `[[ignore]]`, a `[[clone]]` names a
-//! file that is not there, an `[[ignore]]` names a directory without a
-//! tracked lockfile, or the file has a mistake in it. Without any
-//! `[[clone]]` (targets are detected) it does nothing and exits 0.
+//! (comments included). An entry that does not resolve stops it, so that
+//! it never adds a second one for the same project. `check` is for a
+//! pre-commit hook or CI: a few `git ls-files` and a look at which files
+//! exist, then exit 1 when the file has a mistake in it (it does not parse,
+//! an unknown key or section, an unknown preset, a `path` that does not fit
+//! its preset, holds tracked files or another target, or leaves the
+//! worktree through a symlink), a tracked lockfile is in no `[[clone]]` and
+//! no `[[ignore]]`, a `[[clone]]` names a file that is not there or not
+//! tracked, or an `[[ignore]]` names a directory without a tracked
+//! lockfile. Without any `[[clone]]` (targets are detected) the lockfiles
+//! are not compared, but the rest is checked.
 
 use crate::ecosystem::target::{self, join, Target};
 use crate::error::{bail, Error, Result};
@@ -47,6 +52,14 @@ pub fn init(dry_run: bool) -> Result<i32> {
     let path = root.join(FILE);
     let text = read(&path)?;
     let (cfg, _) = hooks::parse(&text).map_err(|e| Error(format!("{FILE}: {e}")))?;
+    // An entry that does not resolve names no project: one for its
+    // project would be added next to it.
+    if let Err(errors) = target::resolve(&cfg.clone) {
+        bail!(
+            "{FILE}: {}; nothing was added (fix it first: `fast-worktree config check` lists every problem)",
+            errors.join("; ")
+        );
+    }
     let had_clone = !cfg.clone.is_empty();
     let listed = listed(&cfg);
     let missing: Vec<(&'static str, String)> = target::tracked_lockfiles(&root)?
@@ -117,6 +130,9 @@ pub enum Problem {
     Unlisted { lockfile: String, preset: String },
     /// A file a `[[clone]]` needs that is not there.
     Missing { entry: usize, file: String },
+    /// A `key` file that git does not track: a new worktree has another
+    /// one, or none.
+    Untracked { entry: usize, file: String },
     /// An `[[ignore]]` whose directory has no tracked lockfile (of its
     /// preset, when it names one).
     IgnoredMissing { entry: usize, what: String },
@@ -134,6 +150,11 @@ impl std::fmt::Display for Problem {
             Problem::Missing { entry, file } => {
                 write!(f, "missing    clone[{entry}]: {file} does not exist")
             }
+            Problem::Untracked { entry, file } => write!(
+                f,
+                "untracked  clone[{entry}]: {file} is not tracked by git, so another worktree \
+                 has its own or none"
+            ),
             Problem::IgnoredMissing { entry, what } => {
                 write!(f, "missing    ignore[{entry}]: no tracked {what}")
             }
@@ -141,27 +162,51 @@ impl std::fmt::Display for Problem {
     }
 }
 
-/// What is wrong with the config `text` of the worktree `root`, given its
-/// tracked lockfiles (`(preset name, dir)`) and whether a file exists.
-/// `None` when it has no `[[clone]]`: there is nothing to check.
-pub fn problems(
-    text: &str,
-    tracked: &[(&str, String)],
-    exists: impl Fn(&str) -> bool,
-) -> Option<Vec<Problem>> {
+/// What [`target::check_fs`] finds wrong with targets, named so.
+pub type FsCheck<'a> = &'a dyn Fn(&[Target], &[String]) -> Vec<String>;
+
+/// What `problems` asks of the worktree.
+pub struct Disk<'a> {
+    /// Whether a file exists.
+    pub exists: &'a dyn Fn(&str) -> bool,
+    /// Which of these files git tracks.
+    pub tracked: &'a dyn Fn(&[String]) -> Vec<String>,
+    /// What [`target::check_fs`] finds wrong with these targets, named so.
+    pub fs: FsCheck<'a>,
+}
+
+/// What is wrong with the config `text` of a worktree, given its tracked
+/// lockfiles (`(preset name, dir)`) and what `disk` says. `None` when
+/// there is nothing to check: no `[[clone]]`, and nothing wrong with the
+/// rest.
+pub fn problems(text: &str, tracked: &[(&str, String)], disk: &Disk) -> Option<Vec<Problem>> {
     let (cfg, warnings) = match hooks::parse(text) {
         Ok(p) => p,
         Err(e) => return Some(vec![Problem::Invalid(e)]),
     };
-    if cfg.clone.is_empty() {
-        return None;
-    }
     let mut out: Vec<Problem> = warnings
         .into_iter()
         .map(|w| Problem::Invalid(w.trim_end_matches(", ignored").to_string()))
         .collect();
-    if let Err(errors) = target::resolve(&cfg.clone) {
-        out.extend(errors.into_iter().map(Problem::Invalid));
+    if cfg.clone.is_empty() {
+        // Detected: what install would refuse, and [[ignore]] entries.
+        let found: Vec<Target> = tracked
+            .iter()
+            .filter(|(p, d)| !cfg.ignore.iter().any(|i| i.covers(p, d)))
+            .filter_map(|(p, d)| crate::ecosystem::preset(p).map(|p| Target::with_defaults(p, d)))
+            .filter(|t| (disk.exists)(&join(&t.dir, t.preset.manifest())))
+            .collect();
+        let names: Vec<String> = found.iter().map(Target::label).collect();
+        out.extend((disk.fs)(&found, &names).into_iter().map(Problem::Invalid));
+        out.extend(ignored_missing(&cfg, tracked));
+        return (!out.is_empty()).then_some(out);
+    }
+    match target::resolve(&cfg.clone) {
+        Err(errors) => out.extend(errors.into_iter().map(Problem::Invalid)),
+        Ok(found) => {
+            let names: Vec<String> = (0..found.len()).map(|i| format!("clone[{i}]")).collect();
+            out.extend((disk.fs)(&found, &names).into_iter().map(Problem::Invalid));
+        }
     }
     let listed = listed(&cfg);
     for (i, ig) in cfg.ignore.iter().enumerate() {
@@ -184,6 +229,7 @@ pub fn problems(
             });
         }
     }
+    let mut needed: Vec<(usize, String)> = Vec::new();
     for (i, e) in cfg.clone.iter().enumerate() {
         let Ok(t) = target::resolve_entry(i, e) else {
             continue;
@@ -195,10 +241,29 @@ pub fn problems(
                 files.insert(0, lockfile);
             }
         }
-        for f in files.into_iter().filter(|f| !exists(f)) {
+        needed.extend(files.into_iter().map(|f| (i, f)));
+    }
+    let present: Vec<String> = needed
+        .iter()
+        .filter(|(_, f)| (disk.exists)(f))
+        .map(|(_, f)| f.clone())
+        .collect();
+    let in_git = (disk.tracked)(&present);
+    for (i, f) in needed {
+        if !(disk.exists)(&f) {
             out.push(Problem::Missing { entry: i, file: f });
+        } else if !in_git.contains(&f) {
+            out.push(Problem::Untracked { entry: i, file: f });
         }
     }
+    out.extend(ignored_missing(&cfg, tracked));
+    Some(out)
+}
+
+/// The `[[ignore]]` entries whose directory has no tracked lockfile (of
+/// their preset).
+fn ignored_missing(cfg: &hooks::Config, tracked: &[(&str, String)]) -> Vec<Problem> {
+    let mut out = Vec::new();
     for (i, ig) in cfg.ignore.iter().enumerate() {
         if !tracked.iter().any(|(p, d)| ig.covers(p, d)) {
             let dir = target::normalize(&ig.dir);
@@ -209,28 +274,53 @@ pub fn problems(
             out.push(Problem::IgnoredMissing { entry: i, what });
         }
     }
-    Some(out)
+    out
 }
 
 /// `config check`.
 pub fn check() -> Result<i32> {
     let root = root_here()?;
     let text = read(&root.join(FILE))?;
-    // Without a [[clone]] there is nothing to compare: not even git runs.
-    if !text.contains("clone") {
+    // No file: nothing to check, not even git runs.
+    if text.trim().is_empty() {
         return Ok(0);
     }
     let tracked: Vec<(&str, String)> = target::tracked_lockfiles(&root)?
         .into_iter()
         .map(|(p, d)| (p.name(), d))
         .collect();
-    let Some(found) = problems(&text, &tracked, |f| root.join(f).is_file()) else {
+    let exists = |f: &str| root.join(f).is_file();
+    // One `git ls-files`, by where each file really is (a file through a
+    // symlink is one `check_fs` reports).
+    let in_git = |files: &[String]| -> Vec<String> {
+        let real: Vec<(String, String)> = files
+            .iter()
+            .filter_map(|f| target::real_rel(&root, f).ok().map(|r| (f.clone(), r)))
+            .collect();
+        if real.is_empty() {
+            return Vec::new();
+        }
+        let specs: Vec<String> = real.iter().map(|(_, r)| format!(":(literal){r}")).collect();
+        let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        let listed = git::tracked(&root, &refs).unwrap_or_default();
+        real.into_iter()
+            .filter(|(_, r)| listed.contains(r))
+            .map(|(f, _)| f)
+            .collect()
+    };
+    let fs_check = |t: &[Target], names: &[String]| target::check_fs(&root, t, names);
+    let disk = Disk {
+        exists: &exists,
+        tracked: &in_git,
+        fs: &fs_check,
+    };
+    let Some(found) = problems(&text, &tracked, &disk) else {
         return Ok(0);
     };
     if found.is_empty() {
         outln!(
             "config ok: every tracked lockfile is in a [[clone]] or an [[ignore]], \
-             and every file they name exists"
+             and every file they name is tracked"
         );
         return Ok(0);
     }
@@ -257,11 +347,34 @@ mod tests {
         v.iter().map(|(p, d)| (*p, d.to_string())).collect()
     }
 
+    /// Every file exists and is tracked, and nothing is wrong on disk,
+    /// unless `exists` says otherwise.
+    fn problems_with(
+        text: &str,
+        t: &[(&str, String)],
+        exists: impl Fn(&str) -> bool,
+    ) -> Option<Vec<Problem>> {
+        let all = |f: &[String]| f.to_vec();
+        let none = |_: &[Target], _: &[String]| Vec::new();
+        problems(
+            text,
+            t,
+            &Disk {
+                exists: &exists,
+                tracked: &all,
+                fs: &none,
+            },
+        )
+    }
+
     #[test]
     fn nothing_to_check_without_a_clone() {
-        assert_eq!(problems("", &tracked(&[("npm", "api")]), |_| true), None);
         assert_eq!(
-            problems("[[post_add]]\nrun = \"x\"\n", &tracked(&[]), |_| true),
+            problems_with("", &tracked(&[("npm", "api")]), |_| true),
+            None
+        );
+        assert_eq!(
+            problems_with("[[post_add]]\nrun = \"x\"\n", &tracked(&[]), |_| true),
             None
         );
     }
@@ -293,7 +406,7 @@ path = "app/.dart_tool"
             ("npm", "lambda"),
             ("dart", "mobile"),
         ]);
-        let got = problems(text, &t, |f| {
+        let got = problems_with(text, &t, |f| {
             f != "ios/Podfile.lock" && f != "web/package-lock.json"
         })
         .unwrap();
@@ -318,14 +431,14 @@ path = "app/.dart_tool"
     fn a_clean_config_and_one_that_does_not_parse() {
         let text = "[[clone]]\npreset = \"npm\"\ndir = \"api\"\n";
         assert_eq!(
-            problems(text, &tracked(&[("npm", "api")]), |_| true),
+            problems_with(text, &tracked(&[("npm", "api")]), |_| true),
             Some(vec![])
         );
-        let bad = problems("[[clone]\n", &tracked(&[]), |_| true).unwrap();
+        let bad = problems_with("[[clone]\n", &tracked(&[]), |_| true).unwrap();
         assert!(matches!(&bad[..], [Problem::Invalid(_)]), "{bad:?}");
         // A key that replaces the lockfile does not make the lockfile optional.
         let text = "[[clone]]\npreset = \"npm\"\ndir = \"api\"\nkey = [\"api/.npmrc\"]\n";
-        let got = problems(text, &tracked(&[("npm", "api")]), |f| f == "api/.npmrc").unwrap();
+        let got = problems_with(text, &tracked(&[("npm", "api")]), |f| f == "api/.npmrc").unwrap();
         assert_eq!(
             got,
             vec![Problem::Missing {
@@ -371,7 +484,7 @@ reason = "listed too"
             ("npm", "web"),
             ("bundler", "web"),
         ]);
-        let shown: Vec<String> = problems(text, &t, |_| true)
+        let shown: Vec<String> = problems_with(text, &t, |_| true)
             .unwrap()
             .iter()
             .map(|p| p.to_string())
@@ -385,6 +498,80 @@ reason = "listed too"
                 "missing    ignore[2]: no tracked lockfile in gone",
                 "missing    ignore[3]: no tracked web/pubspec.lock",
             ]
+        );
+    }
+
+    #[test]
+    fn mistakes_outside_clone_and_untracked_key_files() {
+        let t = tracked(&[("npm", "api"), ("npm", "web")]);
+        let shown = |text: &str| -> Vec<String> {
+            problems_with(text, &t, |_| true)
+                .unwrap_or_default()
+                .iter()
+                .map(|p| p.to_string())
+                .collect()
+        };
+        // A misspelled section is no [[clone]], and is a mistake.
+        assert_eq!(
+            shown("[[clones]]\npreset = \"npm\"\ndir = \"api\"\n"),
+            vec!["invalid    unknown key `clones`"]
+        );
+        assert_eq!(
+            shown("[[Clone]]\npreset = \"npm\"\ndir = \"api\"\n"),
+            vec!["invalid    unknown key `Clone`"]
+        );
+        let e = shown("[[ignore]]\ndir = \"web\"\n");
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].starts_with("invalid    ignore[0]: `reason` is required"),
+            "{e:?}"
+        );
+        let e = shown("[pool]\nsize = \"two\"\n");
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].starts_with("invalid    "), "{e:?}");
+        // Without [[clone]], a clean file has nothing to say.
+        assert_eq!(problems_with("[pool]\nsize = 1\n", &t, |_| true), None);
+        // What install would refuse, also when detected.
+        let refused = |_: &[Target], names: &[String]| {
+            names.iter().map(|n| format!("{n}: path refused")).collect()
+        };
+        let all = |f: &[String]| f.to_vec();
+        let yes = |_: &str| true;
+        let disk = Disk {
+            exists: &yes,
+            tracked: &all,
+            fs: &refused,
+        };
+        let got: Vec<String> = problems("[pool]\nsize = 1\n", &t, &disk)
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "invalid    api (npm): path refused",
+                "invalid    web (npm): path refused"
+            ]
+        );
+        // A key file that exists here but is not tracked.
+        let text = "[[clone]]\npreset = \"npm\"\ndir = \"api\"\n[[clone]]\npreset = \"npm\"\n\
+                    dir = \"web\"\nkey = [\"web/package-lock.json\", \"web/.npmrc\"]\n";
+        let only_locks = |f: &[String]| -> Vec<String> {
+            f.iter().filter(|f| f.ends_with(".json")).cloned().collect()
+        };
+        let none = |_: &[Target], _: &[String]| Vec::new();
+        let disk = Disk {
+            exists: &yes,
+            tracked: &only_locks,
+            fs: &none,
+        };
+        assert_eq!(
+            problems(text, &t, &disk).unwrap(),
+            vec![Problem::Untracked {
+                entry: 1,
+                file: "web/.npmrc".into()
+            }]
         );
     }
 

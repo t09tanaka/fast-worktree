@@ -6,8 +6,10 @@
 //!
 //! 1. **Cache.** `<cache>/<repo>/<path>/<key>` holds the directory from an
 //!    earlier install, or from a worktree that `remove` deleted ([`reclaim`]).
-//! 2. **Another worktree** whose `key` files are byte-identical, whose
-//!    `key_commands` print the same there, and where `verify` passes.
+//! 2. **Another worktree** whose `path` was made from the same key (its
+//!    recorded key is ours), or, without a record, whose `key` files are
+//!    byte-identical, whose `key_commands` print the same there and where
+//!    `verify` passes.
 //! 3. `install`, run in `dir`. Its result is stored in the cache.
 //!
 //! A clone is one `clonefile(2)` call (macOS only; elsewhere only `install`
@@ -16,14 +18,22 @@
 //! was made in is replaced with this one in its text files; then the
 //! `after` commands run. The key is `<16 hex digits of the key files>-<8
 //! hex digits of the key commands' output>`, and is written to
-//! `<path>/.fast-worktree-key`, so that `install --changed` and `remove`
-//! can tell what the directory was made from.
+//! `<path>/.fast-worktree-key` once all of that succeeded, so that
+//! `install`, `check` and `remove` can tell what the directory was made
+//! from. What fails on the way (the install, `verify`, an `after`) moves
+//! `path` away: a directory without that record is not taken as installed,
+//! lent to another worktree or kept in the cache, unless `verify` vouches
+//! for it.
+//!
+//! `verify` runs in a copy of this worktree's own: after a clone, after an
+//! install, and in a `path` without a record. It never runs in a cache
+//! entry, nor in another worktree whose recorded key is ours.
 //!
 //! Unlike `node_modules`, the directory is not checked for symlinks with an
 //! absolute target: one that points into the worktree it was made in
 //! points there in a clone too. `rewrite_paths` leaves symlinks alone.
 
-use super::{Ctx, Mode, Plan, Preset, Report, Target};
+use super::{target, Ctx, Mode, Plan, Preset, Report, Target};
 use crate::paths::project_slug;
 use crate::{cache, clone, trash, util};
 use std::fs;
@@ -49,7 +59,7 @@ impl Preset for Generic {
     }
 
     fn is_installed(&self, root: &Path, t: &Target) -> bool {
-        root.join(&t.path).is_dir()
+        is_installed(root, t)
     }
 
     fn install(&self, ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
@@ -59,6 +69,23 @@ impl Preset for Generic {
     fn plan(&self, ctx: &Ctx, t: &Target, mode: Mode, fresh: bool) -> Plan {
         plan(ctx, t, mode, fresh)
     }
+}
+
+/// Whether `path` is there, in the worktree, and made from the key files
+/// as they are now: its recorded key starts with their digest. Cheap, so
+/// the `key_commands` are not run and `verify` is not either: a directory
+/// without a record is not installed until `install` has seen `verify`
+/// pass in it.
+pub fn is_installed(root: &Path, t: &Target) -> bool {
+    let path = root.join(&t.path);
+    if target::inside(root, &t.path).is_err() || !path.is_dir() {
+        return false;
+    }
+    let Some(k) = recorded(&path) else {
+        return false;
+    };
+    super::key_digest(root, &t.key)
+        .is_ok_and(|d| k.split('-').next() == Some(super::short(&d, 16).as_str()))
 }
 
 /// The key of `t` in the worktree `root`.
@@ -96,12 +123,58 @@ fn write_key(dir: &Path, key: &str) {
     let _ = fs::write(dir.join(KEY_FILE), format!("{key}\n"));
 }
 
-/// Why the worktree `w` cannot lend its `path`, or `None` when it can.
-fn not_a_donor(ctx: &Ctx, t: &Target, w: &Path, ours: &[String]) -> Option<String> {
+/// Move `path` away, when there is something there.
+fn discard(path: &Path) {
+    if path.symlink_metadata().is_ok() {
+        let _ = trash::trash(path);
+    }
+}
+
+/// What the `path` already in this worktree is to an install with `key`.
+enum Standing {
+    /// Made from `key`.
+    Current,
+    /// Without a record, and `verify` passes in it: it is taken as made
+    /// from `key`, and recorded so.
+    Verified,
+    /// To be made again, and why.
+    Stale(String),
+}
+
+fn standing(ctx: &Ctx, t: &Target, path: &Path, key: &str) -> Standing {
+    match recorded(path) {
+        Some(k) if k == key => Standing::Current,
+        Some(_) => Standing::Stale("its key changed".into()),
+        None => match &t.verify {
+            Some(v) if super::succeeds(path, v, &ctx.root, &ctx.main) => Standing::Verified,
+            Some(_) => Standing::Stale("no record of its key, and verify fails".into()),
+            None => Standing::Stale("no record of its key".into()),
+        },
+    }
+}
+
+/// Why the worktree `w` cannot lend its `path` to a worktree whose key is
+/// `key`, or `None` when it can: its recorded key is `key`, or, without a
+/// record, its key files and `key_commands` agree and `verify` passes.
+/// Nothing runs there when it has a record.
+fn not_a_donor(ctx: &Ctx, t: &Target, w: &Path, ours: &[String], key: &str) -> Option<String> {
     let name = util::tilde(w);
+    if let Err(why) = target::real_rel(w, &t.path) {
+        return Some(format!("worktree {name}: {} {why}", t.path));
+    }
     let p = w.join(&t.path);
     if !p.is_dir() {
         return Some(format!("worktree {name}: no {}", t.path));
+    }
+    match recorded(&p) {
+        Some(k) if k == key => return None,
+        Some(_) => {
+            return Some(format!(
+                "worktree {name}: its {} was made from other key files or tools",
+                t.path
+            ))
+        }
+        None => {}
     }
     if let Err(k) = super::same_key_files(w, &ctx.root, &t.key) {
         return Some(format!("worktree {name}: {k} differs"));
@@ -111,24 +184,21 @@ fn not_a_donor(ctx: &Ctx, t: &Target, w: &Path, ours: &[String]) -> Option<Strin
             "worktree {name}: key_commands print something else there"
         ));
     }
-    if let Some(v) = &t.verify {
-        if !super::succeeds(&p, v, w, &ctx.main) {
-            return Some(format!("worktree {name}: verify failed there"));
-        }
+    match &t.verify {
+        Some(v) if super::succeeds(&p, v, w, &ctx.main) => None,
+        Some(_) => Some(format!("worktree {name}: verify failed there")),
+        None => Some(format!(
+            "worktree {name}: no record of what its {} was made from, and no verify",
+            t.path
+        )),
     }
-    None
 }
 
-/// Clone `src` (made in the worktree `made_in`) to `path`, then `verify`,
-/// `rewrite_paths`, the key and `after`. On error nothing is left at
-/// `path`.
-fn clone_in(
-    ctx: &Ctx,
-    t: &Target,
-    src: &Path,
-    made_in: Option<PathBuf>,
-    key: &str,
-) -> Result<(), String> {
+/// Clone `src` (made in the worktree `made_in`) to `path`, then `verify`
+/// and `rewrite_paths`. On error nothing is left at `path`. The key is not
+/// written: [`finish`] does, after `after`.
+fn clone_in(ctx: &Ctx, t: &Target, src: &Path, made_in: Option<PathBuf>) -> Result<(), String> {
+    target::inside(&ctx.root, &t.path)?;
     let path = ctx.root.join(&t.path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -137,60 +207,72 @@ fn clone_in(
     let _ = fs::remove_dir_all(path.join(".cache"));
     if let Some(v) = &t.verify {
         if !super::succeeds(&path, v, &ctx.root, &ctx.main) {
-            let _ = trash::trash(&path);
+            discard(&path);
             return Err("verify failed after the clone".into());
         }
     }
     if let (true, Some(from)) = (t.rewrite_paths, made_in) {
+        if let Err(e) = target::inside(&ctx.root, &t.path) {
+            discard(&path);
+            return Err(e);
+        }
         super::rewrite_tree(&path, &[from], &ctx.root);
     }
-    write_key(&path, key);
     Ok(())
 }
 
-fn run_after(ctx: &Ctx, t: &Target) -> Result<(), String> {
+/// The `after` commands, then the key: `path` is complete. When an `after`
+/// fails, `path` is moved away.
+fn finish(ctx: &Ctx, t: &Target, path: &Path, key: &str) -> Result<(), String> {
     let cwd = super::project_path(&ctx.root, &t.dir);
     for a in &t.after {
-        super::run_quietly(&cwd, a, &ctx.root, &ctx.main)?;
+        if let Err(e) = super::run_quietly(&cwd, a, &ctx.root, &ctx.main) {
+            discard(path);
+            return Err(e);
+        }
     }
+    target::inside(&ctx.root, &t.path)?;
+    write_key(path, key);
     Ok(())
 }
 
 fn install(ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
     let start = Instant::now();
     let name = t.name.as_str();
+    target::inside(&ctx.root, &t.path)?;
     let path = ctx.root.join(&t.path);
     let mut lines = Vec::new();
-    let present = path.symlink_metadata().is_ok();
-    if present && !mode.reinstalls_changed() {
-        return Ok(Report::kept(format!("skip   {name} (already present)")));
-    }
     let key = key(&ctx.root, &ctx.main, t)?;
-    if present {
-        match recorded(&path) {
-            Some(k) if k == key => {
-                return Ok(Report::kept(format!("skip   {name} (up to date)")));
+    if path.symlink_metadata().is_ok() {
+        let up_to_date = if mode.reinstalls_changed() {
+            "up to date"
+        } else {
+            "already present"
+        };
+        match standing(ctx, t, &path, &key) {
+            Standing::Current => {
+                return Ok(Report::kept(format!("skip   {name} ({up_to_date})")));
             }
-            // Not made by fast-worktree: kept while it passes `verify`.
-            None if t
-                .verify
-                .as_ref()
-                .is_none_or(|v| super::succeeds(&path, v, &ctx.root, &ctx.main)) =>
-            {
-                return Ok(Report::kept(format!("skip   {name} (already present)")));
+            Standing::Verified => {
+                write_key(&path, &key);
+                return Ok(Report::kept(format!(
+                    "skip   {name} ({up_to_date}, verify passes)"
+                )));
             }
-            _ => {}
+            Standing::Stale(why) => {
+                target::inside(&ctx.root, &t.path)?;
+                trash::trash(&path).map_err(|e| format!("cannot move {} away: {e}", t.path))?;
+                lines.push(format!("note   {name}: {why}, making it again"));
+            }
         }
-        trash::trash(&path).map_err(|e| format!("cannot move {} away: {e}", t.path))?;
-        lines.push(format!("note   {name}: its key changed, making it again"));
     }
     let entry = entry(&ctx.cache_repo, t, &key);
     if clone::SUPPORTED {
         if entry.is_dir() {
             cache::touch(&entry);
-            match clone_in(ctx, t, &entry, cache::source(&entry), &key) {
+            match clone_in(ctx, t, &entry, cache::source(&entry)) {
                 Ok(()) => {
-                    run_after(ctx, t)?;
+                    finish(ctx, t, &path, &key)?;
                     lines.push(format!(
                         "clone  {name} from {} ({})",
                         util::tilde(&entry),
@@ -203,13 +285,13 @@ fn install(ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
         }
         let ours = outputs(&ctx.root, &ctx.main, t)?;
         for w in ctx.worktrees.iter().filter(|w| **w != ctx.root) {
-            if not_a_donor(ctx, t, w, &ours).is_some() {
+            if not_a_donor(ctx, t, w, &ours, &key).is_some() {
                 continue;
             }
             let src = w.join(&t.path);
-            match clone_in(ctx, t, &src, Some(w.clone()), &key) {
+            match clone_in(ctx, t, &src, Some(w.clone())) {
                 Ok(()) => {
-                    run_after(ctx, t)?;
+                    finish(ctx, t, &path, &key)?;
                     lines.push(format!(
                         "clone  {name} from {} ({})",
                         util::tilde(&src),
@@ -231,19 +313,30 @@ fn install(ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
         return Ok(Report::done(lines.join("\n")));
     };
     let cwd = super::project_path(&ctx.root, &t.dir);
-    super::run_quietly(&cwd, cmd, &ctx.root, &ctx.main)?;
-    if !path.is_dir() {
-        return Err(format!("`{cmd}` did not make {}", t.path));
-    }
-    if let Some(v) = &t.verify {
-        if let Err(e) = super::run_quietly(&path, v, &ctx.root, &ctx.main) {
-            let _ = trash::trash(&path);
-            return Err(format!("verify failed after the install: {e}"));
+    // What a failed install leaves is not an install.
+    let made = super::run_quietly(&cwd, cmd, &ctx.root, &ctx.main)
+        .and_then(|()| target::inside(&ctx.root, &t.path))
+        .and_then(|()| {
+            if path.is_dir() {
+                Ok(())
+            } else {
+                Err(format!("`{cmd}` did not make {}", t.path))
+            }
+        })
+        .and_then(|()| match &t.verify {
+            Some(v) => super::run_quietly(&path, v, &ctx.root, &ctx.main)
+                .map_err(|e| format!("verify failed after the install: {e}")),
+            None => Ok(()),
+        });
+    if let Err(e) = made {
+        if target::inside(&ctx.root, &t.path).is_ok() {
+            discard(&path);
         }
+        return Err(e);
     }
-    write_key(&path, &key);
     if clone::SUPPORTED {
-        // Not checked for absolute symlinks (see the module's notes).
+        // Not checked for absolute symlinks (see the module's notes). The
+        // key goes in when the entry is cloned.
         if let Err(e) = cache::store(&path, &entry, true, &ctx.root) {
             lines.push(format!("note   {name}: cache not saved: {e}"));
         }
@@ -251,7 +344,7 @@ fn install(ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
             cache::prune(dir, Duration::from_secs(cache::TTL_DAYS * 86_400));
         }
     }
-    run_after(ctx, t)?;
+    finish(ctx, t, &path, &key)?;
     lines.push(format!("install {name} ({cmd}, {})", util::elapsed(start)));
     Ok(Report::done(lines.join("\n")))
 }
@@ -259,27 +352,29 @@ fn install(ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
 fn plan(ctx: &Ctx, t: &Target, mode: Mode, fresh: bool) -> Plan {
     let path = ctx.root.join(&t.path);
     let mut why = Vec::new();
-    let present = !fresh && path.symlink_metadata().is_ok();
-    if present && !mode.reinstalls_changed() {
-        return Plan::new("present", why);
+    if let Err(e) = target::inside(&ctx.root, &t.path) {
+        return Plan::new(format!("nothing: {e}"), why);
     }
     let key = match key(&ctx.root, &ctx.main, t) {
         Ok(k) => k,
         Err(e) => return Plan::new(format!("nothing: {e}"), why),
     };
-    if present {
-        match recorded(&path) {
-            Some(k) if k == key => return Plan::new("present (up to date)", why),
-            None if t
-                .verify
-                .as_ref()
-                .is_none_or(|v| super::succeeds(&path, v, &ctx.root, &ctx.main)) =>
-            {
-                return Plan::new("present", why);
+    if !fresh && path.symlink_metadata().is_ok() {
+        match standing(ctx, t, &path, &key) {
+            Standing::Current if mode.reinstalls_changed() => {
+                return Plan::new("present (up to date)", why)
             }
-            _ => why.push("present: made from other key files".to_string()),
+            Standing::Current => return Plan::new("present", why),
+            Standing::Verified => return Plan::new("present (verify passes)", why),
+            Standing::Stale(no) => why.push(format!("present: {no}")),
         }
     }
+    // A clone is checked with verify once it is made, in this worktree.
+    let checked = if t.verify.is_some() {
+        " (verify after the clone)"
+    } else {
+        ""
+    };
     let install = || match &t.install {
         Some(c) => format!("install ({c})"),
         None => "nothing (no install)".to_string(),
@@ -288,29 +383,22 @@ fn plan(ctx: &Ctx, t: &Target, mode: Mode, fresh: bool) -> Plan {
         why.push("clone: needs macOS clonefile(2)".to_string());
     } else {
         let entry = entry(&ctx.cache_repo, t, &key);
-        if !entry.is_dir() {
-            why.push(format!("cache: no entry {key}"));
-        } else if let Some(v) = t
-            .verify
-            .as_ref()
-            .filter(|v| !super::succeeds(&entry, v, &ctx.root, &ctx.main))
-        {
-            why.push(format!(
-                "cache {}: verify `{v}` failed",
-                util::tilde(&entry)
-            ));
-        } else {
-            return Plan::new(format!("cache {}", util::tilde(&entry)), why);
+        if entry.is_dir() {
+            return Plan::new(format!("cache {}{checked}", util::tilde(&entry)), why);
         }
+        why.push(format!("cache: no entry {key}"));
         let ours = match outputs(&ctx.root, &ctx.main, t) {
             Ok(o) => o,
             Err(e) => return Plan::new(format!("nothing: {e}"), why),
         };
         for w in ctx.worktrees.iter().filter(|w| fresh || **w != ctx.root) {
-            match not_a_donor(ctx, t, w, &ours) {
+            match not_a_donor(ctx, t, w, &ours, &key) {
                 Some(no) => why.push(no),
                 None => {
-                    return Plan::new(format!("worktree {}", util::tilde(&w.join(&t.path))), why)
+                    return Plan::new(
+                        format!("worktree {}{checked}", util::tilde(&w.join(&t.path))),
+                        why,
+                    )
                 }
             }
         }
@@ -323,26 +411,38 @@ fn plan(ctx: &Ctx, t: &Target, mode: Mode, fresh: bool) -> Plan {
     Plan::new(install(), why)
 }
 
-/// Before the worktree `root` is deleted, move the `path` of each of
-/// `targets` without a preset into the cache, where the next worktree with
-/// the same key clones it: when it is there, was made from the key files
-/// it has now (its recorded key) or passes `verify`, and the cache has no
-/// entry for that key yet. A rename on the same volume costs next to
-/// nothing; one that fails (another volume) leaves it to be deleted with
-/// the worktree. Only where directories can be cloned. Returns lines to
-/// print.
-pub fn reclaim(root: &Path, main: &Path, cache_repo: &Path, targets: &[Target]) -> Vec<String> {
+/// Before the worktree that was at `made_in` is deleted, from where it is
+/// now (`at`: moved into the trash, so that nothing here runs unless it is
+/// surely going), move the `path` of each of `targets` without a preset
+/// into the cache, where the next worktree with the same key clones it:
+/// when it is a directory in the worktree (not through a symlink), was made
+/// from the key files it has now (its recorded key) or passes `verify`, and
+/// the cache has no entry for that key yet. A rename on the same volume
+/// costs next to nothing; one that fails (another volume) leaves it to be
+/// deleted with the worktree. Only where directories can be cloned.
+/// Returns lines to print.
+pub fn reclaim(
+    at: &Path,
+    made_in: &Path,
+    main: &Path,
+    cache_repo: &Path,
+    targets: &[Target],
+) -> Vec<String> {
     let mut lines = Vec::new();
     if !clone::SUPPORTED {
         return lines;
     }
     for t in targets.iter().filter(|t| !t.has_preset()) {
-        let path = root.join(&t.path);
+        let path = at.join(&t.path);
         if !path.symlink_metadata().is_ok_and(|m| m.is_dir()) {
             continue;
         }
         let name = &t.name;
-        let key = match key(root, main, t) {
+        if let Err(e) = target::inside(at, &t.path) {
+            lines.push(format!("note   {name}: not kept in the cache: {e}"));
+            continue;
+        }
+        let key = match key(at, main, t) {
             Ok(k) => k,
             Err(e) => {
                 lines.push(format!("note   {name}: not kept in the cache: {e}"));
@@ -354,7 +454,7 @@ pub fn reclaim(root: &Path, main: &Path, cache_repo: &Path, targets: &[Target]) 
             let verified = t
                 .verify
                 .as_ref()
-                .is_some_and(|v| super::succeeds(&path, v, root, main));
+                .is_some_and(|v| super::succeeds(&path, v, at, main));
             if !verified {
                 lines.push(format!(
                     "note   {name}: not kept in the cache: not made from its key files as they are{}",
@@ -369,7 +469,11 @@ pub fn reclaim(root: &Path, main: &Path, cache_repo: &Path, targets: &[Target]) 
             write_key(&path, &key);
         }
         let entry = entry(cache_repo, t, &key);
-        match cache::adopt(&path, &entry, root) {
+        if let Err(e) = target::inside(at, &t.path) {
+            lines.push(format!("note   {name}: not kept in the cache: {e}"));
+            continue;
+        }
+        match cache::adopt(&path, &entry, made_in) {
             Ok(true) => lines.push(format!("cache  {name} kept as {}", util::tilde(&entry))),
             Ok(false) => {}
             Err(e) => lines.push(format!("note   {name}: not kept in the cache ({e})")),
@@ -415,6 +519,80 @@ mod tests {
     }
 
     #[test]
+    fn installed_means_recorded_from_the_key_files_as_they_are() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("wt");
+        fs::create_dir_all(root.join("ios/Pods")).unwrap();
+        fs::write(root.join("ios/Podfile.lock"), "a").unwrap();
+        let pods = target("path = \"ios/Pods\"\nkey = [\"ios/Podfile.lock\"]");
+        // Half made: no record.
+        assert!(!is_installed(&root, &pods));
+        let k = key(&root, &root, &pods).unwrap();
+        write_key(&root.join("ios/Pods"), &k);
+        assert!(is_installed(&root, &pods));
+        // The key files changed since.
+        fs::write(root.join("ios/Podfile.lock"), "b").unwrap();
+        assert!(!is_installed(&root, &pods));
+        // Through a symlink out of the worktree: not this worktree's.
+        let out = t.path().join("outside/Pods");
+        fs::create_dir_all(&out).unwrap();
+        std::os::unix::fs::symlink(t.path().join("outside"), root.join("link")).unwrap();
+        let linked = target("path = \"link/Pods\"\nkey = [\"ios/Podfile.lock\"]");
+        write_key(&out, &key(&root, &root, &linked).unwrap());
+        assert!(!is_installed(&root, &linked));
+    }
+
+    /// A worktree `wt` with `k` and a symlink `link` to `outside`, which
+    /// holds `Pods/important.txt`.
+    fn with_a_way_out() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let base = t.path().canonicalize().unwrap();
+        let root = base.join("wt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("k"), "a").unwrap();
+        let outside = base.join("outside");
+        fs::create_dir_all(outside.join("Pods")).unwrap();
+        fs::write(outside.join("Pods/important.txt"), "not ours").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        (t, root, outside)
+    }
+
+    #[test]
+    fn install_checks_where_path_is_right_before_it_moves_it() {
+        // As if the symlink appeared after the targets were checked.
+        let (t, root, outside) = with_a_way_out();
+        let ctx = Ctx {
+            root: root.clone(),
+            main: root.clone(),
+            worktrees: vec![root.clone()],
+            cache_repo: t.path().join("cache/repo-01234567"),
+            skip_lifecycle: Vec::new(),
+        };
+        let pods = target("path = \"link/Pods\"\nkey = [\"k\"]\nverify = \"false\"");
+        for mode in [Mode::Missing, Mode::Changed, Mode::ChangedCloneOnly] {
+            let e = install(&ctx, &pods, mode).unwrap_err();
+            assert!(e.contains("outside the worktree"), "{e}");
+            assert!(outside.join("Pods/important.txt").is_file());
+        }
+        let p = plan(&ctx, &pods, Mode::Changed, false);
+        assert!(p.from.starts_with("nothing: path `link/Pods`"), "{p:?}");
+        assert!(!is_installed(&root, &pods));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reclaim_leaves_what_is_out_of_the_worktree() {
+        let (t, root, outside) = with_a_way_out();
+        let cache_repo = t.path().join("cache/repo-01234567");
+        let pods = target("path = \"link/Pods\"\nkey = [\"k\"]\nverify = \"true\"");
+        let lines = reclaim(&root, &root, &root, &cache_repo, &[pods]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("outside the worktree"), "{lines:?}");
+        assert!(outside.join("Pods/important.txt").is_file());
+        assert!(!cache_repo.exists());
+    }
+
+    #[test]
     fn the_command_output_is_taken_in_dir() {
         let t = tempfile::tempdir().unwrap();
         let root = t.path();
@@ -439,12 +617,12 @@ mod tests {
         let npm = target::Target::with_defaults(&crate::ecosystem::npm::Npm, "ios");
         let both = [pods.clone(), npm];
         // No record, no verify: not known to be made from these key files.
-        let lines = reclaim(&root, &root, &cache_repo, &both);
+        let lines = reclaim(&root, &root, &root, &cache_repo, &both);
         assert!(lines[0].contains("not kept in the cache"), "{lines:?}");
         assert!(root.join("ios/Pods").is_dir());
         let k = key(&root, &root, &pods).unwrap();
         write_key(&root.join("ios/Pods"), &k);
-        let lines = reclaim(&root, &root, &cache_repo, &both);
+        let lines = reclaim(&root, &root, &root, &cache_repo, &both);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
             lines[0].starts_with("cache  ios/Pods kept as "),
@@ -457,17 +635,29 @@ mod tests {
         // An entry with that key is there now: the next one stays.
         fs::create_dir_all(root.join("ios/Pods")).unwrap();
         write_key(&root.join("ios/Pods"), &k);
-        assert!(reclaim(&root, &root, &cache_repo, &both).is_empty());
+        assert!(reclaim(&root, &root, &root, &cache_repo, &both).is_empty());
         assert!(root.join("ios/Pods").is_dir());
         // verify vouches for a directory without a record.
         let verified =
             target("path = \"ios/Pods\"\nkey = [\"ios/Podfile.lock\"]\nverify = \"test -f ok\"");
         fs::write(root.join("ios/Podfile.lock"), "b").unwrap();
         fs::remove_file(root.join("ios/Pods").join(KEY_FILE)).unwrap();
-        let lines = reclaim(&root, &root, &cache_repo, std::slice::from_ref(&verified));
+        let lines = reclaim(
+            &root,
+            &root,
+            &root,
+            &cache_repo,
+            std::slice::from_ref(&verified),
+        );
         assert!(lines[0].ends_with(", and verify failed"), "{lines:?}");
         fs::write(root.join("ios/Pods/ok"), "").unwrap();
-        let lines = reclaim(&root, &root, &cache_repo, std::slice::from_ref(&verified));
+        let lines = reclaim(
+            &root,
+            &root,
+            &root,
+            &cache_repo,
+            std::slice::from_ref(&verified),
+        );
         assert!(
             lines[0].starts_with("cache  ios/Pods kept as "),
             "{lines:?}"

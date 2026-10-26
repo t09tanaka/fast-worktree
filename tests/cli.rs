@@ -4329,18 +4329,43 @@ fn a_clone_without_a_preset_is_installed_then_cloned() {
         );
         assert_eq!(paths(&wt3), format!("{}\n", wt3.join("ios").display()));
         assert_eq!(w.pod_log().lines().count(), 1);
-        // Not from a worktree where verify fails, nor one with another
-        // pod --version.
+        // A worktree whose Pods record our key lends them as they are
+        // (verify runs in the clone, not there).
         let cache3 = w.base.join("cache3");
         let cache3 = cache3.to_str().unwrap();
-        for wt in [&wt1, &wt2] {
-            fs::remove_file(wt.join("ios/Pods/Manifest.lock")).unwrap();
+        let r = w.fw_with(&main, &["plan"], &[("FAST_WORKTREE_CACHE", cache3)]);
+        assert!(
+            r.out().contains(&format!(
+                "ios/Pods (clone)\n  from  worktree {} (verify after the clone)\n",
+                wt1.join("ios/Pods").display()
+            )),
+            "{}",
+            r.out()
+        );
+        // Not from one whose Pods were made from another key, nor, without
+        // a record, where verify fails, nor one with another pod --version.
+        fs::write(
+            wt2.join("ios/Pods/.fast-worktree-key"),
+            "0000000000000000-00000000\n",
+        )
+        .unwrap();
+        for wt in [&wt1, &wt3] {
+            fs::remove_file(wt.join("ios/Pods/.fast-worktree-key")).unwrap();
         }
+        fs::remove_file(wt1.join("ios/Pods/Manifest.lock")).unwrap();
         let r = w.fw_with(&main, &["plan"], &[("FAST_WORKTREE_CACHE", cache3)]);
         assert!(
             r.out().contains(&format!(
                 "  not   worktree {}: verify failed there",
                 wt1.display()
+            )),
+            "{}",
+            r.out()
+        );
+        assert!(
+            r.out().contains(&format!(
+                "  not   worktree {}: its ios/Pods was made from other key files or tools",
+                wt2.display()
             )),
             "{}",
             r.out()
@@ -4754,7 +4779,7 @@ fn plan_says_where_each_target_comes_from_and_changes_nothing() {
         );
         assert!(
             r.out().contains(&format!(
-                "ios/Pods (clone)\n  from  worktree {}\n",
+                "ios/Pods (clone)\n  from  worktree {} (verify after the clone)\n",
                 wt1.join("ios/Pods").display()
             )),
             "{}",
@@ -4814,7 +4839,11 @@ case "$1" in
     ;;
   check)
     G=${BUNDLE_GEMFILE:-Gemfile}
-    cmp -s "$G.lock" "$BP/ruby/3.3.0/installed.lock" || { echo "The following gems are missing" >&2; exit 1; }
+    cmp -s "$G.lock" "$BP/ruby/3.3.0/installed.lock"; ok=$?
+    # Like Bundler with a lockfile that lacks this platform: without
+    # --dry-run, check adds it to the lockfile.
+    [ "$2" = "--dry-run" ] || printf '  x86_64-linux\n' >> "$G.lock"
+    [ $ok = 0 ] || { echo "The following gems are missing" >&2; exit 1; }
     ;;
   *) echo "fake bundle: unexpected $*" >&2; exit 1 ;;
 esac
@@ -5119,4 +5148,687 @@ fn an_ignored_project_is_left_out_and_config_check_knows_why() {
         "{}",
         r.err()
     );
+}
+
+// ---- 0.3: what fast-worktree may touch, and when a path counts ----
+
+impl World {
+    /// Commit `files` to the upstream and bring the main checkout up to it.
+    fn publish(&self, files: &[(&str, &str)], msg: &str) {
+        self.commit(&self.base.join("upstream"), files, msg);
+        self.git(&self.main(), &["pull", "-q", "--ff-only"]);
+    }
+}
+
+/// Every file named `name` under `root`.
+fn files_named(root: &Path, name: &str) -> Vec<PathBuf> {
+    walk(root)
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n == name))
+        .collect()
+}
+
+#[test]
+fn a_path_through_a_symlink_out_of_the_worktree_is_never_touched() {
+    let w = World::new();
+    let main = w.main();
+    let outside = w.base.join("outside");
+    for d in ["Pods", "Pods2"] {
+        fs::create_dir_all(outside.join(d)).unwrap();
+        fs::write(outside.join(d).join("important.txt"), "not ours\n").unwrap();
+    }
+    // A tracked symlink that leaves the worktree.
+    std::os::unix::fs::symlink("../outside", w.base.join("upstream/link")).unwrap();
+    w.publish(
+        &[
+            ("k", "1\n"),
+            (
+                ".fast-worktree.toml",
+                "[[clone]]\npath = \"link/Pods\"\nkey = [\"k\"]\nverify = \"test -f important.txt\"\n\
+                 [[clone]]\npath = \"link/Pods2\"\nkey = [\"k\"]\nverify = \"false\"\n",
+            ),
+        ],
+        "link",
+    );
+    // add, install --changed (which moves away what fails verify), plan
+    // and remove (which gives what passes it to the cache).
+    let add = w.fw(&main, &["add", "../wt", "-b", "a"]);
+    let wt = w.base.join("wt");
+    let changed = w.fw(&wt, &["install", "--changed"]);
+    let plan = w.fw(&wt, &["plan", "."]);
+    let remove = w.fw(&main, &["remove", "../wt"]);
+    for d in ["Pods", "Pods2"] {
+        assert_eq!(
+            fs::read_to_string(outside.join(d).join("important.txt")).unwrap(),
+            "not ours\n",
+            "{d}"
+        );
+    }
+    assert!(files_named(&w.cache, "important.txt").is_empty());
+    add.assert_fails();
+    assert!(add.all().contains("outside the worktree"), "{}", add.all());
+    changed.assert_fails();
+    assert!(
+        changed.err().contains("outside the worktree"),
+        "{}",
+        changed.err()
+    );
+    plan.assert_fails();
+    remove.assert_ok();
+    assert!(!wt.exists());
+    assert!(
+        remove.out().contains("note   nothing kept in the cache: "),
+        "{}",
+        remove.out()
+    );
+    let r = w.fw(&main, &["config", "check"]);
+    r.assert_fails();
+    assert!(
+        r.out().contains(&format!(
+            "invalid    clone[0]: path `link/Pods` goes through the symlink {} to {}, outside the worktree",
+            main.join("link").display(),
+            outside.display()
+        )),
+        "{}",
+        r.out()
+    );
+    assert!(
+        r.out().contains("invalid    clone[1]: path `link/Pods2`"),
+        "{}",
+        r.out()
+    );
+    // A key file and a dir through it are refused too.
+    fs::write(
+        main.join(".fast-worktree.toml"),
+        "[[clone]]\npath = \"Pods\"\nkey = [\"link/Pods/important.txt\"]\ndir = \"link\"\n",
+    )
+    .unwrap();
+    let r = w.fw(&main, &["config", "check"]);
+    r.assert_fails();
+    assert!(
+        r.out()
+            .contains("invalid    clone[0]: dir `link` goes through the symlink "),
+        "{}",
+        r.out()
+    );
+    assert!(
+        r.out().contains(
+            "invalid    clone[0]: key `link/Pods/important.txt` goes through the symlink "
+        ),
+        "{}",
+        r.out()
+    );
+}
+
+#[test]
+fn a_path_that_holds_tracked_files_is_refused() {
+    let w = World::new();
+    let main = w.main();
+    w.publish(
+        &[
+            ("vendor/javascript/app.js", "tracked\n"),
+            (
+                ".fast-worktree.toml",
+                "[[clone]]\npath = \"vendor\"\nkey = [\"app/package-lock.json\"]\n\
+                 install = \"mkdir -p vendor/x\"\nverify = \"test -d x\"\n",
+            ),
+        ],
+        "vendor",
+    );
+    let add = w.fw(&main, &["add", "../wt", "-b", "a"]);
+    let wt = w.base.join("wt");
+    fs::write(wt.join("vendor/javascript/app.js"), "edited\n").unwrap();
+    fs::write(wt.join("vendor/javascript/new.js"), "new\n").unwrap();
+    let changed = w.fw(&wt, &["install", "--changed"]);
+    assert_eq!(
+        fs::read_to_string(wt.join("vendor/javascript/app.js")).unwrap(),
+        "edited\n"
+    );
+    assert!(wt.join("vendor/javascript/new.js").is_file());
+    add.assert_fails();
+    changed.assert_fails();
+    assert!(
+        changed.err().contains("holds tracked files"),
+        "{}",
+        changed.err()
+    );
+    let r = w.fw(&main, &["config", "check"]);
+    r.assert_fails();
+    assert!(
+        r.out().contains(
+            "invalid    clone[0]: path `vendor` holds tracked files (vendor/javascript/app.js), \
+             and fast-worktree moves the whole directory away"
+        ),
+        "{}",
+        r.out()
+    );
+}
+
+#[test]
+fn a_bundle_path_that_holds_tracked_files_is_never_moved_away() {
+    let w = World::new();
+    let main = w.main();
+    w.with_bundler(&[]);
+    let up = w.base.join("upstream");
+    // A Rails app's vendor/javascript, tracked despite `vendor/` in
+    // .gitignore, and BUNDLE_PATH=vendor.
+    fs::create_dir_all(up.join("shop/vendor/javascript")).unwrap();
+    fs::write(up.join("shop/vendor/javascript/app.js"), "tracked\n").unwrap();
+    w.git(&up, &["add", "-f", "shop/vendor/javascript/app.js"]);
+    w.git(&up, &["commit", "-qm", "vendored js"]);
+    w.git(&main, &["pull", "-q", "--ff-only"]);
+    let env = [("BUNDLE_PATH", "vendor")];
+    let r = w.fw_with(&main, &["add", "../wt", "-b", "a"], &env);
+    r.assert_ok();
+    assert!(
+        r.out().contains("install shop (bundle install, "),
+        "{}",
+        r.out()
+    );
+    let wt = w.base.join("wt");
+    let js = wt.join("shop/vendor/javascript");
+    fs::write(js.join("app.js"), "tracked\nmy work\n").unwrap();
+    fs::write(js.join("new.js"), "new\n").unwrap();
+    // The lockfile changes: the gems are installed again where they are.
+    fs::write(wt.join("shop/Gemfile.lock"), format!("{GEMFILE_LOCK}\n")).unwrap();
+    let r = w.fw_with(&wt, &["install", "--changed"], &env);
+    r.assert_ok();
+    assert!(
+        r.out().contains("install shop (bundle install, "),
+        "{}",
+        r.out()
+    );
+    assert_eq!(
+        fs::read_to_string(js.join("app.js")).unwrap(),
+        "tracked\nmy work\n"
+    );
+    assert!(js.join("new.js").is_file());
+    let r = w.fw_with(&wt, &["plan", "."], &env);
+    assert!(
+        r.out().contains(&format!(
+            "  not   clone: the gems are in {}, a directory that holds tracked files\n",
+            wt.join("shop/vendor").display()
+        )),
+        "{}",
+        r.out()
+    );
+}
+
+#[test]
+fn a_spare_taken_by_hook_create_keeps_a_bundle_path_with_tracked_files() {
+    let w = World::new();
+    let main = w.main();
+    w.with_bundler(&[]);
+    let up = w.base.join("upstream");
+    fs::create_dir_all(up.join("shop/vendor/javascript")).unwrap();
+    fs::write(up.join("shop/vendor/javascript/app.js"), "tracked\n").unwrap();
+    w.git(&up, &["add", "-f", "shop/vendor/javascript/app.js"]);
+    w.git(&up, &["commit", "-qm", "vendored js"]);
+    w.git(&main, &["pull", "-q", "--ff-only"]);
+    let env = [("BUNDLE_PATH", "vendor")];
+    w.pool_size(1);
+    w.fw_with(&main, &["pool", "fill"], &env).assert_ok();
+    let _lock = hold_fill_lock(&w.pool_dir());
+    // Upstream moves on: the spare's gems are out of date
+    // (ChangedCloneOnly).
+    w.commit(
+        &up,
+        &[("shop/Gemfile.lock", &format!("{GEMFILE_LOCK}\n"))],
+        "lock",
+    );
+    let r = w.hook_create("pooled", &env);
+    r.assert_ok();
+    assert!(r.err().contains("worktree from the pool"), "{}", r.err());
+    let path = PathBuf::from(last_line(&r.out()));
+    w.fw_with(&path, &["wait"], &env).assert_ok();
+    assert_eq!(
+        fs::read_to_string(path.join("shop/vendor/javascript/app.js")).unwrap(),
+        "tracked\n"
+    );
+    assert!(path.join("shop/vendor/ruby/3.3.0/installed.lock").is_file());
+    status_is_clean(&w, &path);
+}
+
+/// `Pods` from `k`, by an install that fails half-way.
+const HALF_MADE: &str = "[[clone]]\npath = \"Pods\"\nkey = [\"k\"]\n\
+    install = \"mkdir -p Pods && cp k Pods/made-from && test -f ok\"\n";
+
+#[test]
+fn a_failed_install_leaves_nothing_that_counts_as_installed() {
+    let w = World::new();
+    let main = w.main();
+    w.publish(
+        &[
+            ("k", "v1\n"),
+            (".gitignore", "node_modules/\nPods/\n"),
+            (".fast-worktree.toml", HALF_MADE),
+        ],
+        "pods",
+    );
+    let r = w.fw(&main, &["add", "../wt1", "-b", "a"]);
+    r.assert_fails();
+    assert!(r.out().contains("FAILED Pods:"), "{}", r.out());
+    let wt1 = w.base.join("wt1");
+    assert!(
+        !wt1.join("Pods").exists(),
+        "the half-made Pods is moved away"
+    );
+    // A Pods without a record of its key (made by hand, or left by an
+    // install that was killed) is not installed, nor lent.
+    fs::create_dir_all(wt1.join("Pods")).unwrap();
+    fs::write(wt1.join("Pods/made-from"), "half\n").unwrap();
+    assert_eq!(
+        w.fw(&wt1, &["check"]).out(),
+        "missing deps: Pods (clone)\nrun `fast-worktree install` to install them\n"
+    );
+    let r = w.fw(&main, &["add", "../wt2", "-b", "b"]);
+    r.assert_fails();
+    assert!(!r.out().contains("clone  Pods from"), "{}", r.out());
+    assert!(!w.base.join("wt2/Pods").exists());
+    // `install` makes it again rather than keep it (and fails again).
+    let r = w.fw(&wt1, &["install"]);
+    r.assert_fails();
+    assert!(r.out().contains("FAILED Pods:"), "{}", r.out());
+    assert!(!wt1.join("Pods").exists());
+}
+
+#[test]
+fn a_worktree_whose_path_was_made_from_other_key_files_lends_nothing() {
+    let w = World::new();
+    let main = w.main();
+    w.publish(
+        &[
+            ("k", "v1\n"),
+            (".gitignore", "node_modules/\nPods/\n"),
+            (
+                ".fast-worktree.toml",
+                "[[clone]]\npath = \"Pods\"\nkey = [\"k\"]\ninstall = \"mkdir -p Pods && cp k Pods/made-from\"\n",
+            ),
+        ],
+        "pods",
+    );
+    w.fw(&main, &["add", "../wtc", "-b", "c"]).assert_ok();
+    let wtc = w.base.join("wtc");
+    assert_eq!(
+        fs::read_to_string(wtc.join("Pods/made-from")).unwrap(),
+        "v1\n"
+    );
+    // wtc moves on to v2 and installs nothing: its Pods are v1's.
+    w.commit(&wtc, &[("k", "v2\n")], "v2");
+    let other = w.base.join("cache2");
+    let r = w.fw_with(
+        &main,
+        &["add", "../wtd", "-b", "d", "c"],
+        &[("FAST_WORKTREE_CACHE", other.to_str().unwrap())],
+    );
+    r.assert_ok();
+    assert!(!r.out().contains("clone  Pods from"), "{}", r.out());
+    assert_eq!(
+        fs::read_to_string(w.base.join("wtd/Pods/made-from")).unwrap(),
+        "v2\n"
+    );
+    let r = w.fw_with(
+        &w.base.join("wtd"),
+        &["plan"],
+        &[(
+            "FAST_WORKTREE_CACHE",
+            w.base.join("cache3").to_str().unwrap(),
+        )],
+    );
+    if cfg!(target_os = "macos") {
+        assert!(
+            r.out().contains(&format!(
+                "  not   worktree {}: its Pods was made from other key files or tools\n",
+                wtc.display()
+            )),
+            "{}",
+            r.out()
+        );
+    }
+}
+
+#[test]
+fn bundle_check_never_writes_gemfile_lock() {
+    let w = World::new();
+    let main = w.main();
+    w.with_bundler(&[]);
+    let lock = |wt: &Path| fs::read_to_string(wt.join("shop/Gemfile.lock")).unwrap();
+    w.fw(&main, &["add", "../wt1", "-b", "a"]).assert_ok();
+    let wt1 = w.base.join("wt1");
+    assert_eq!(lock(&wt1), GEMFILE_LOCK);
+    status_is_clean(&w, &wt1);
+    // A worktree without a record of its gems' key is a source when
+    // `bundle check` passes there: it runs there, and writes nothing.
+    fs::remove_file(wt1.join("shop/vendor/bundle/.fast-worktree-key")).unwrap();
+    let cache2 = w.base.join("cache2");
+    let cache2 = [("FAST_WORKTREE_CACHE", cache2.to_str().unwrap())];
+    let r = w.fw_with(&main, &["plan"], &cache2);
+    r.assert_ok();
+    if cfg!(target_os = "macos") {
+        assert!(
+            r.out().contains(&format!(
+                "shop (bundler)\n  from  worktree {} (verify after the clone)\n",
+                wt1.join("shop/vendor/bundle").display()
+            )),
+            "{}",
+            r.out()
+        );
+    }
+    w.fw_with(&main, &["add", "../wt2", "-b", "b"], &cache2)
+        .assert_ok();
+    let wt2 = w.base.join("wt2");
+    for wt in [&main, &wt1, &wt2] {
+        assert_eq!(lock(wt), GEMFILE_LOCK, "{}", wt.display());
+    }
+    status_is_clean(&w, &wt1);
+    status_is_clean(&w, &wt2);
+    // `plan` runs no check in a cache entry: the clone is checked.
+    let r = w.fw(&main, &["plan"]);
+    r.assert_ok();
+    if cfg!(target_os = "macos") {
+        assert!(
+            r.out().contains("shop (bundler)\n  from  cache ")
+                && r.out().contains(" (verify after the clone)\n"),
+            "{}",
+            r.out()
+        );
+    }
+    let in_cache: Vec<String> = w
+        .bundle_log()
+        .lines()
+        .filter(|l| l.contains(&w.cache.display().to_string()))
+        .map(String::from)
+        .collect();
+    assert!(in_cache.is_empty(), "{in_cache:?}");
+    // Gems outside the worktree: the check in the project writes nothing
+    // either.
+    let shared = w.base.join("shared-gems");
+    fs::create_dir_all(wt1.join("shop/.bundle")).unwrap();
+    fs::write(
+        wt1.join("shop/.bundle/config"),
+        format!("BUNDLE_PATH: \"{}\"\n", shared.display()),
+    )
+    .unwrap();
+    w.fw(&wt1, &["install", "shop"]).assert_ok();
+    w.fw(&wt1, &["plan", "."]).assert_ok();
+    w.fw(&wt1, &["install", "--changed", "shop"]).assert_ok();
+    assert_eq!(lock(&wt1), GEMFILE_LOCK);
+}
+
+#[test]
+fn the_post_checkout_hook_clones_nothing_for_a_config_it_cannot_read() {
+    let w = World::new();
+    let main = w.main();
+    // The cache and wt1 have app's and lib's node_modules.
+    w.fw(&main, &["add", "../wt1", "-b", "a"]).assert_ok();
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_fast-worktree"),
+        w.base.join("bin/fast-worktree"),
+    )
+    .unwrap();
+    write_exe(
+        &main.join(".git/hooks/post-checkout"),
+        "#!/bin/sh\nfast-worktree check --post-checkout \"$@\" || true\n",
+    );
+    w.commit(&main, &[(".fast-worktree.toml", "[[clone]\n")], "broken");
+    let r = w.git_run(
+        &main,
+        &["worktree", "add", "../wt2", "-b", "y", "HEAD"],
+        &[],
+    );
+    r.assert_ok();
+    assert!(
+        r.all().contains("fast-worktree: .fast-worktree.toml: "),
+        "{}",
+        r.all()
+    );
+    let wt2 = w.base.join("wt2");
+    assert!(!wt2.join("app/node_modules").exists());
+    assert!(!wt2.join("lib/node_modules").exists());
+}
+
+#[test]
+fn config_check_reports_mistakes_outside_clone_and_untracked_key_files() {
+    let w = World::new();
+    let main = w.main();
+    let check = |text: &str| {
+        fs::write(main.join(".fast-worktree.toml"), text).unwrap();
+        w.fw(&main, &["config", "check"])
+    };
+    for (text, says) in [
+        (
+            "[[clones]]\npreset = \"npm\"\ndir = \"app\"\n",
+            "invalid    unknown key `clones`\n",
+        ),
+        (
+            "[[Clone]]\npreset = \"npm\"\ndir = \"app\"\n",
+            "invalid    unknown key `Clone`\n",
+        ),
+        (
+            "[[ignore]]\ndir = \"lib\"\n",
+            "invalid    ignore[0]: `reason` is required",
+        ),
+        ("[pool]\nsize = \"two\"\n", "invalid    "),
+    ] {
+        let r = check(text);
+        r.assert_fails();
+        assert!(r.out().contains(says), "{text}: {}", r.out());
+    }
+    // A key file that is here, but ignored by git.
+    fs::write(main.join("app/.npmrc"), "x\n").unwrap();
+    fs::write(main.join(".git/info/exclude"), "app/.npmrc\n").unwrap();
+    let r = check(
+        "[[clone]]\npreset = \"npm\"\ndir = \"app\"\nkey = [\"app/package-lock.json\", \"app/.npmrc\"]\n\
+         [[clone]]\npreset = \"npm\"\ndir = \"lib\"\n",
+    );
+    r.assert_fails();
+    assert_eq!(
+        r.out(),
+        "untracked  clone[0]: app/.npmrc is not tracked by git, so another worktree has its own or none\n\
+         1 problem in .fast-worktree.toml\n"
+    );
+}
+
+#[test]
+fn config_init_adds_nothing_next_to_an_entry_that_does_not_resolve() {
+    let w = World::new();
+    let main = w.main();
+    let text = "[[clone]]\npreset = \"npm\"\ndir = \"app\"\npath = \"app/vendor\"\n";
+    fs::write(main.join(".fast-worktree.toml"), text).unwrap();
+    let r = w.fw(&main, &["config", "init"]);
+    r.assert_fails();
+    assert!(
+        r.err().contains("clone[0]: path `app/vendor`") && r.err().contains("nothing was added"),
+        "{}",
+        r.err()
+    );
+    assert_eq!(
+        fs::read_to_string(main.join(".fast-worktree.toml")).unwrap(),
+        text
+    );
+}
+
+#[test]
+fn remove_goes_on_without_a_config_it_cannot_read() {
+    let w = World::new();
+    let main = w.main();
+    w.fw(&main, &["add", "../wt", "-b", "a"]).assert_ok();
+    let wt = w.base.join("wt");
+    w.commit(&wt, &[(".fast-worktree.toml", "[[clone]\n")], "broken");
+    // Its checks still refuse.
+    fs::write(wt.join("notes.txt"), "wip").unwrap();
+    let r = w.fw(&main, &["remove", "../wt"]);
+    r.assert_fails();
+    assert!(
+        r.err().contains("uncommitted or untracked changes"),
+        "{}",
+        r.err()
+    );
+    assert!(wt.join("notes.txt").is_file());
+    fs::remove_file(wt.join("notes.txt")).unwrap();
+    let r = w.fw(&main, &["remove", "../wt"]);
+    r.assert_ok();
+    assert!(!wt.exists());
+    assert!(
+        r.err().contains("removing it without the pre_remove hooks"),
+        "{}",
+        r.err()
+    );
+    // hook remove does the same.
+    let hooked = w.hook_worktree("broken");
+    w.commit(&hooked, &[(".fast-worktree.toml", "[[clone]\n")], "broken");
+    let r = w.hook_remove(&hooked);
+    r.assert_ok();
+    assert!(!hooked.exists());
+    assert!(
+        r.err().contains("removing it without the pre_remove hooks"),
+        "{}",
+        r.err()
+    );
+    assert!(!w.hook_log().contains("pre_remove"), "{}", w.hook_log());
+}
+
+#[test]
+fn what_fails_after_the_install_leaves_nothing_installed() {
+    let w = World::new();
+    let main = w.main();
+    w.publish(
+        &[
+            ("k", "v1\n"),
+            (".gitignore", "node_modules/\nPods/\n"),
+            (
+                ".fast-worktree.toml",
+                "[[clone]]\npath = \"Pods\"\nkey = [\"k\"]\ninstall = \"mkdir -p Pods && cp k Pods/made-from\"\n\
+                 after = [\"exit 3\"]\n",
+            ),
+        ],
+        "after fails",
+    );
+    let r = w.fw(&main, &["add", "../wt", "-b", "a"]);
+    r.assert_fails();
+    assert!(r.out().contains("`exit 3` failed"), "{}", r.out());
+    let wt = w.base.join("wt");
+    assert!(!wt.join("Pods").exists());
+    let r = w.fw(&main, &["add", "../wt2", "-b", "b"]);
+    r.assert_fails();
+    assert!(!r.out().contains("clone  Pods from"), "{}", r.out());
+}
+
+#[test]
+fn a_dart_verify_that_fails_leaves_no_record() {
+    let w = World::new();
+    let main = w.main();
+    write_exe(&w.base.join("bin/dart"), FAKE_PUB);
+    w.publish(
+        &[
+            ("mobile/pubspec.yaml", "name: mobile\n"),
+            ("mobile/pubspec.lock", "packages: {}\n"),
+            (".gitignore", "node_modules/\n.dart_tool/\n"),
+            (
+                ".fast-worktree.toml",
+                "[[clone]]\npreset = \"dart\"\ndir = \"mobile\"\nverify = \"test -f nothing\"\n",
+            ),
+        ],
+        "dart",
+    );
+    let r = w.fw(&main, &["add", "../wt", "-b", "a"]);
+    r.assert_fails();
+    assert!(
+        r.out().contains("verify failed after the install"),
+        "{}",
+        r.out()
+    );
+    let wt = w.base.join("wt");
+    assert!(!wt.join("mobile/.dart_tool").exists());
+    let r = w.fw(&wt, &["install", "--changed"]);
+    r.assert_fails();
+    assert!(!r.out().contains("up to date"), "{}", r.out());
+}
+
+#[test]
+fn nothing_goes_to_the_cache_until_the_worktree_is_surely_going() {
+    if is_root() {
+        return;
+    }
+    let w = World::new();
+    let main = w.main();
+    // A pre_remove hook that leaves the worktree where it is.
+    let config = format!(
+        "{BUILD_CONFIG}\n[[pre_remove]]\nrun = 'chmod a-w \"$(dirname \"$FAST_WORKTREE_PATH\")\"'\n"
+    );
+    w.publish(
+        &[
+            (".fast-worktree.toml", &config),
+            (".gitignore", "node_modules/\napp/build/\n"),
+        ],
+        "build",
+    );
+    w.fw(&main, &["add", "../wts/wt", "-b", "a"]).assert_ok();
+    let wts = w.base.join("wts");
+    let wt = wts.join("wt");
+    fs::create_dir_all(wt.join("app/build")).unwrap();
+    fs::write(wt.join("app/build/out.txt"), "built\n").unwrap();
+    let r = w.fw(&main, &["remove", "../wts/wt"]);
+    fs::set_permissions(&wts, fs::Permissions::from_mode(0o755)).unwrap();
+    r.assert_fails();
+    assert!(r.err().contains("could not be moved away"), "{}", r.err());
+    assert!(
+        wt.join("app/build/out.txt").is_file(),
+        "the build stays with the worktree"
+    );
+    assert!(w.entry_names(&w.cache, "app__build").is_empty());
+
+    // hook remove, the same.
+    let hooked = w.hook_worktree("stays");
+    fs::create_dir_all(hooked.join("app/build")).unwrap();
+    fs::write(hooked.join("app/build/out.txt"), "built\n").unwrap();
+    let r = w.hook_remove(&hooked);
+    fs::set_permissions(hooked.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
+    r.assert_fails();
+    assert!(hooked.join("app/build/out.txt").is_file());
+    assert!(w.entry_names(&w.cache, "app__build").is_empty());
+}
+
+#[test]
+fn plan_runs_no_verify_in_a_cache_entry() {
+    let w = World::new();
+    let main = w.main();
+    // verify says where it runs.
+    w.with_config(&PODS_CONFIG.replace(
+        "verify = \"test -f Manifest.lock\"",
+        "verify = 'echo \"verify $(pwd -P)\" >> \"$HOOK_LOG\"; test -f Manifest.lock'",
+    ));
+    w.fw(&main, &["add", "../wt1", "-b", "a"]).assert_ok();
+    let before = w.hook_log();
+    let r = w.fw(&main, &["plan"]);
+    r.assert_ok();
+    let ran: Vec<String> = w.hook_log()[before.len()..]
+        .lines()
+        .filter(|l| l.starts_with("verify "))
+        .map(String::from)
+        .collect();
+    assert!(ran.is_empty(), "{ran:?}");
+    if cfg!(target_os = "macos") {
+        let entries = w.entry_names(&w.cache, "ios__Pods");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(
+            r.out().contains(&format!(
+                "ios/Pods (clone)\n  from  cache {} (verify after the clone)\n",
+                w.cache
+                    .join(w.entry_dir_of("ios__Pods", &entries[0]))
+                    .display()
+            )),
+            "{}",
+            r.out()
+        );
+        // install clones it, then verifies it in the clone.
+        w.fw(&main, &["add", "../wt2", "-b", "b"]).assert_ok();
+        let wt2 = w.base.join("wt2");
+        assert!(
+            w.hook_log()
+                .contains(&format!("verify {}\n", wt2.join("ios/Pods").display())),
+            "{}",
+            w.hook_log()
+        );
+    }
 }

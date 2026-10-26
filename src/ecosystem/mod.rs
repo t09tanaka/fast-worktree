@@ -108,8 +108,10 @@ impl Report {
 }
 
 /// What `plan` says about one target: where it would come from, and why
-/// the sources tried before that one are not used. Finding out changes
-/// nothing.
+/// the sources tried before that one are not used. Finding out moves,
+/// clones and installs nothing, but runs the `key_commands` and `verify`
+/// (in this worktree, and in another without a record of its key), which
+/// the repository writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
     /// `cache <entry>`, `worktree <path>`, `delta from <entry>`, `install
@@ -160,8 +162,9 @@ pub trait Preset: Sync {
     /// failure the log to show.
     fn install(&self, ctx: &Ctx, t: &Target, mode: Mode) -> std::result::Result<Report, String>;
 
-    /// What [`Preset::install`] would do, without doing anything. It may
-    /// run `key_commands` and `verify`, which only look. With `fresh`, for
+    /// What [`Preset::install`] would do, without installing anything. It
+    /// may run `key_commands` and `verify` (never in a cache entry), which
+    /// are the repository's commands: they should only look. With `fresh`, for
     /// a new worktree with the files of `ctx.root`: nothing is present yet,
     /// and `ctx.root` is one of the worktrees to clone from.
     fn plan(&self, ctx: &Ctx, t: &Target, mode: Mode, fresh: bool) -> Plan;
@@ -189,7 +192,7 @@ pub trait Preset: Sync {
     /// Returns how many files were rewritten. By default every text file
     /// under `path`, when `rewrite_paths` is on.
     fn rewrite_moved(&self, root: &Path, t: &Target, from: &[PathBuf]) -> usize {
-        if t.rewrite_paths {
+        if t.rewrite_paths && target::inside(root, &t.path).is_ok() {
             rewrite_tree(&root.join(&t.path), from, root)
         } else {
             0

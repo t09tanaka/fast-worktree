@@ -17,9 +17,9 @@
 //! used, [`rewrite_moved_paths`] replaces the path where the spare was made
 //! with the new one in those files.
 
-use super::{Ctx, Mode, Plan, Preset, Report, Target};
+use super::{target, Ctx, Mode, Plan, Preset, Report, Target};
 use crate::paths::hex;
-use crate::util;
+use crate::{trash, util};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,13 +71,24 @@ impl Preset for Dart {
         if report.kept || report.missing || !project.join(PACKAGE_CONFIG).is_file() {
             return Ok(report);
         }
+        // The key goes in once `verify` and `after` passed; when one fails,
+        // `.dart_tool` is moved away, so that nothing takes it as installed.
+        let failed = |e: String| {
+            let dart_tool = ctx.root.join(&t.path);
+            if target::inside(&ctx.root, &t.path).is_ok() && dart_tool.symlink_metadata().is_ok() {
+                let _ = trash::trash(&dart_tool);
+            }
+            e
+        };
         if let Some(v) = &t.verify {
+            target::inside(&ctx.root, &t.path)?;
             super::run_quietly(&ctx.root.join(&t.path), v, &ctx.root, &ctx.main)
-                .map_err(|e| format!("verify failed after the install: {e}"))?;
+                .map_err(|e| failed(format!("verify failed after the install: {e}")))?;
         }
         for a in &t.after {
-            super::run_quietly(&project, a, &ctx.root, &ctx.main)?;
+            super::run_quietly(&project, a, &ctx.root, &ctx.main).map_err(failed)?;
         }
+        let _ = fs::write(project.join(KEY_FILE), format!("{key}\n"));
         Ok(report)
     }
 
@@ -112,7 +123,7 @@ impl Preset for Dart {
     fn rewrite_moved(&self, root: &Path, t: &Target, from: &[PathBuf]) -> usize {
         let project = super::project_path(root, &t.dir);
         let mut n = rewrite_moved_paths(&project, from, root);
-        if t.rewrite_paths {
+        if t.rewrite_paths && target::inside(root, &t.path).is_ok() {
             n += super::rewrite_tree(&root.join(&t.path), from, root);
         }
         n
@@ -275,7 +286,6 @@ fn install(project: &Path, dir: &str, mode: Mode, get: &Get, key: &str) -> Resul
             )));
         }
     };
-    let _ = fs::write(project.join(KEY_FILE), format!("{key}\n"));
     Ok(Report::done(format!(
         "pub get {dir} ({how}, {})",
         util::elapsed(start)

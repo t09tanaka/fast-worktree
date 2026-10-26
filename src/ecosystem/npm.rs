@@ -340,6 +340,7 @@ enum Source {
 fn install(ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
     let dir = t.dir.as_str();
     let start = Instant::now();
+    super::target::inside(&ctx.root, &t.path)?;
     // Time spent waiting for the lifecycle lock, shown apart.
     let mut waited = Duration::ZERO;
     let target = super::project_path(&ctx.root, dir);
@@ -449,7 +450,7 @@ fn install(ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
                     };
                     rewrite_from(t, &ctx.root, made_in);
                     lines.extend(after_clone(ctx, &target, dir, &key, &mut waited)?);
-                    run_after(ctx, t, &target)?;
+                    run_after(ctx, t, &target).inspect_err(|_| discard(&node_modules))?;
                     lines.push(format!(
                         "clone  {dir} from {} ({})",
                         util::tilde(path),
@@ -493,7 +494,7 @@ fn install(ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
                         &project_cache,
                         Duration::from_secs(cache::TTL_DAYS * 86_400),
                     );
-                    run_after(ctx, t, &target)?;
+                    run_after(ctx, t, &target).inspect_err(|_| discard(&node_modules))?;
                     lines.push(format!(
                         "delta  {dir} from {} ({})",
                         util::tilde(&base),
@@ -533,7 +534,7 @@ fn install(ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
             Duration::from_secs(cache::TTL_DAYS * 86_400),
         );
     }
-    run_after(ctx, t, &target)?;
+    run_after(ctx, t, &target).inspect_err(|_| discard(&node_modules))?;
     lines.push(match &t.install {
         None => format!("npm ci {dir} ({})", super::timing(start, waited)),
         Some(cmd) => format!("install {dir} ({cmd}, {})", super::timing(start, waited)),
@@ -558,6 +559,9 @@ fn donor_root(node_modules: &Path, dir: &str) -> PathBuf {
 /// With `rewrite_paths`, replace the worktree a clone was made in with
 /// this one in the text files of its `node_modules`.
 fn rewrite_from(t: &Target, root: &Path, made_in: Option<PathBuf>) {
+    if super::target::inside(root, &t.path).is_err() {
+        return;
+    }
     if let (true, Some(from)) = (t.rewrite_paths, made_in) {
         super::rewrite_tree(&root.join(&t.path), &[from], root);
     }
@@ -643,12 +647,13 @@ fn plan(ctx: &Ctx, t: &Target, mode: Mode, fresh: bool) -> Plan {
     let project_cache = ctx.cache_repo.join(project_slug(dir));
     let entry = project_cache.join(&key);
     if entry.is_dir() {
-        match &t.verify {
-            Some(v) if !super::succeeds(&entry, v, &ctx.root, &ctx.main) => {
-                why.push(format!("cache {}: verify failed", util::tilde(&entry)));
-            }
-            _ => return Plan::new(format!("cache {}", util::tilde(&entry)), why),
-        }
+        // Not in the entry: verify runs in the clone, once it is made.
+        let checked = if t.verify.is_some() {
+            " (verify after the clone)"
+        } else {
+            ""
+        };
+        return Plan::new(format!("cache {}{checked}", util::tilde(&entry)), why);
     } else {
         why.push(format!("cache: no entry {key}"));
         let probe = FsProbe {
