@@ -64,9 +64,15 @@ change bumps the minor version).
   untracked changes (whatever `status.showUntrackedFiles` says), when it
   has submodules checked out (their git directories are moved into them
   first, so unpushed submodule commits go with it) or when another
-  registered worktree is inside it (that one stays registered where it is now). A
-  kept worktree's `HEAD`, and a detached `HEAD` on no branch, is kept in
-  `refs/fast-worktree/kept/<name>-<date>-<time>`. It stops a background
+  registered worktree is inside it (that one stays registered where it is now). Any
+  checked-out submodule counts, whatever the layout of its git directory.
+  If a submodule's git directory cannot be moved, the ones already moved
+  are put back. Commits that would be lost are kept in a group of refs per
+  removal, `refs/fast-worktree/kept/<name>-<date>-<time>/`: `head` for a
+  kept worktree's `HEAD` that is not on a branch that stays (and for a
+  detached `HEAD` on no other ref), `sub/<path>` for each checked-out
+  submodule's `HEAD` of a kept worktree, fetched into the main repository.
+  A detached worktree inside gets its own group. It stops a background
   install still running in the worktree first. It removes only the
   worktree's own entry from git, also when the path is already gone, and
   never runs `git worktree prune`. It refuses, before the `pre_remove`
@@ -83,6 +89,13 @@ change bumps the minor version).
   entries from git.
 - `wait [<path>]`: wait for the background install of `hook create`;
   `check` says when one is running.
+- `kept ls` and `kept prune [--older-than <days>]` (default 30, going by
+  the date in the ref's name) for `refs/fast-worktree/kept/`. `git push
+  --mirror` pushes those refs; the README says so.
+- `install` leaves alone a `node_modules` that yarn (`.yarn-integrity`,
+  `.yarn-state.yml`), pnpm (`.modules.yaml`) or bun (`.bun`, or no
+  `.package-lock.json` next to `bun.lock` / `bun.lockb`) made, with a note,
+  instead of moving it away and running `npm ci`.
 
 ### Changed
 
@@ -91,6 +104,12 @@ change bumps the minor version).
   An install result with an absolute symlink is not cached.
 - `check` names the ecosystem: `missing deps: api (npm)`.
 - `remove` points to `pool clear` when asked to remove a spare.
+- `remove` stops a background install of `hook create` still running in
+  the worktree before moving it, as `hook remove` does.
+- The tree check compares a registry tarball's `resolved` without its
+  scheme and host, so a tree installed through a registry mirror matches;
+  git (`git+...`, `#<commit>`), `file:` and link sources are compared
+  whole.
 - `cache ls` and `cache prune` leave the pool's spares alone.
 
 ### Fixed
@@ -109,6 +128,11 @@ change bumps the minor version).
   with exit code 101.
 - `install --changed` installs again when a git dependency moved to
   another commit (the tree check now compares `resolved`).
+- `remove` finds the entry of a worktree whose `gitdir` file is relative
+  (`worktree.useRelativePaths`).
+- A tree installed from a `lockfileVersion` 1 lockfile, which has no
+  `packages` to compare, is cached when npm recorded it in
+  `node_modules/.package-lock.json`.
 
 ## [0.1.0]
 

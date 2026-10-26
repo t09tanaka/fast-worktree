@@ -96,6 +96,10 @@ latest cache entry, else with `npm ci --prefer-offline --no-audit
 are present is skipped; for npm that means `node_modules` has its
 `node_modules/.package-lock.json`, and a `node_modules` without one (an
 install that did not finish) is moved to the trash and installed again.
+A `node_modules` that another package manager made is left as it is, with
+a note, and nothing is installed there: one with `.yarn-integrity` or
+`.yarn-state.yml` (yarn), `.modules.yaml` (pnpm) or `.bun` (bun), or one
+without `.package-lock.json` next to a `bun.lock` or `bun.lockb`.
 With `--changed`, a project is installed again when its lockfile changed
 since fast-worktree last installed it (for npm: unless the installed tree
 already matches the new lockfile) or, for npm, when the project now
@@ -135,7 +139,9 @@ that cannot be renamed (its parent directory is not writable, or it is a
 mount point). All of this is decided before any hook runs and before
 anything is removed.
 
-Otherwise runs the `pre_remove` hooks, renames the worktree away, deletes
+Otherwise stops the background install of [`hook create`](#claude-code-hooks)
+if one is still running in it (as `hook remove` does), runs the
+`pre_remove` hooks, renames the worktree away, deletes
 its entry under `.git/worktrees/`, deletes the files in the background
 and, with `--delete-branch`, runs `git branch -d`. It does not run `git
 worktree prune`, which would also unregister other worktrees that are only
@@ -151,6 +157,18 @@ fast-worktree cache prune [--older-than <days>]
 `ls` lists the cache entries with their repository, project directory, key
 and last use. `prune` moves the entries not used for `<days>` (default 7)
 to the trash.
+
+```sh
+fast-worktree kept ls
+fast-worktree kept prune [--older-than <days>]
+```
+
+`ls` lists the refs under `refs/fast-worktree/kept/` of the repository
+you are in, where `hook remove` keeps commits that would be lost (see
+[Claude Code hooks](#claude-code-hooks)), with their commit and when they
+were kept. `prune` deletes those kept `<days>` (default 30) ago or more,
+going by the date in the ref's name; refs whose name has no date are left
+alone.
 
 ```sh
 fast-worktree pool status | fill | refresh | clear
@@ -552,7 +570,11 @@ worktree (or with `discard_changes`), so it always deletes it:
   submodule git directory that cannot go with it (below).
 - If its background install is still running, it stops it first, with
   everything it started (`SIGTERM`, then `SIGKILL` after 3 seconds), so
-  that nothing writes into the worktree once it is gone.
+  that nothing writes into the worktree once it is gone. It signals the
+  process the marker names only while that process holds the install's
+  lock; when the lock cannot be checked (a file system without locks), it
+  waits 3 seconds for the install to end and otherwise says it could not
+  stop it.
 - It runs the `pre_remove` hooks, moves the worktree into the trash and
   removes its own entry from git, and no other (it does not run `git
   worktree prune`, as for `remove`). When the path is already gone, it
@@ -560,18 +582,32 @@ worktree (or with `discard_changes`), so it always deletes it:
 - It keeps the worktree in the trash for at least 24 hours, and prints the
   command to get it back, when it has uncommitted or untracked changes (as
   `remove` counts them, whatever `status.showUntrackedFiles` says), when it
-  has submodules checked out, or when another registered worktree is
-  inside it. Submodules keep their git directories in the worktree's
-  entry, which goes; each one's is moved into the submodule as its `.git`
-  first, so their commits go with it (`git submodule absorbgitdirs` moves
-  them back after a restore). A worktree inside is not deleted: it stays
-  registered where it is now, in the trash, and the command to move it out
-  is printed.
-- When it keeps a worktree, and when the worktree's detached `HEAD` is on
-  no branch, that commit is kept in
-  `refs/fast-worktree/kept/<name>-<UTC date>-<time>`, named in the output,
-  so that gc does not take it. Those refs stay until you delete them
-  (`git update-ref -d <ref>`).
+  has a submodule checked out (whether its git directory is in the
+  worktree's entry, in the main repository or inside the submodule), or
+  when another registered worktree is inside it. Submodules keep their git
+  directories in the worktree's entry, which goes; each one's is moved
+  into the submodule as its `.git` first, so their commits go with it (`git
+  submodule absorbgitdirs` moves them back after a restore). If one of them
+  cannot be moved, those already moved are put back, nothing else changes
+  and it exits 1. A worktree inside is not deleted: it stays registered
+  where it is now, in the trash, and the command to move it out is printed.
+- Commits that would be lost are kept in refs of the main repository, so
+  that gc does not take them and they outlive the trash entry. Each removal
+  gets a group, `refs/fast-worktree/kept/<name>-<UTC date>-<time>`:
+  - `<group>/head`: the worktree's `HEAD`, when the worktree is kept and
+    `HEAD` is not on a branch that stays (a detached `HEAD`, or
+    `worktree-<name>` when it is deleted), and when a detached `HEAD` is on
+    no other ref. A worktree inside that is detached gets a group of its
+    own.
+  - `<group>/sub/<path>`: the `HEAD` of each checked-out submodule of a
+    kept worktree, fetched into the main repository first (if that fails,
+    it says so).
+
+  The refs are named in the output. They stay until you delete them:
+  `fast-worktree kept ls` lists them and `fast-worktree kept prune
+  [--older-than <days>]` deletes the old ones (default: 30 days; `git
+  update-ref -d <ref>` deletes one). They are not pushed by `git push` of a
+  branch, but `git push --mirror` pushes every ref, these included.
 - Claude Code never deletes the branch of a worktree a hook created. `hook
   remove` deletes `worktree-<name>` only when its commit is on its
   upstream, a remote branch or the default branch; otherwise it keeps it
@@ -609,8 +645,9 @@ bye: demo
 removed ~/monorepo/.claude/worktrees/demo (moved to ~/Library/Caches/fast-worktree/trash/keep-1793106191-1793019791-61112-0116067000-demo)
 deleted branch worktree-demo
 fast-worktree: it had uncommitted changes; it is kept in ~/Library/Caches/fast-worktree/trash/keep-1793106191-1793019791-61112-0116067000-demo for at least 24 hours
-to restore them: git -C ~/monorepo worktree add ~/monorepo/.claude/worktrees/demo refs/fast-worktree/kept/demo-20261026-130311 && rsync -a --exclude=/.git ~/Library/Caches/fast-worktree/trash/keep-1793106191-1793019791-61112-0116067000-demo/ ~/monorepo/.claude/worktrees/demo/
-fast-worktree: its HEAD 50c46ff4cb8f is kept as refs/fast-worktree/kept/demo-20261026-130311 (`git update-ref -d refs/fast-worktree/kept/demo-20261026-130311` drops it)
+to restore them: git -C ~/monorepo worktree add ~/monorepo/.claude/worktrees/demo refs/fast-worktree/kept/demo-20261026-130311/head && rsync -a --exclude=/.git ~/Library/Caches/fast-worktree/trash/keep-1793106191-1793019791-61112-0116067000-demo/ ~/monorepo/.claude/worktrees/demo/
+fast-worktree: its HEAD 50c46ff4cb8f is kept as refs/fast-worktree/kept/demo-20261026-130311/head
+fast-worktree: `fast-worktree kept ls` lists such refs, `fast-worktree kept prune` drops those older than 30 days
 ```
 
 `worktree-demo` was deleted because its commit is on `origin/main`. A
@@ -648,7 +685,8 @@ fast-worktree: kept branch worktree-work: commit 21f7c601e324 is not on its upst
   `keep-<unix time>-...`
   (worktrees `hook remove` kept) are left alone until that time.
 - `refs/fast-worktree/kept/*` in the repository: commits `hook remove`
-  kept (above).
+  kept (above); `kept ls` and `kept prune` manage them. `git push --mirror`
+  pushes them.
 - Pool: `<cache>/<repo>-<hash>/pool`, with one directory per spare
   (`wt-<unix time>-<pid>-<n>`), `fill.log`, `fill.lock` and `misses` (one
   line per `add` that found no spare).
