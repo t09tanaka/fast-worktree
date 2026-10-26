@@ -1,7 +1,7 @@
 //! `fast-worktree check`: list projects whose dependencies are missing.
 //!
-//! Meant for a `post-checkout` hook, so it always exits 0, never spawns
-//! anything but one `git ls-files`, and stays well under 100 ms.
+//! Meant for a `post-checkout` hook, so it always exits 0, spawns nothing
+//! but `git rev-parse` and one `git ls-files`, and stays well under 100 ms.
 
 use crate::ecosystem;
 use crate::git;

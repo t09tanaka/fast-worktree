@@ -422,6 +422,47 @@ fn no_config_and_no_lockfiles() {
     assert_eq!(w.fw(&main, &["check"]).out(), "");
 }
 
+#[test]
+fn a_lockfile_at_the_repository_root_is_a_project() {
+    let w = World::new();
+    let main = w.main();
+    fs::write(main.join("package.json"), r#"{"name":"root"}"#).unwrap();
+    fs::write(main.join("package-lock.json"), lockfile("root")).unwrap();
+    w.git(&main, &["add", "-A"]);
+    w.git(&main, &["commit", "-qm", "root project"]);
+
+    let r = w.fw(&main, &["check", "--quiet"]);
+    assert!(r.out().contains("missing deps: .\n"), "{}", r.out());
+    let r = w.fw(&main, &["install", "."]);
+    r.assert_ok();
+    assert!(r.out().contains("npm ci . ("), "{}", r.out());
+    assert!(main.join("node_modules/.package-lock.json").is_file());
+    assert!(!r.out().contains(" app"), "only the named project");
+
+    // A worktree of the same commit gets the root project from the cache
+    // (macOS) or from npm ci.
+    let r = w.fw(&main, &["add", "../wt", "-b", "x", "HEAD"]);
+    r.assert_ok();
+    if cfg!(target_os = "macos") {
+        // The repository's cache directory (`<name>-<hash>`).
+        let from_cache = fs::read_dir(&w.cache)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name() != "trash")
+            .unwrap()
+            .path();
+        assert!(
+            r.out()
+                .contains(&format!("clone  . from {}/_root/", from_cache.display())),
+            "{}",
+            r.out()
+        );
+    } else {
+        assert!(r.out().contains("npm ci . ("), "{}", r.out());
+    }
+    assert!(w.base.join("wt/node_modules/.package-lock.json").is_file());
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;

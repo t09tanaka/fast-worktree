@@ -107,6 +107,7 @@ pub fn run(opts: Opts) -> Result<i32> {
     if std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
         std::env::set_current_dir(&main)?;
     }
+    trash::sweep();
     let dest = trash::trash(&path)?;
     git::output(&main, &["worktree", "prune"])?;
     println!(

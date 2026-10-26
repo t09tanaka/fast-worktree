@@ -74,8 +74,8 @@ fast-worktree check [--quiet]
 ```
 
 Lists the projects without `node_modules/.package-lock.json`. It always
-exits 0 and runs one `git ls-files`, so it fits in a `post-checkout`
-hook. `--quiet` prints only when something is missing.
+exits 0 and runs nothing but two quick `git` calls (no `node`, no
+`npm`), so it fits in a `post-checkout` hook. `--quiet` prints only when something is missing.
 
 ```sh
 fast-worktree remove <path> [--delete-branch]
