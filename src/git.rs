@@ -122,8 +122,11 @@ pub fn admin_dir(path: &Path) -> Result<PathBuf> {
         p.canonicalize().unwrap_or(p)
     };
     let (admin, common) = (real(git_dir), real(common));
+    // Absolute, or relative to the entry (`worktree.useRelativePaths`), as
+    // in [`find_admin`].
     let gitdir_file = fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
-    let points_back = Path::new(gitdir_file.trim_end_matches('\n'))
+    let points_back = admin
+        .join(gitdir_file.trim_end_matches('\n'))
         .parent()
         .and_then(|p| p.canonicalize().ok())
         .is_some_and(|p| p == path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));

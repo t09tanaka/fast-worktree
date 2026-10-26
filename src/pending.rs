@@ -158,18 +158,39 @@ pub fn detach(c: &mut Command) {
     }
 }
 
-/// An exclusive `flock` on `path`, without waiting. `None` when another
-/// process holds it (or it cannot be taken).
-fn try_flock(path: &Path) -> Option<fs::File> {
-    let f = fs::OpenOptions::new()
+/// What an attempt at the lock found.
+enum Flock {
+    /// Taken: nobody else holds it. It goes when the file is closed.
+    Taken(#[allow(dead_code)] fs::File),
+    /// Another process holds it (`EWOULDBLOCK`).
+    Held,
+    /// It could not be tried (the file cannot be opened, or the file
+    /// system has no locks: `ENOLCK`, `ENOTSUP`...), so it says nothing.
+    Unknown(io::Error),
+}
+
+/// An exclusive `flock` on `path`, without waiting.
+fn try_flock(path: &Path) -> Flock {
+    let f = match fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(path)
-        .ok()?;
+    {
+        Ok(f) => f,
+        Err(e) => return Flock::Unknown(e),
+    };
     // SAFETY: a valid open descriptor; the lock goes when it is closed.
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    (rc == 0).then_some(f)
+    if rc == 0 {
+        return Flock::Taken(f);
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Flock::Held
+    } else {
+        Flock::Unknown(e)
+    }
 }
 
 /// Run the background install: hold the lock, put this process in the
@@ -179,7 +200,7 @@ pub fn run_deferred(root: &Path, f: impl FnOnce() -> Result<i32>) -> i32 {
     let dir = git_dir(root);
     // Taken before the pid goes into the marker: whoever finds a pid there
     // also finds the lock held for as long as this process lives.
-    let _lock = dir.as_ref().and_then(|d| try_flock(&d.join(LOCK)));
+    let _lock = dir.as_ref().map(|d| try_flock(&d.join(LOCK)));
     if let Some(d) = &dir {
         let _ = fs::write(
             d.join(MARKER),
@@ -204,38 +225,80 @@ pub fn run_deferred(root: &Path, f: impl FnOnce() -> Result<i32>) -> i32 {
 /// has not written its pid yet.
 const PID_WAIT: Duration = Duration::from_secs(5);
 
+/// How long `remove` and `hook remove` give a background install to stop.
+pub const STOP_GRACE: Duration = Duration::from_secs(3);
+
+/// What [`stop`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    /// No background install was running.
+    NotRunning,
+    /// One was running, and it is gone now.
+    Stopped,
+    /// The marker names a process, but the lock could not be tried, so
+    /// nothing tells whether that process is the install: it was left
+    /// alone. Says why.
+    Unknown(String),
+}
+
 /// Stop the background install of `root`, if one is running, together with
 /// everything it started: `SIGTERM` to its process group, then `SIGKILL`
-/// to what is left after `grace`. Returns, once the group is gone, whether
-/// one was running.
-pub fn stop(root: &Path, grace: Duration) -> bool {
+/// to what is left after `grace`. Returns once the group is gone.
+///
+/// The pid in the marker is trusted only when the lock is held by another
+/// process: the marker of an install that was killed may name a pid that
+/// is someone else's now. When the lock cannot be tried at all, nothing is
+/// signalled; it waits up to `grace` for the marker to go away instead.
+pub fn stop(root: &Path, grace: Duration) -> Stop {
     let Some(dir) = git_dir(root) else {
-        return false;
+        return Stop::NotRunning;
     };
     let start = Instant::now();
     let pid = loop {
         let Ok(text) = fs::read_to_string(dir.join(MARKER)) else {
-            return false;
+            return Stop::NotRunning;
         };
         if let Some(pid) = marker_pid(&text) {
             break pid;
         }
         if marker_state(&text, now_secs()) != State::Running || start.elapsed() > PID_WAIT {
-            return false;
+            return Stop::NotRunning;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    // The pid is trusted only while the lock is held: the marker of an
-    // install that was killed may name a pid that is someone else's now.
-    if try_flock(&dir.join(LOCK)).is_some() {
-        return false;
+    match try_flock(&dir.join(LOCK)) {
+        Flock::Taken(_) => Stop::NotRunning,
+        Flock::Held => {
+            signal_group(pid, libc::SIGTERM);
+            if !group_gone_within(pid, grace) {
+                signal_group(pid, libc::SIGKILL);
+                group_gone_within(pid, Duration::from_secs(2));
+            }
+            Stop::Stopped
+        }
+        Flock::Unknown(e) => {
+            let start = Instant::now();
+            while start.elapsed() < grace {
+                if !dir.join(MARKER).exists() {
+                    return Stop::NotRunning;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Stop::Unknown(format!(
+                "cannot check the lock of the background install (pid {pid}): {e}; \
+                 it was not stopped"
+            ))
+        }
     }
-    signal_group(pid, libc::SIGTERM);
-    if !group_gone_within(pid, grace) {
-        signal_group(pid, libc::SIGKILL);
-        group_gone_within(pid, Duration::from_secs(2));
+}
+
+/// Print what [`stop`] did, for `remove` and `hook remove`.
+pub fn report_stop(s: &Stop) {
+    match s {
+        Stop::NotRunning => {}
+        Stop::Stopped => eprintln!("fast-worktree: stopped the background install"),
+        Stop::Unknown(why) => eprintln!("fast-worktree: warning: {why}"),
     }
-    true
 }
 
 /// The pid in a marker, `<unix seconds> <pid>`.
@@ -323,17 +386,44 @@ mod tests {
         let root = t.path();
         let dir = root.join(".git");
         fs::create_dir(&dir).unwrap();
-        assert!(!stop(root, Duration::from_secs(1)), "no marker");
+        assert_eq!(
+            stop(root, Duration::from_secs(1)),
+            Stop::NotRunning,
+            "no marker"
+        );
         // A live process that is not ours, named by a stale marker.
         let mut other = Command::new("sleep").arg("5").spawn().unwrap();
         fs::write(dir.join(MARKER), format!("1 {}\n", other.id())).unwrap();
-        assert!(!stop(root, Duration::from_secs(1)));
+        assert_eq!(stop(root, Duration::from_secs(1)), Stop::NotRunning);
         assert!(other.try_wait().unwrap().is_none(), "left alone");
         let _ = other.kill();
         let _ = other.wait();
         assert_eq!(marker_pid("1 42\n"), Some(42));
         assert_eq!(marker_pid("1\n"), None);
         assert_eq!(marker_pid("1 1\n"), None);
+    }
+
+    #[test]
+    fn stop_kills_nothing_when_the_lock_cannot_be_checked() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let dir = root.join(".git");
+        fs::create_dir(&dir).unwrap();
+        // A lock that cannot be opened says nothing about the pid.
+        fs::create_dir(dir.join(LOCK)).unwrap();
+        // In a group of its own, as the background install is: a signal
+        // to the group would reach it.
+        let mut c = Command::new("sleep");
+        c.arg("5");
+        detach(&mut c);
+        let mut other = c.spawn().unwrap();
+        fs::write(dir.join(MARKER), format!("1 {}\n", other.id())).unwrap();
+        let s = stop(root, Duration::from_millis(200));
+        assert!(matches!(s, Stop::Unknown(_)), "{s:?}");
+        let alive = other.try_wait().unwrap().is_none();
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(alive, "killed a process the lock did not vouch for");
     }
 
     #[test]

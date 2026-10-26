@@ -93,6 +93,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: HookCmd,
     },
+    /// List or prune the commits `hook remove` kept in refs/fast-worktree/kept/
+    Kept {
+        #[command(subcommand)]
+        cmd: KeptCmd,
+    },
     /// Wait for the background install that `hook create` started
     Wait {
         /// The worktree (default: the current one)
@@ -120,6 +125,18 @@ enum HookCmd {
     Remove,
     /// Print the hooks to paste into a Claude Code settings file
     PrintConfig,
+}
+
+#[derive(Subcommand)]
+enum KeptCmd {
+    /// List the kept refs with their commit and when they were kept
+    Ls,
+    /// Delete the kept refs older than a number of days
+    Prune {
+        /// Days since they were kept (default: 30)
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -186,6 +203,10 @@ fn main() {
             HookCmd::Remove => cmd::hook::remove(),
             HookCmd::PrintConfig => cmd::hook::print_config(),
         }),
+        Cmd::Kept { cmd } => match cmd {
+            KeptCmd::Ls => cmd::kept::ls(),
+            KeptCmd::Prune { older_than } => cmd::kept::prune(older_than),
+        },
         Cmd::Wait { path } => cmd::hook::wait(path.as_deref()),
     };
     let code = match result {

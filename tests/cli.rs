@@ -2369,6 +2369,21 @@ fn hook_remove_saves_the_git_directories_of_submodules() {
     r.assert_ok();
     assert!(!wt.exists());
     assert!(r.err().contains("submodule"), "{}", r.err());
+    // Its HEAD is in the main repository too, under the removal's group.
+    let refs = w.git(
+        &w.main(),
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/fast-worktree/",
+        ],
+    );
+    assert!(
+        refs.lines()
+            .any(|l| l.starts_with("refs/fast-worktree/kept/subs-")
+                && l.ends_with(&format!("/sub/sub {}", unpushed.trim()))),
+        "{refs}"
+    );
     let kept = w.kept();
     assert_eq!(kept.len(), 1, "{}", r.err());
     // The submodule's git directory went with it.
@@ -2745,6 +2760,64 @@ fn check_exits_0_when_its_stdout_is_closed_during_a_background_install() {
 }
 
 #[test]
+fn remove_stops_the_background_install_first() {
+    let w = World::new();
+    let main = w.main();
+    let r = w.hook_create(
+        "race",
+        &[("FAKE_NPM_SLEEP", "3"), ("FAKE_NPM_ABS_WRITE", "1")],
+    );
+    r.assert_ok();
+    let path = PathBuf::from(last_line(&r.out()));
+    wait_until("npm ci to start", || w.count("ci ") == 2);
+    let r = w.fw(&main, &["remove", &path.to_string_lossy()]);
+    r.assert_ok();
+    assert!(
+        r.err().contains("stopped the background install"),
+        "{}",
+        r.err()
+    );
+    assert!(!path.exists());
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    assert!(!path.exists(), "the background install brought it back");
+    let r = w.hook_create("race", &[]);
+    r.assert_ok();
+    assert_eq!(last_line(&r.out()), path.display().to_string());
+}
+
+/// A worktree whose `<admin>/gitdir` is relative to the admin directory,
+/// as git 2.48 and later write it with `worktree.useRelativePaths`.
+#[test]
+fn remove_finds_the_entry_of_a_worktree_with_relative_paths() {
+    let w = World::new();
+    let main = w.main();
+    w.git(
+        &main,
+        &[
+            "-c",
+            "worktree.useRelativePaths=true",
+            "worktree",
+            "add",
+            "-q",
+            "../rel",
+            "-b",
+            "rel",
+        ],
+    );
+    let rel = w.base.join("rel");
+    let gitdir = main.join(".git/worktrees/rel/gitdir");
+    let text = fs::read_to_string(&gitdir).unwrap();
+    if Path::new(text.trim()).is_absolute() {
+        // A git that ignores the setting: write what a newer one would.
+        fs::write(&gitdir, "../../../../rel/.git\n").unwrap();
+    }
+    let r = w.fw(&main, &["remove", &rel.to_string_lossy()]);
+    r.assert_ok();
+    assert!(!rel.exists());
+    assert!(!main.join(".git/worktrees/rel").exists());
+}
+
+#[test]
 fn install_leaves_the_node_modules_of_another_package_manager_alone() {
     let w = World::new();
     let main = w.main();
@@ -2771,4 +2844,214 @@ fn install_leaves_the_node_modules_of_another_package_manager_alone() {
         assert!(main.join("app/node_modules/.yarn-integrity").is_file());
         assert!(main.join("lib/node_modules/.modules.yaml").is_file());
     }
+}
+
+/// A submodule whose git directory is inside it (cloned and added, or
+/// left so by an earlier `hook remove`): the worktree is kept, and the
+/// submodule's HEAD is kept in a ref of the main repository.
+#[test]
+fn hook_remove_keeps_a_submodule_with_its_git_directory_inside() {
+    let w = World::new();
+    let main = w.main();
+    let sub_up = w.base.join("subup");
+    fs::create_dir_all(&sub_up).unwrap();
+    w.git(&sub_up, &["init", "-q", "-b", "trunk"]);
+    w.commit(&sub_up, &[("s.txt", "s")], "s");
+    let wt = w.hook_worktree("emb");
+    w.git(&wt, &["clone", "-q", &sub_up.to_string_lossy(), "sub"]);
+    w.commit(&wt.join("sub"), &[("mine.txt", "m")], "unpushed");
+    let unpushed = w.git(&wt.join("sub"), &["rev-parse", "HEAD"]);
+    let unpushed = unpushed.trim();
+    w.git(&wt, &["add", "sub"]);
+    w.git(&wt, &["commit", "-qm", "embedded"]);
+    assert!(wt.join("sub/.git").is_dir());
+    assert_eq!(w.git(&wt, &["status", "--porcelain"]), "");
+
+    let r = w.hook_remove(&wt);
+    r.assert_ok();
+    assert!(!wt.exists());
+    let kept = w.kept();
+    assert_eq!(kept.len(), 1, "{}", r.err());
+    assert!(kept[0].join("sub/.git").is_dir());
+    let refs = w.git(
+        &main,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/fast-worktree/",
+        ],
+    );
+    let sub_ref = refs
+        .lines()
+        .find(|l| l.contains("/sub/sub "))
+        .unwrap_or_else(|| panic!("no submodule ref in:\n{refs}\n{}", r.err()));
+    assert!(
+        sub_ref.starts_with("refs/fast-worktree/kept/emb-"),
+        "{refs}"
+    );
+    assert!(sub_ref.ends_with(unpushed), "{refs}");
+    assert!(r.err().contains("/sub/sub"), "{}", r.err());
+    // The commit is in the main repository now, and gc keeps it.
+    fs::remove_dir_all(&sub_up).unwrap();
+    w.git(&main, &["reflog", "expire", "--expire=now", "--all"]);
+    w.git(&main, &["gc", "-q", "--prune=now"]);
+    w.git(&main, &["cat-file", "-e", unpushed]);
+}
+
+#[test]
+fn hook_remove_keeps_no_ref_for_a_head_on_a_branch_that_stays() {
+    let w = World::new();
+    let main = w.main();
+    let wt = w.hook_worktree("mine");
+    w.commit(&wt, &[("new.txt", "x")], "own commit");
+    fs::write(wt.join("notes.txt"), "wip\n").unwrap();
+    let r = w.hook_remove(&wt);
+    r.assert_ok();
+    assert!(r.err().contains("kept branch worktree-mine"), "{}", r.err());
+    assert!(!r.err().contains("refs/fast-worktree/"), "{}", r.err());
+    assert_eq!(w.git(&main, &["for-each-ref", "refs/fast-worktree/"]), "");
+    let restore = after(&r.err(), "to restore them: ").to_string();
+    assert!(restore.contains(" worktree-mine && rsync"), "{restore}");
+}
+
+#[test]
+fn hook_remove_keeps_the_detached_head_of_a_worktree_inside() {
+    let w = World::new();
+    let main = w.main();
+    fs::write(main.join(".git/info/exclude"), ".claude/\n").unwrap();
+    let outer = w.hook_worktree("outer");
+    w.git(
+        &outer,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            ".claude/worktrees/inner",
+        ],
+    );
+    let inner = outer.join(".claude/worktrees/inner");
+    w.commit(&inner, &[("lonely.txt", "x")], "lonely");
+    let sha = w.git(&inner, &["rev-parse", "HEAD"]);
+    let r = w.hook_remove(&outer);
+    r.assert_ok();
+    let refs = w.git(
+        &main,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/fast-worktree/",
+        ],
+    );
+    let line = refs
+        .lines()
+        .find(|l| l.starts_with("refs/fast-worktree/kept/inner-"))
+        .unwrap_or_else(|| panic!("no ref for the inner worktree:\n{refs}\n{}", r.err()));
+    assert!(line.ends_with(sha.trim()), "{refs}");
+}
+
+#[test]
+fn kept_ls_and_prune() {
+    let w = World::new();
+    let main = w.main();
+    let head = w.git(&main, &["rev-parse", "HEAD"]);
+    let head = head.trim();
+    let now = w.git(
+        &main,
+        &[
+            "log",
+            "-1",
+            "--format=%cd",
+            "--date=format-local:%Y%m%d-%H%M%S",
+        ],
+    );
+    let fresh = format!("refs/fast-worktree/kept/new-1-{}/head", now.trim());
+    for r in [
+        "refs/fast-worktree/kept/old-20200101-000000/head",
+        "refs/fast-worktree/kept/old-20200101-000000/sub/a/b",
+        "refs/fast-worktree/kept/flat-20200102-030405-2",
+        fresh.as_str(),
+    ] {
+        w.git(&main, &["update-ref", r, head]);
+    }
+    let r = w.fw(&main, &["kept", "ls"]);
+    r.assert_ok();
+    for want in [
+        "old-20200101-000000/sub/a/b",
+        "flat-20200102-030405-2",
+        "new-1-",
+        "2020-01-02",
+    ] {
+        assert!(r.out().contains(want), "{want}: {}", r.out());
+    }
+    let r = w.fw(&main, &["kept", "prune"]);
+    r.assert_ok();
+    assert_eq!(
+        w.git(
+            &main,
+            &["for-each-ref", "--format=%(refname)", "refs/fast-worktree/"]
+        ),
+        format!("{fresh}\n"),
+        "{}",
+        r.out()
+    );
+    assert!(r.out().contains("pruned 3 refs"), "{}", r.out());
+    w.fw(&main, &["kept", "prune", "--older-than", "0"])
+        .assert_ok();
+    assert_eq!(w.git(&main, &["for-each-ref", "refs/fast-worktree/"]), "");
+}
+
+fn is_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+}
+
+#[test]
+fn hook_remove_puts_the_submodules_back_when_one_cannot_be_moved() {
+    if is_root() {
+        return; // a read-only directory does not stop root
+    }
+    let w = World::new();
+    let main = w.main();
+    let sub_up = w.base.join("subup");
+    fs::create_dir_all(&sub_up).unwrap();
+    w.git(&sub_up, &["init", "-q", "-b", "trunk"]);
+    w.commit(&sub_up, &[("s.txt", "s")], "s");
+    let wt = w.hook_worktree("two");
+    for name in ["sub", "sub2"] {
+        w.git(
+            &wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &sub_up.to_string_lossy(),
+                name,
+            ],
+        );
+    }
+    w.git(&wt, &["commit", "-qm", "two subs"]);
+    let admin = main.join(".git/worktrees/two");
+    // The second one cannot be moved: its `.git` file cannot be replaced.
+    let ro = |mode| fs::set_permissions(wt.join("sub2"), fs::Permissions::from_mode(mode));
+    ro(0o555).unwrap();
+    let r = w.hook_remove(&wt);
+    ro(0o755).unwrap();
+    r.assert_fails();
+    assert!(r.err().contains("still registered"), "{}", r.err());
+    for name in ["sub", "sub2"] {
+        assert!(wt.join(name).join(".git").is_file(), "{name}: {}", r.err());
+        assert!(
+            admin.join("modules").join(name).join("HEAD").is_file(),
+            "{name}"
+        );
+        assert_eq!(w.git(&wt.join(name), &["status", "--porcelain"]), "");
+    }
+    // Once it can be, it is.
+    w.hook_remove(&wt).assert_ok();
+    assert!(!wt.exists());
 }

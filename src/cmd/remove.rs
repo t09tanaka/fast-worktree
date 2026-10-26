@@ -11,7 +11,7 @@
 
 use crate::error::{bail, Error, Result};
 use crate::hooks::{self, Stage};
-use crate::{git, pool, trash, util};
+use crate::{git, pending, pool, trash, util};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -161,6 +161,9 @@ pub fn run(opts: Opts) -> Result<i32> {
     }
 
     let cfg = hooks::Config::load(&path)?;
+    // A background install that `hook create` left still writing into it
+    // would bring it back after the move.
+    pending::report_stop(&pending::stop(&path, pending::STOP_GRACE));
     let failed = hooks::run(&cfg, Stage::PreRemove, &path, &main);
     if failed > 0 {
         eprintln!("fast-worktree: {failed} pre_remove hook(s) failed; removing anyway");
