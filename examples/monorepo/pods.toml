@@ -1,0 +1,10 @@
+# A [[clone]] without a preset: mobile/ios/Pods, made by fake-pod.sh (a
+# stand-in for `pod install`). Append it to .fast-worktree.toml once it
+# lists the projects (`fast-worktree config init`).
+[[clone]]
+path = "mobile/ios/Pods"
+key = ["mobile/ios/Podfile.lock"]
+key_commands = ["sh fake-pod.sh --version"]
+install = "sh fake-pod.sh install"
+verify = "test -f Manifest.lock"
+rewrite_paths = true

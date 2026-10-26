@@ -10,6 +10,8 @@ fast-worktree check --quiet                     # what is missing
 fast-worktree remove ../app-feature             # gone at once, deleted in the background
 fast-worktree pool status                       # worktrees made ahead of time, if you want them
 fast-worktree hook print-config                 # Claude Code's worktrees, made by fast-worktree
+fast-worktree plan                              # where each project's files would come from
+fast-worktree config check                      # every lockfile listed in .fast-worktree.toml?
 ```
 
 ## What & why
@@ -46,6 +48,10 @@ and removing the worktree again means deleting tens of thousands of files.
   `.git/config`, [one at a time](#install-scripts).
 - **Flutter and Dart too.** A tracked `pubspec.lock` is a project: `flutter
   pub get --offline` (then online), or `dart pub get` without Flutter.
+- **Any other directory, by key.** A [`[[clone]]`](#what-each-worktree-gets-clone)
+  names a directory such as CocoaPods' `Pods` or a build cache, the files
+  that decide whether a copy can be reused, and the command that makes it;
+  it is cloned the same way, and `remove` hands it to the next worktree.
 - **Ignored files come along.** `.env` and other gitignored files listed
   in `.worktreeinclude` are copied into each new worktree.
 - **Removal by rename.** `remove` renames the worktree into a trash
@@ -93,8 +99,9 @@ its `Updating files` progress stay out of the output (its errors do not).
 fast-worktree install [--root <dir>] [--changed] [<project-dir>...]
 ```
 
-For every tracked `package-lock.json` and `pubspec.lock` (or only the
-given project directories), makes the dependencies present. A project is
+For every tracked `package-lock.json` and `pubspec.lock`, or for each
+[`[[clone]]`](#what-each-worktree-gets-clone) when there are any (or only
+the given project directories), makes the dependencies present. A project is
 named by its directory (relative to the current directory or to the
 worktree root); `root` names the one at the root (`.`), unless a project
 directory is called `root`, and the last part of a directory alone
@@ -337,7 +344,264 @@ size = 2
   the output. A file that does not exist is never equal, so the script
   runs. It applies only where fast-worktree runs the script itself, after a
   clone; `npm ci` and `npm install` run scripts on their own.
-- No file, no hooks. Unknown keys are warned about and ignored.
+- `[[clone]]` lists what each worktree gets; see
+  [below](#what-each-worktree-gets-clone). Without it, the projects are
+  found from the tracked lockfiles.
+- No file, no hooks. Unknown keys are warned about and ignored (`config
+  check` reports them).
+
+## What each worktree gets: `[[clone]]`
+
+Without any `[[clone]]` in `.fast-worktree.toml`, every tracked
+`package-lock.json` and `pubspec.lock` is a project, found by itself
+(above). That is all a repository needs to start. Once the file has one
+`[[clone]]`, only what the `[[clone]]` entries list is handled: a project
+they leave out gets nothing from `add`, `install`, `check` or the hooks, and
+`config check` (below) reports its lockfile.
+
+```toml
+[[clone]]
+preset = "npm"            # path = "api/node_modules", key = ["api/package-lock.json"],
+dir = "api"               # key_commands = ["node -v"], npm's own install and checks
+
+[[clone]]
+preset = "dart"
+dir = "mobile"
+
+[[clone]]                 # no preset: everything written out
+path = "mobile/ios/Pods"                # relative to the worktree root
+key = ["mobile/ios/Podfile.lock"]       # what decides whether a copy can be reused
+key_commands = ["pod --version"]        # their output is part of the key
+install = "pod install"                 # makes it when nothing can be cloned
+verify = "test -f Manifest.lock"        # optional: must pass after a clone
+rewrite_paths = true                    # optional: see below
+after = ["echo pods ready"]             # optional: after a clone or an install
+```
+
+- **A preset** fills in every field. `npm` is what a detected npm project
+  gets: `path = "<dir>/node_modules"`, `key = ["<dir>/package-lock.json"]`,
+  `key_commands = ["node -v"]`, and `npm ci` with everything described in
+  this README (the cache, other worktrees, the incremental install, the
+  tree check against `node_modules/.package-lock.json`, the project's own
+  install scripts after a clone, `skip_lifecycle`). `dart` is a `pub get`
+  as above, with `path = "<dir>/.dart_tool"` and `key =
+  ["<dir>/pubspec.lock"]`. `dir` defaults to `.`, the root.
+- **Any field of a preset can be written** to replace its default: `key`
+  with more files (their contents are hashed with the lockfile's),
+  `key_commands` (npm puts their output in the key in place of `node -v`'s,
+  joined with `-`), `install` (run instead of `npm ci` or `pub get`, in
+  `dir`), `verify`, `rewrite_paths`, `after`. With a preset, `path` must be
+  `<dir>/node_modules` (or `<dir>/.dart_tool`); it can stand in for `dir`.
+- **Without a preset**, `path` and `key` are required. `path` is made
+  present by the first of:
+  1. a cache entry with the same key (the contents of the `key` files and
+     the output of the `key_commands`);
+  2. a registered worktree whose `key` files are byte-identical, whose
+     `key_commands` print the same there and where `verify` passes;
+  3. `install`. Its result is stored in the cache. Without `install`,
+     nothing is made, and the directory only ever comes from the cache or
+     another worktree (a build cache, say).
+
+  A clone is one `clonefile(2)` call for the whole directory (macOS only;
+  elsewhere only `install` runs). After it, `verify` must exit 0 in `path`,
+  or the clone is thrown away and the next source is tried. With
+  `rewrite_paths`, the path of the worktree the directory was made in is
+  replaced with this worktree's path in its text files (files with a NUL
+  byte, and symlinks, are left alone). `key_commands`, `install` and
+  `after` run in `dir`, by default the parent of `path`; `verify` runs in
+  `path`. All of them run with `sh -c`, with `FAST_WORKTREE_PATH` and
+  `FAST_WORKTREE_MAIN` set. Unlike `node_modules`, the directory is not
+  checked for symlinks with an absolute target.
+- **Order.** The targets with a preset are installed first, in parallel,
+  then those without one: `pod install` needs what `flutter pub get`
+  generates.
+- **Removal gives to the next worktree.** When `remove` (or `hook remove`)
+  deletes a worktree after its checks, it first moves the `path` of each
+  `[[clone]]` without a preset into the cache, by rename (the cache is
+  usually on the same volume, so this is instant): when it was made from
+  the key files it has now (fast-worktree records the key in
+  `<path>/.fast-worktree-key`) or passes `verify`, and when the cache has
+  no entry with that key yet. The next worktree with that key clones it. A
+  worktree that `hook remove` keeps in the trash, because it had changes,
+  keeps its directories.
+
+In the [example](#example), `config init` writes the presets for the
+three projects, and [`pods.toml`](examples/monorepo/pods.toml) adds a
+`[[clone]]` for `mobile/ios/Pods`, made by a stand-in for `pod install`:
+
+```console
+$ fast-worktree config init
+add    [[clone]] preset = "npm", dir = "api"
+add    [[clone]] preset = "dart", dir = "mobile"
+add    [[clone]] preset = "npm", dir = "web"
+note   with [[clone]] in .fast-worktree.toml, only what it lists is installed; `fast-worktree config check` finds lockfiles it leaves out
+$ cat pods.toml >> .fast-worktree.toml
+$ git add .fast-worktree.toml && git commit -qm "[[clone]] entries"
+$ fast-worktree add ../monorepo-a -b feature/a HEAD
+worktree added in 0.0s
+copy   .env
+npm ci api (0.8s, waited 0.2s for lifecycle lock)
+pub get mobile (flutter, 0.5s)
+npm ci web (0.8s)
+install mobile/ios/Pods (sh fake-pod.sh install, 0.0s)
+deps done in 1.0s
+hook   post_add: echo "ready: $(basename "$FAST_WORKTREE_PATH")"
+ready: monorepo-a
+$ fast-worktree add ../monorepo-b -b feature/b HEAD
+worktree added in 0.1s
+copy   .env
+note   api: postinstall skipped, inputs unchanged
+clone  api from ~/Library/Caches/fast-worktree/monorepo-e8406f05/api/263f7cb8e0876026-v20.13.1 (0.1s)
+pub get mobile (flutter, 0.3s)
+clone  web from ~/Library/Caches/fast-worktree/monorepo-e8406f05/web/02ed81ddfaf462f9-v20.13.1 (0.3s)
+clone  mobile/ios/Pods from ~/Library/Caches/fast-worktree/monorepo-e8406f05/mobile__ios__Pods/d6937bd63decbc2e-365864a4 (0.0s)
+deps done in 0.3s
+hook   post_add: echo "ready: $(basename "$FAST_WORKTREE_PATH")"
+ready: monorepo-b
+$ sed "s|$HOME|~|" ../monorepo-b/mobile/ios/Pods/Target/Target.xcconfig
+PODS_ROOT = ~/monorepo-b/mobile/ios/Pods
+$ fast-worktree plan ../monorepo-b
+plan for ~/monorepo-b
+api (npm)
+  from  present (node_modules)
+mobile (pub)
+  from  present (.dart_tool)
+web (npm)
+  from  present (node_modules)
+mobile/ios/Pods (clone)
+  from  present
+```
+
+With the cache emptied (`cache prune --older-than 0`), `remove` keeps the
+`Pods` of the worktree it deletes, and the next worktree clones it:
+
+```console
+$ fast-worktree remove ../monorepo-a
+hook   pre_remove: echo "bye: $(basename "$FAST_WORKTREE_PATH")"
+bye: monorepo-a
+cache  mobile/ios/Pods kept as ~/Library/Caches/fast-worktree/monorepo-e8406f05/mobile__ios__Pods/d6937bd63decbc2e-365864a4
+removed ~/monorepo-a (moved to ~/Library/Caches/fast-worktree/trash/1793049431-73174-0735852000-monorepo-a, deleting in background)
+$ fast-worktree add ../monorepo-c -b feature/c HEAD
+worktree added in 0.1s
+copy   .env
+note   api: postinstall skipped, inputs unchanged
+clone  api from ~/monorepo-b/api/node_modules (0.2s)
+pub get mobile (flutter, 0.3s)
+clone  web from ~/monorepo-b/web/node_modules (0.4s)
+clone  mobile/ios/Pods from ~/Library/Caches/fast-worktree/monorepo-e8406f05/mobile__ios__Pods/d6937bd63decbc2e-365864a4 (0.0s)
+deps done in 0.4s
+hook   post_add: echo "ready: $(basename "$FAST_WORKTREE_PATH")"
+ready: monorepo-c
+```
+
+### `config init` and `config check`
+
+```sh
+fast-worktree config init [--dry-run]
+fast-worktree config check
+```
+
+`config init` adds a `[[clone]]` with its preset for each tracked lockfile
+that no `[[clone]]` names yet, at the end of `.fast-worktree.toml` (made if
+missing). What the file already says, comments included, is kept. With
+`--dry-run`, it prints the entries and writes nothing.
+
+`config check` exits 1 and lists what it finds:
+
+- `unlisted`: a tracked lockfile of a preset (`package-lock.json`,
+  `pubspec.lock`) that no `[[clone]]` names;
+- `missing`: a `[[clone]]` whose lockfile or `key` file does not exist;
+- `invalid`: a mistake in the file, such as an unknown key, an unknown
+  preset, a `path` that does not fit its preset, or a `[[clone]]` without a
+  preset that lacks `path` or `key`.
+
+It runs one `git ls-files` (the index, so a lockfile that is only staged
+counts) and looks at which files exist, so it is quick enough for a
+pre-commit hook. In a repository without any `[[clone]]` it does nothing
+and exits 0. After a new project was added in the example:
+
+```console
+$ mkdir tools && cp web/package.json web/package-lock.json tools/ && git add tools
+$ fast-worktree config check
+unlisted   tools/package-lock.json (npm) is in no [[clone]]; `fast-worktree config init` adds it
+1 problem in .fast-worktree.toml
+```
+
+As a pre-commit hook (`.git/hooks/pre-commit`, or the file your hook
+manager runs), skipped where fast-worktree is not installed:
+
+```sh
+#!/bin/sh
+command -v fast-worktree >/dev/null 2>&1 || exit 0
+exec fast-worktree config check
+```
+
+In CI (GitHub Actions):
+
+```yaml
+- run: cargo install fast-worktree --locked
+- run: fast-worktree config check
+```
+
+### `plan`
+
+```sh
+fast-worktree plan [<path>]
+```
+
+For each target, where its files would come from (`cache <entry>`,
+`worktree <path>`, `delta from <entry>` for npm's incremental install,
+`install (<command>)`, or `present`), and below it, one `not` line for
+each source passed over and why (no cache entry for the key, another key
+file or tool version in a worktree, `verify` failing...). It changes
+nothing: it reads files and runs only the `key_commands` (`node -v` for
+npm) and `verify`, which are meant to only look. With `<path>`, it is for
+that worktree as it is; without, for a new worktree with the current
+worktree's files (a new branch from origin's default branch may have other
+lockfiles), where nothing is present yet and the current worktree is one
+to clone from. In the example, before the first `add`:
+
+```console
+$ fast-worktree plan
+plan for a new worktree with the files of ~/monorepo
+api (npm)
+  from  install (npm ci)
+  not   cache: no entry 263f7cb8e0876026-v20.13.1
+  not   worktree ~/monorepo: no node_modules that matches package-lock.json
+  not   delta: no older cache entry for v20.13.1
+mobile (pub)
+  from  install (flutter pub get)
+  not   clone: pub keeps packages in a cache of its own
+web (npm)
+  from  install (npm ci)
+  not   cache: no entry 02ed81ddfaf462f9-v20.13.1
+  not   worktree ~/monorepo: no node_modules that matches package-lock.json
+  not   delta: no older cache entry for v20.13.1
+mobile/ios/Pods (clone)
+  from  install (sh fake-pod.sh install)
+  not   cache: no entry d6937bd63decbc2e-365864a4
+  not   worktree ~/monorepo: no mobile/ios/Pods
+```
+
+and after the `remove` above, with the npm entries gone from the cache:
+
+```console
+$ fast-worktree plan
+plan for a new worktree with the files of ~/monorepo
+api (npm)
+  from  worktree ~/monorepo-b/api/node_modules
+  not   cache: no entry 263f7cb8e0876026-v20.13.1
+  not   worktree ~/monorepo: no node_modules that matches package-lock.json
+mobile (pub)
+  from  install (flutter pub get)
+  not   clone: pub keeps packages in a cache of its own
+web (npm)
+  from  worktree ~/monorepo-b/web/node_modules
+  not   cache: no entry 02ed81ddfaf462f9-v20.13.1
+  not   worktree ~/monorepo: no node_modules that matches package-lock.json
+mobile/ios/Pods (clone)
+  from  cache ~/Library/Caches/fast-worktree/monorepo-e8406f05/mobile__ios__Pods/d6937bd63decbc2e-365864a4
+```
 
 ## Ignored files: `.worktreeinclude`
 
@@ -689,11 +953,16 @@ fast-worktree: kept branch worktree-work: commit 21f7c601e324 is not on its upst
   so two checkouts with the same name never share entries. Next to an
   entry, `<entry>.ok` records that it was checked when stored (below).
   Only a tree whose `.package-lock.json` matches the lockfile is stored.
+  A `[[clone]]` without a preset has its entries under
+  `<repo>-<hash>/<path, with / as __>/<key files sha256, 16 digits>-<key
+  commands' output sha256, 8 digits>`, and `<entry>.src` records the
+  worktree an entry was made in, for `rewrite_paths`.
   Entries unused for 7 days are removed; `cache prune` does it on demand.
   Clones share blocks with their source, so the cache costs almost no disk
   while worktrees made from it exist.
-- `node_modules/.fast-worktree-key` and `.dart_tool/fast-worktree-key`
-  record what an install was made from, for `install --changed`. A tree
+- `node_modules/.fast-worktree-key`, `.dart_tool/fast-worktree-key` and,
+  for a `[[clone]]` without a preset, `<path>/.fast-worktree-key` record
+  what an install was made from, for `install --changed` (and `remove`). A tree
   without one is compared with its lockfile.
 - Trash: `<cache>/trash`. When the trash is on another volume than the
   directory being deleted, that directory is renamed to a hidden
@@ -775,7 +1044,9 @@ again, at most twice.
 
 Cloning needs macOS `clonefile(2)`. On other platforms the clone and delta
 stages are skipped and every npm project gets `npm ci`; the post-checkout
-hook only lists. `add`, `check`, `remove`, `.worktreeinclude`, Dart
+hook only lists. A `[[clone]]` without a preset gets its `install`, and
+`remove` keeps nothing in the cache. `add`, `check`, `remove`,
+`.worktreeinclude`, Dart
 projects, the cache commands, the pool and the hooks work the same; there,
 `hook create` leaves every npm install to the background.
 

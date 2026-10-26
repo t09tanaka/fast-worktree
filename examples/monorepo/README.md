@@ -12,7 +12,12 @@ dependency each, and a Dart package without dependencies.
 - `mobile` is a Dart package: `flutter pub get` (or `dart pub get`) works
   offline because it has no dependencies.
 - `.worktreeinclude` lists `.env`, which `.gitignore` ignores.
-- `.fast-worktree.toml` also has one hook per stage.
+- `.fast-worktree.toml` also has one hook per stage. It has no
+  `[[clone]]`, so the projects are found from their lockfiles.
+- `mobile/ios` has a `Podfile.lock` and `fake-pod.sh`, an offline
+  stand-in for `pod install`, for trying a `[[clone]]` without a preset:
+  `fast-worktree config init` writes the presets for the three projects,
+  and `cat pods.toml >> .fast-worktree.toml` adds `mobile/ios/Pods`.
 
 fast-worktree works on a repository, so copy this directory out, commit it,
 and clone it (the clone gives it an `origin` to start branches from):
@@ -36,6 +41,18 @@ git commit -qam "web: ms 2.1.2"
 fast-worktree add ../fw-c -b feature/c HEAD
 
 fast-worktree cache ls
+
+# List the targets, and add mobile/ios/Pods (see the README).
+fast-worktree config init
+cat pods.toml >> .fast-worktree.toml
+fast-worktree config check
+git commit -qam "[[clone]] entries"
+fast-worktree plan
+fast-worktree add ../fw-d -b feature/d HEAD     # pod install (the stand-in)
+fast-worktree add ../fw-e -b feature/e HEAD     # Pods cloned from the cache (macOS)
+
+fast-worktree remove ../fw-e --delete-branch
+fast-worktree remove ../fw-d --delete-branch
 fast-worktree remove ../fw-c --delete-branch
 fast-worktree remove ../fw-b --delete-branch
 fast-worktree remove ../fw-a --delete-branch

@@ -273,7 +273,7 @@ pub fn explain_donor(
         } else if !probe.same_lockfile(&p) {
             format!("worktree {name}: {LOCKFILE} (or another key file) differs")
         } else if !probe.tree_matches(&p) {
-            format!("worktree {name}: node_modules does not match {LOCKFILE}")
+            format!("worktree {name}: no node_modules that matches {LOCKFILE}")
         } else {
             match probe.fingerprint(&p) {
                 Some(f) if f == fp => return Some(p.join("node_modules")),
@@ -1415,7 +1415,7 @@ mod tests {
         assert_eq!(
             why,
             vec![
-                "worktree /r/main: node_modules does not match package-lock.json",
+                "worktree /r/main: no node_modules that matches package-lock.json",
                 "worktree /r/a: package-lock.json (or another key file) differs",
                 "worktree /r/b: key_commands print v22, not v20",
                 "worktree /r/c: key_commands failed there",

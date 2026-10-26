@@ -16,7 +16,13 @@
 //!
 //! [pool]                # keep this many ready worktrees (read from the
 //! size = 2              # main checkout; default: the user config, else 0)
+//!
+//! [[clone]]             # what each worktree gets; without any, the
+//! preset = "npm"        # tracked lockfiles are detected
+//! dir = "api"
 //! ```
+//!
+//! `[[clone]]` is described in [`crate::ecosystem::target`].
 //!
 //! fast-worktree itself knows nothing about the tools a repository uses;
 //! anything repository-specific goes here.

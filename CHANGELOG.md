@@ -5,6 +5,41 @@ based on [Keep a Changelog](https://keepachangelog.com/), and this project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking
 change bumps the minor version).
 
+## [Unreleased]
+
+### Added
+
+- `[[clone]]` in `.fast-worktree.toml`: one kind of entry for what each
+  worktree gets. `preset = "npm"` and `preset = "dart"` with a `dir` fill
+  in what a detected project gets (`path`, `key`, `key_commands`, the
+  install and its checks); any of `key`, `key_commands`, `install`,
+  `verify`, `rewrite_paths` and `after` replaces a preset's default. A
+  `[[clone]]` without a preset names a directory (`path`) and the files
+  whose contents decide whether a copy can be reused (`key`), and is made
+  present from the cache, else from a registered worktree whose key files
+  are byte-identical, whose `key_commands` print the same and where
+  `verify` passes, else by its `install`, whose result is cached. After a
+  clone, `verify` must pass, `rewrite_paths` replaces the source
+  worktree's path with the new one in its text files, and `after` runs.
+  Targets with a preset are installed before those without.
+- When a `.fast-worktree.toml` has at least one `[[clone]]`, only what the
+  entries list is handled; without any, the tracked lockfiles are detected
+  as before, with the same cache keys.
+- `remove`, and `hook remove` for a worktree it does not keep, move the
+  directory of each `[[clone]]` without a preset into the cache before the
+  worktree goes (a rename), when it matches its key or passes `verify` and
+  the cache has no entry for that key, so the next worktree clones it.
+- `config init [--dry-run]` adds a `[[clone]]` for each tracked lockfile
+  that has none, keeping the rest of the file and its comments.
+- `config check` exits 1 when a tracked lockfile is in no `[[clone]]`, a
+  `[[clone]]` names a file that does not exist, or the file has a mistake
+  (an unknown key or preset, a `path` that does not fit its preset). It
+  runs one `git ls-files`, for pre-commit hooks and CI, and does nothing
+  in a repository without `[[clone]]`.
+- `plan [<path>]` lists, for each target, where its files would come
+  from (a cache entry, a worktree, an incremental install, an install)
+  and why the sources before it are not used, without changing anything.
+
 ## [0.2.1] - 2026-10-27
 
 ### Changed

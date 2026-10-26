@@ -482,6 +482,27 @@ install = "pod install""#)
     }
 
     #[test]
+    fn listed_targets_are_all_there_is() {
+        // With [[clone]] entries nothing is detected: no git runs here.
+        let cfg = crate::hooks::parse("[[clone]]\npreset = \"npm\"\ndir = \"api\"\n")
+            .unwrap()
+            .0;
+        let got = targets(Path::new("/nonexistent-root"), &cfg).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "api");
+        let bad = crate::hooks::parse("[[clone]]\npreset = \"none\"\n")
+            .unwrap()
+            .0;
+        let e = targets(Path::new("/nonexistent-root"), &bad).unwrap_err().0;
+        assert!(
+            e.starts_with(".fast-worktree.toml: clone[0]: unknown preset"),
+            "{e}"
+        );
+        // Without any, they are detected (and git is asked).
+        assert!(targets(Path::new("/nonexistent-root"), &Config::default()).is_err());
+    }
+
+    #[test]
     fn normalized_paths() {
         assert_eq!(normalize("./a/b/"), "a/b");
         assert_eq!(normalize(""), ".");
