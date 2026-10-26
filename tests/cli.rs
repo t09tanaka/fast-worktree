@@ -2743,3 +2743,32 @@ fn check_exits_0_when_its_stdout_is_closed_during_a_background_install() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn install_leaves_the_node_modules_of_another_package_manager_alone() {
+    let w = World::new();
+    let main = w.main();
+    fs::create_dir_all(main.join("app/node_modules")).unwrap();
+    fs::write(main.join("app/node_modules/.yarn-integrity"), "{}").unwrap();
+    fs::create_dir_all(main.join("lib/node_modules")).unwrap();
+    fs::write(main.join("lib/node_modules/.modules.yaml"), "x: 1\n").unwrap();
+    for args in [&["install"][..], &["install", "--changed"][..]] {
+        let r = w.fw(&main, args);
+        r.assert_ok();
+        assert!(
+            r.out()
+                .contains("note   app: node_modules was installed by yarn"),
+            "{}",
+            r.out()
+        );
+        assert!(
+            r.out()
+                .contains("note   lib: node_modules was installed by pnpm"),
+            "{}",
+            r.out()
+        );
+        assert_eq!(w.count("ci "), 0, "{}", w.npm_log());
+        assert!(main.join("app/node_modules/.yarn-integrity").is_file());
+        assert!(main.join("lib/node_modules/.modules.yaml").is_file());
+    }
+}

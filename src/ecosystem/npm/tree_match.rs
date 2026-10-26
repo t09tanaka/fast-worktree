@@ -12,7 +12,10 @@
 //! - in both, with a different `version`; a different `integrity` or
 //!   `resolved` when both have one (a git dependency whose `#<commit>`
 //!   moved keeps its version and has no integrity); or `link` on one side
-//!   only: `diff`
+//!   only: `diff`. A registry tarball's `resolved` is compared without its
+//!   scheme and host, so that a tree installed through a mirror matches a
+//!   lockfile written against another registry; git sources (`git+...`,
+//!   anything with `#`), `file:` and link targets are compared whole.
 //! - in the lockfile but not in the tree, unless `optional`, `devOptional`
 //!   or `peer` (npm may legitimately leave those out): `missing`
 //!
@@ -40,13 +43,14 @@ pub fn tree_matches(lockfile: &[u8], hidden: &[u8]) -> Result<(), Vec<String>> {
         match lock.get(k) {
             None => why.push(format!("extra {k}")),
             Some(l) => {
-                let both_and_differ = |f: &str| {
-                    let (a, b) = (l.get(f), v.get(f));
-                    truthy(a) && truthy(b) && a != b
-                };
+                let both_and_differ =
+                    |f: &str, same: fn(&Value, &Value) -> bool| match (l.get(f), v.get(f)) {
+                        (Some(a), Some(b)) if truthy(Some(a)) && truthy(Some(b)) => !same(a, b),
+                        _ => false,
+                    };
                 if l.get("version") != v.get("version")
-                    || both_and_differ("integrity")
-                    || both_and_differ("resolved")
+                    || both_and_differ("integrity", |a, b| a == b)
+                    || both_and_differ("resolved", same_source)
                     || truthy(l.get("link")) != truthy(v.get("link"))
                 {
                     why.push(format!("diff {k}"));
@@ -68,6 +72,30 @@ pub fn tree_matches(lockfile: &[u8], hidden: &[u8]) -> Result<(), Vec<String>> {
         why.truncate(3);
         Err(why)
     }
+}
+
+/// Whether two `resolved` values name the same source: registry tarballs
+/// by their path, anything else whole.
+fn same_source(a: &Value, b: &Value) -> bool {
+    match (a.as_str(), b.as_str()) {
+        (Some(a), Some(b)) => registry_path(a) == registry_path(b),
+        _ => a == b,
+    }
+}
+
+/// An `http(s)://` tarball URL without its scheme and host
+/// (`/a/-/a-1.0.0.tgz`). Anything with a `#` (a git commit) and anything
+/// else is returned as it is.
+fn registry_path(s: &str) -> &str {
+    if s.contains('#') {
+        return s;
+    }
+    for scheme in ["https://", "http://"] {
+        if let Some(rest) = s.strip_prefix(scheme) {
+            return rest.find('/').map_or(s, |i| &rest[i..]);
+        }
+    }
+    s
 }
 
 /// JavaScript truthiness of an optional JSON value.
@@ -144,6 +172,37 @@ mod tests {
         // Compared only when both have one, like integrity.
         let bare = pkgs(json!({ "node_modules/a": { "version": "1.0.0" } }));
         assert_eq!(check(at("bbb"), bare), Ok(()));
+    }
+
+    #[test]
+    fn a_registry_tarball_is_compared_without_its_host() {
+        let at =
+            |url: &str| pkgs(json!({ "node_modules/a": { "version": "1.0.0", "resolved": url } }));
+        let npmjs = "https://registry.npmjs.org/a/-/a-1.0.0.tgz";
+        assert_eq!(
+            check(at(npmjs), at("https://mirror.example.com/a/-/a-1.0.0.tgz")),
+            Ok(())
+        );
+        assert_eq!(
+            check(at(npmjs), at("http://127.0.0.1:4873/a/-/a-1.0.0.tgz")),
+            Ok(())
+        );
+        assert!(check(at(npmjs), at("https://registry.npmjs.org/a/-/a-1.0.1.tgz")).is_err());
+        // Git and file sources are compared whole.
+        for (x, y) in [
+            (
+                "git+https://example.com/a.git#aaa",
+                "git+https://example.org/a.git#aaa",
+            ),
+            (
+                "https://example.com/a.tgz#aaa",
+                "https://example.org/a.tgz#aaa",
+            ),
+            ("file:../a", "file:../b"),
+        ] {
+            assert!(check(at(x), at(y)).is_err(), "{x} {y}");
+            assert_eq!(check(at(x), at(x)), Ok(()), "{x}");
+        }
     }
 
     #[test]

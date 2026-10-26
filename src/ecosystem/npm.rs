@@ -21,9 +21,12 @@
 //! What steps 2 to 4 produce is cloned into the cache.
 //!
 //! Only a tree whose `node_modules/.package-lock.json` matches the lockfile
-//! goes into the cache. A `node_modules` without `.package-lock.json` (an
-//! install that did not finish) does not count as installed: it is moved to
-//! the trash and installed again.
+//! goes into the cache (for a `lockfileVersion` 1 lockfile, which has no
+//! `packages` to compare, a tree with a `.package-lock.json`). A
+//! `node_modules` without `.package-lock.json` (an install that did not
+//! finish) does not count as installed: it is moved to the trash and
+//! installed again, unless another package manager made it ([`foreign`]):
+//! then it is left alone with a note, and nothing is installed.
 //!
 //! The key is the first 16 hex digits of the lockfile's sha256 plus the
 //! `node -v` that the project directory resolves (version managers pick
@@ -219,6 +222,13 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
     let node_modules = target.join("node_modules");
     let mut lines = Vec::new();
     let mut present = node_modules.symlink_metadata().is_ok();
+    if present {
+        if let Some(by) = foreign(&target) {
+            return Ok(Report::kept(format!(
+                "note   {dir}: node_modules was installed by {by}; left as it is"
+            )));
+        }
+    }
     if present && !mode.reinstalls_changed() {
         if Npm.is_installed(&target) {
             return Ok(Report::kept(format!(
@@ -349,6 +359,40 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
     Ok(Report::done(lines.join("\n")))
 }
 
+/// The package manager other than npm that made `project/node_modules`,
+/// from what it leaves there: such a tree has no `.package-lock.json`, and
+/// moving it away and running `npm ci` would replace it with a different
+/// one.
+fn foreign(project: &Path) -> Option<&'static str> {
+    let nm = project.join("node_modules");
+    let marks = [
+        (".yarn-integrity", "yarn"),
+        (".yarn-state.yml", "yarn"),
+        (".modules.yaml", "pnpm"),
+        (".bun", "bun"),
+    ];
+    if let Some((_, by)) = marks
+        .iter()
+        .find(|(m, _)| nm.join(m).symlink_metadata().is_ok())
+    {
+        return Some(by);
+    }
+    // bun's default (hoisted) layout leaves nothing of its own in
+    // node_modules; its lockfile beside a tree npm did not record is the
+    // sign.
+    let bun_lock = ["bun.lock", "bun.lockb"]
+        .iter()
+        .any(|l| project.join(l).is_file());
+    (bun_lock && !project.join(HIDDEN_LOCKFILE).exists()).then_some("bun")
+}
+
+/// Whether the lockfile has a `packages` map (`lockfileVersion` 2 and 3),
+/// the part [`tree_match`] compares. Version 1 has only `dependencies`.
+fn has_packages(lockfile: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(lockfile)
+        .is_ok_and(|v| v.get("packages").is_some_and(|p| p.is_object()))
+}
+
 /// Whether the installed tree is the one this lockfile and Node version
 /// ask for. Trees installed by fast-worktree carry their key: a different
 /// Node version means installing again, a different lockfile only if the
@@ -370,7 +414,9 @@ fn write_key(project: &Path, key: &str) {
 /// Store in the cache, noting a failure among `lines`. Only a tree whose
 /// `.package-lock.json` matches `lockfile` is stored: anything else (an
 /// install that wrote part of the tree) would be cloned into every later
-/// worktree, and marked as checked.
+/// worktree, and marked as checked. A version 1 lockfile has no `packages`
+/// to compare with (npm records the tree in the newer format): there, a
+/// `.package-lock.json` is enough.
 fn save(
     node_modules: &Path,
     entry: &Path,
@@ -381,7 +427,9 @@ fn save(
 ) {
     let stored = match fs::read(node_modules.join(".package-lock.json")) {
         Err(_) => Err("node_modules has no .package-lock.json".to_string()),
-        Ok(hidden) if tree_match::tree_matches(lockfile, &hidden).is_err() => {
+        Ok(hidden)
+            if has_packages(lockfile) && tree_match::tree_matches(lockfile, &hidden).is_err() =>
+        {
             Err("node_modules does not match package-lock.json".to_string())
         }
         Ok(_) => cache::store(node_modules, entry, checked),
@@ -592,6 +640,34 @@ mod tests {
         );
         fs::write(p.join(HIDDEN_LOCKFILE), b"{\"packages\":{}}").unwrap();
         assert!(!is_current(p, lock, "bbbb-v20"));
+    }
+
+    #[test]
+    fn a_tree_from_a_version_1_lockfile_is_saved_when_npm_recorded_it() {
+        let t = tempfile::tempdir().unwrap();
+        let nm = t.path().join("node_modules");
+        fs::create_dir(&nm).unwrap();
+        // npm 7+ records the tree in the new format, whatever the lockfile.
+        fs::write(
+            nm.join(".package-lock.json"),
+            br#"{"lockfileVersion":3,"packages":{"node_modules/a":{"version":"1.0.0"}}}"#,
+        )
+        .unwrap();
+        let v1 = br#"{"lockfileVersion":1,"dependencies":{"a":{"version":"1.0.0"}}}"#;
+        let mut lines = Vec::new();
+        save(&nm, &t.path().join("entry"), true, v1, "app", &mut lines);
+        assert!(
+            !lines.iter().any(|l| l.contains("package-lock.json")),
+            "{lines:?}"
+        );
+        // Without the record it is still not saved.
+        fs::remove_file(nm.join(".package-lock.json")).unwrap();
+        let mut lines = Vec::new();
+        save(&nm, &t.path().join("entry2"), true, v1, "app", &mut lines);
+        assert!(
+            lines.iter().any(|l| l.contains("no .package-lock.json")),
+            "{lines:?}"
+        );
     }
 
     #[test]
