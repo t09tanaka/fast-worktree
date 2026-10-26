@@ -1,0 +1,20 @@
+# Runs in the new worktree's root after `add` / `install`.
+[[post_add]]
+run = 'echo "ready: $(basename "$FAST_WORKTREE_PATH")"'
+
+# Runs before `remove` moves the worktree away. A typical use is stopping
+# the worktree's containers:
+#
+#   [[pre_remove]]
+#   run = 'docker compose -p "$(basename "$FAST_WORKTREE_PATH")" down -v --remove-orphans'
+#   requires = "docker"
+[[pre_remove]]
+run = 'echo "bye: $(basename "$FAST_WORKTREE_PATH")"'
+
+# api's postinstall generates code into node_modules from schema.json and
+# keeps a copy of the schema there. After a clone, skip it when the copy
+# matches: the cloned node_modules already holds the generated code.
+[[skip_lifecycle]]
+dir = "api"
+script = "postinstall"
+if_equal = [["schema.json", "node_modules/.codegen/schema.json"]]
