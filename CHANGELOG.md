@@ -7,6 +7,53 @@ change bumps the minor version).
 
 ## [Unreleased]
 
+## [0.2.0]
+
+### Added
+
+- Incremental npm installs: when no cache entry or worktree matches a
+  changed lockfile, the project's most recently used cache entry for the
+  same Node version is cloned and updated with `npm install
+  --prefer-offline --no-audit --no-fund`. The result is used only if
+  `package-lock.json` is unchanged afterwards and the installed tree
+  matches it; otherwise the lockfile is restored and `npm ci` runs.
+  Printed as `delta  <dir> from <entry>`.
+- `[[skip_lifecycle]]` in `.fast-worktree.toml` (`dir`, `script`,
+  `if_equal`): after a clone, a project's own lifecycle script is not run
+  when every listed pair of files is byte-identical. A missing file is
+  never equal.
+- `.worktreeinclude` (`.gitignore` syntax, read from the main checkout):
+  `add` copies the gitignored files it matches into the new worktree,
+  without overwriting anything there.
+- Dart and Flutter projects, one per tracked `pubspec.lock`: `flutter pub
+  get --offline`, then online if that fails, or `dart pub get` without
+  Flutter; a note when neither is installed.
+- `check --post-checkout <prev> <new> <flag>` for a `post-checkout` hook:
+  on a new worktree or clone it clones what the cache or other worktrees
+  have and lists the rest; on other checkouts it only lists. Always exits
+  0; does nothing with `CI` set or `FAST_WORKTREE_SKIP=1`. `add` sets
+  `FAST_WORKTREE_SKIP=1` for its `git worktree add`.
+- `install --changed`: also install again where the lockfile or the Node
+  version changed since the last install (recorded in
+  `node_modules/.fast-worktree-key` and `.dart_tool/fast-worktree-key`).
+- `cache ls` and `cache prune [--older-than <days>]`.
+
+### Changed
+
+- Cache entries are checked for absolute symlinks once, when stored, and
+  marked with `<entry>.ok`; clones from the cache no longer walk the tree.
+  An install result with an absolute symlink is not cached.
+- `check` names the ecosystem: `missing deps: api (npm)`.
+
+### Fixed
+
+- A project's own lifecycle script failing after a clone, or `npm ci`
+  failing, no longer leaves a `node_modules` that the next `install`
+  skips as present.
+- `remove --delete-branch` refuses a branch that `git branch -d` would
+  keep before removing anything, instead of removing the worktree and
+  then failing.
+
 ## [0.1.0]
 
 ### Added
