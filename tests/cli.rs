@@ -859,7 +859,9 @@ fn worktreeinclude_copies_only_ignored_matches() {
     // A branch that tracks a file the main checkout has as ignored.
     w.git(&main, &["switch", "-qc", "with-local"]);
     fs::write(main.join(".env.local"), "from branch\n").unwrap();
-    w.git(&main, &["add", "-f", ".env.local"]);
+    fs::create_dir_all(main.join("config")).unwrap();
+    fs::write(main.join("config/app.json"), "from branch\n").unwrap();
+    w.git(&main, &["add", "-f", ".env.local", "config/app.json"]);
     w.git(&main, &["commit", "-qm", "track .env.local"]);
     w.git(&main, &["switch", "-q", "trunk"]);
     for (f, body) in [
@@ -908,10 +910,20 @@ fn worktreeinclude_copies_only_ignored_matches() {
         "{}",
         r.out()
     );
+    // A directory both sides have is merged: its other files still come.
+    assert!(r.out().contains("copy   config/db.json\n"), "{}", r.out());
     let wt2 = w.base.join("wt2");
     assert_eq!(
         fs::read_to_string(wt2.join(".env.local")).unwrap(),
         "from branch\n"
+    );
+    assert_eq!(
+        fs::read_to_string(wt2.join("config/app.json")).unwrap(),
+        "from branch\n"
+    );
+    assert_eq!(
+        fs::read_to_string(wt2.join("config/db.json")).unwrap(),
+        "{}\n"
     );
     assert_eq!(fs::read_to_string(wt2.join(".env")).unwrap(), "main env\n");
     status_is_clean(&w, &wt2);
@@ -1162,14 +1174,14 @@ fn cache_ls_and_prune() {
     );
     assert!(r
         .out()
-        .contains("pruned 1 entries unused for more than 7 days"));
+        .contains("pruned 1 entry unused for more than 7 days"));
     assert!(!old.exists());
     assert!(!old_marker.exists());
     assert!(new.exists());
 
     let r = w.fw(&main, &["cache", "prune", "--older-than", "0"]);
     r.assert_ok();
-    assert!(r.out().contains("pruned 1 entries"), "{}", r.out());
+    assert!(r.out().contains("pruned 1 entry "), "{}", r.out());
     assert!(w
         .fw(&main, &["cache", "ls"])
         .out()

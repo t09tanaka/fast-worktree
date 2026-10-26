@@ -10,3 +10,11 @@ run = 'echo "ready: $(basename "$FAST_WORKTREE_PATH")"'
 #   requires = "docker"
 [[pre_remove]]
 run = 'echo "bye: $(basename "$FAST_WORKTREE_PATH")"'
+
+# api's postinstall generates code into node_modules from schema.json and
+# keeps a copy of the schema there. After a clone, skip it when the copy
+# matches: the cloned node_modules already holds the generated code.
+[[skip_lifecycle]]
+dir = "api"
+script = "postinstall"
+if_equal = [["schema.json", "node_modules/.codegen/schema.json"]]

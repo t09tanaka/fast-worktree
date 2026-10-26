@@ -1,0 +1,5 @@
+name: example_mobile
+description: A Dart package with no dependencies, so pub get works offline.
+publish_to: none
+environment:
+  sdk: ^3.0.0

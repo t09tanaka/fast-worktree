@@ -27,7 +27,7 @@ pub fn ls() -> i32 {
         })
         .collect();
     print!("{}", table(&["REPO", "DIR", "KEY", "LAST USED"], &rows));
-    println!("{} entries in {}", entries.len(), util::tilde(&root));
+    println!("{} in {}", count(entries.len()), util::tilde(&root));
     0
 }
 
@@ -40,10 +40,15 @@ pub fn prune(older_than_days: Option<u64>) -> i32 {
         println!("pruned {}", rel.display());
     }
     println!(
-        "pruned {} entries unused for more than {days} days (deleting in background)",
-        removed.len()
+        "pruned {} unused for more than {days} days (deleting in background)",
+        count(removed.len())
     );
     0
+}
+
+/// `1 entry`, `2 entries`.
+fn count(n: usize) -> String {
+    format!("{n} {}", if n == 1 { "entry" } else { "entries" })
 }
 
 /// Left-aligned columns separated by two spaces.

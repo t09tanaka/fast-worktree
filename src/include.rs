@@ -51,19 +51,33 @@ pub fn copy(main: &Path, dst: &Path) -> Result<Copied, String> {
     .map_err(|e| e.to_string())?;
     let mut out = Copied::default();
     for c in candidates(&listing, &rules, main) {
-        let rel = c.to_string_lossy().into_owned();
-        let to = dst.join(&c);
-        if to.symlink_metadata().is_ok() {
-            out.kept.push(rel);
-            continue;
-        }
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("{rel}: {e}"))?;
-        }
-        clone::copy_tree(&main.join(&c), &to).map_err(|e| format!("{rel}: {e}"))?;
-        out.copied.push(rel);
+        put(&main.join(&c), &dst.join(&c), &c, &mut out)?;
     }
     Ok(out)
+}
+
+/// Copy `src` to `to` unless something is there. A directory that exists
+/// on both sides is merged entry by entry, so its other files still come.
+fn put(src: &Path, to: &Path, rel: &Path, out: &mut Copied) -> Result<(), String> {
+    let name = rel.to_string_lossy().into_owned();
+    match to.symlink_metadata() {
+        Ok(m) if m.is_dir() && src.symlink_metadata().is_ok_and(|s| s.is_dir()) => {
+            let entries = fs::read_dir(src).map_err(|e| format!("{name}: {e}"))?;
+            for e in entries.flatten() {
+                let n = e.file_name();
+                put(&e.path(), &to.join(&n), &rel.join(&n), out)?;
+            }
+        }
+        Ok(_) => out.kept.push(name),
+        Err(_) => {
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("{name}: {e}"))?;
+            }
+            clone::copy_tree(src, to).map_err(|e| format!("{name}: {e}"))?;
+            out.copied.push(name);
+        }
+    }
+    Ok(())
 }
 
 /// The paths (files, or directories copied whole) to copy, relative to
