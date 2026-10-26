@@ -13,7 +13,7 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// What an install needs to know about its surroundings.
 pub struct Ctx {
@@ -114,7 +114,7 @@ pub trait Ecosystem: Sync {
     /// what those steps wrote by absolute path points into the pool) and
     /// its tracked files may have changed. `cache_repo` is the
     /// repository's directory in the cache (for [`lifecycle_lock`]).
-    /// Returns notes to print. On failure the dependencies are moved away,
+    /// Returns notes to print, with the time waited for that lock. On failure the dependencies are moved away,
     /// so the next `install` installs them again.
     fn rerun_own_scripts(
         &self,
@@ -133,15 +133,21 @@ pub const LIFECYCLE_LOCK: &str = "lifecycle.lock";
 
 /// An exclusive `flock` on `<cache_repo>/lifecycle.lock`, held while the
 /// value lives.
-pub struct LifecycleLock(#[allow(dead_code)] Option<fs::File>);
+pub struct LifecycleLock {
+    _file: Option<fs::File>,
+    /// How long taking it waited for another holder.
+    pub waited: Duration,
+}
 
-/// Wait until no other run of a project's own lifecycle in this repository
-/// is going on (in another process, or for another project in this one),
-/// and hold the lock. Those scripts often write the repository's shared
-/// `.git/config` (`git config core.hooksPath ...`), which git lets only one
-/// writer hold at a time. A lock that cannot be taken (a file system
-/// without locks, say) is not waited for.
+/// Wait until no other run of install scripts in this repository is going
+/// on (in another process, or for another project in this one), and hold
+/// the lock. Those scripts (a project's own `prepare`, a dependency's
+/// `postinstall`) often write the repository's shared `.git/config` (`git
+/// config core.hooksPath ...`), which git lets only one writer hold at a
+/// time. A lock that cannot be taken (a file system without locks, say) is
+/// not waited for.
 pub fn lifecycle_lock(cache_repo: &Path) -> LifecycleLock {
+    let start = Instant::now();
     let file = fs::create_dir_all(cache_repo).and_then(|()| {
         fs::OpenOptions::new()
             .create(true)
@@ -149,18 +155,37 @@ pub fn lifecycle_lock(cache_repo: &Path) -> LifecycleLock {
             .write(true)
             .open(cache_repo.join(LIFECYCLE_LOCK))
     });
+    let held = |file| LifecycleLock {
+        _file: file,
+        waited: start.elapsed(),
+    };
     let Ok(f) = file else {
-        return LifecycleLock(None);
+        return held(None);
     };
     loop {
         // SAFETY: a valid open descriptor; the lock goes when it is closed.
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return LifecycleLock(Some(f));
+            return held(Some(f));
         }
         if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            return LifecycleLock(None);
+            return held(None);
         }
     }
+}
+
+/// The time a step took, without what it waited for the lifecycle lock,
+/// and that wait when there was one: `1.2s` or `1.2s, waited 4.1s for
+/// lifecycle lock`.
+pub fn timing(start: Instant, waited: Duration) -> String {
+    let took = start.elapsed().saturating_sub(waited);
+    if waited < Duration::from_millis(50) {
+        return format!("{:.1}s", took.as_secs_f64());
+    }
+    format!(
+        "{:.1}s, waited {:.1}s for lifecycle lock",
+        took.as_secs_f64(),
+        waited.as_secs_f64()
+    )
 }
 
 /// What git prints when another process holds a config file it is about

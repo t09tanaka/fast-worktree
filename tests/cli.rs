@@ -24,9 +24,22 @@ exclusive() {
   sleep 0.5
   rmdir "$FAKE_NPM_EXCLUSIVE"
 }
+# `npm ci --ignore-scripts` of several projects at once: each one waits
+# (at most 5 seconds) until $FAKE_NPM_TOGETHER of them have started.
+together() {
+  [ -n "$FAKE_NPM_RDV" ] || return 0
+  mkdir -p "$FAKE_NPM_RDV"; : > "$FAKE_NPM_RDV/$(echo "$P" | tr / _)"
+  i=0
+  while [ "$(ls "$FAKE_NPM_RDV" | wc -l)" -lt "$FAKE_NPM_TOGETHER" ]; do
+    i=$((i + 1)); [ $i -le 100 ] || { echo "fake npm: ci ran alone" >&2; exit 1; }
+    sleep 0.05
+  done
+}
 case "$1" in
   ci)
-    exclusive
+    # Without --ignore-scripts, npm ci runs the project's own lifecycle.
+    together
+    [ "$2" = "--ignore-scripts" ] || exclusive
     if [ -n "$FAKE_NPM_SLEEP" ]; then sleep "$FAKE_NPM_SLEEP"; fi
     # Like npm, which resolves its prefix once: write by absolute path.
     if [ -n "$FAKE_NPM_ABS_WRITE" ]; then mkdir -p "$P/node_modules/late"; fi
@@ -40,10 +53,20 @@ case "$1" in
     if [ -n "$FAKE_NPM_ABS_LINK" ]; then ln -s "$(pwd -P)" node_modules/dep/abs; fi
     ;;
   install)
+    [ "$2" = "--ignore-scripts" ] || exclusive
     [ -d node_modules ] || { echo "fake npm: install without a tree" >&2; exit 1; }
     if [ -n "$FAKE_NPM_INSTALL_REWRITES" ]; then echo '{"rewritten":1}' > package-lock.json; fi
     if [ -z "$FAKE_NPM_INSTALL_STALE" ]; then cp package-lock.json node_modules/.package-lock.json; fi
     echo updated > node_modules/dep/index.js
+    ;;
+  rebuild)
+    exclusive
+    shift
+    for n in "$@"; do mkdir -p "node_modules/$n" && echo built > "node_modules/$n/built"; done
+    if [ -n "$FAKE_NPM_REBUILD_FAIL" ]; then echo "gyp ERR! simulated" >&2; exit 1; fi
+    ;;
+  config)
+    if [ -n "$FAKE_NPM_IGNORE_SCRIPTS" ]; then echo true; else echo false; fi
     ;;
   run)
     exclusive
@@ -280,7 +303,11 @@ fn add_install_check_remove() {
         assert!(w
             .npm_log()
             .contains(&format!("run postinstall {}", wt2.join("app").display())));
-        assert_eq!(w.count("run "), 1, "only the project that has one");
+        assert_eq!(
+            w.count("run "),
+            2,
+            "after npm ci in wt1 and the clone in wt2, only in the project that has one"
+        );
         assert!(!wt2.join("app/node_modules/.cache").exists());
         assert!(wt2.join("app/node_modules/dep/index.js").is_file());
     } else {
@@ -1467,7 +1494,7 @@ mod macos_v02 {
         assert!(r.out().contains("clone  lib from "), "{}", r.out());
         assert_eq!(w.count("ci "), 2, "{}", w.npm_log());
         assert!(w.npm_log().contains(&format!(
-            "install --prefer-offline {}",
+            "install --ignore-scripts {}",
             wt2.join("app").display()
         )));
         assert_eq!(
@@ -1564,7 +1591,8 @@ mod macos_v02 {
             r.out()
         );
         assert!(r.out().contains("clone  app from "), "{}", r.out());
-        assert_eq!(w.count("run "), 0, "{}", w.npm_log());
+        // Only after wt1's npm ci, which runs every script.
+        assert_eq!(w.count("run "), 1, "{}", w.npm_log());
 
         w.commit(
             &main,
@@ -1574,7 +1602,7 @@ mod macos_v02 {
         let r = w.fw(&main, &["add", "../wt3", "-b", "c", "HEAD"]);
         r.assert_ok();
         assert!(!r.out().contains("skipped"), "{}", r.out());
-        assert_eq!(w.count("run postinstall"), 1, "{}", w.npm_log());
+        assert_eq!(w.count("run postinstall"), 2, "{}", w.npm_log());
     }
 
     #[test]
@@ -3630,4 +3658,422 @@ fn remove_delete_branch_finds_a_branch_merged_on_origin_or_into_the_default_bran
     r.assert_ok();
     assert!(r.out().contains("deleted branch local2"), "{}", r.out());
     assert!(w.git(&main, &["branch", "--list", "local2"]).is_empty());
+}
+
+/// A lockfile whose dependencies `native` (at `version`) and `other` have
+/// install scripts.
+fn lockfile_scripted(name: &str, version: &str) -> String {
+    format!(
+        r#"{{"name":"{name}","lockfileVersion":3,"requires":true,"packages":{{"":{{"name":"{name}"}},"node_modules/dep":{{"version":"1.0.0"}},"node_modules/native":{{"version":"{version}","hasInstallScript":true}},"node_modules/other":{{"version":"1.0.0","hasInstallScript":true}}}}}}"#
+    )
+}
+
+/// Give `lib` a postinstall too and `app` dependencies with install
+/// scripts.
+fn with_scripts_everywhere(w: &World) {
+    let main = w.main();
+    w.commit(
+        &main,
+        &[
+            (
+                "lib/package.json",
+                r#"{"name":"lib","version":"1.0.0","scripts":{"postinstall":"echo lib"}}"#,
+            ),
+            ("app/package-lock.json", &lockfile_scripted("app", "1.0.0")),
+        ],
+        "scripts",
+    );
+}
+
+#[test]
+fn npm_ci_runs_for_every_project_at_once_and_their_scripts_one_at_a_time() {
+    let w = World::new();
+    let main = w.main();
+    with_scripts_everywhere(&w);
+    let rdv = w.base.join("rdv");
+    let busy = w.base.join("busy");
+    let r = w.fw_with(
+        &main,
+        &["install"],
+        &[
+            // Each npm ci waits for the other one to start.
+            ("FAKE_NPM_RDV", rdv.to_str().unwrap()),
+            ("FAKE_NPM_TOGETHER", "2"),
+            // Two scripts running at once fail.
+            ("FAKE_NPM_EXCLUSIVE", busy.to_str().unwrap()),
+        ],
+    );
+    r.assert_ok();
+    let log = w.npm_log();
+    for d in ["app", "lib"] {
+        let p = main.join(d);
+        assert!(
+            log.contains(&format!("ci --ignore-scripts {}", p.display())),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("run postinstall {}", p.display())),
+            "{log}"
+        );
+        assert!(r.out().contains(&format!("npm ci {d} (")), "{}", r.out());
+    }
+    // The dependencies' install scripts, by name, before the project's own.
+    let app = main.join("app");
+    let rebuild = log
+        .find(&format!("rebuild native {}", app.display()))
+        .unwrap_or_else(|| panic!("{log}"));
+    let post = log
+        .find(&format!("run postinstall {}", app.display()))
+        .unwrap();
+    assert!(rebuild < post, "{log}");
+    assert!(app.join("node_modules/other/built").is_file());
+    assert!(!app
+        .join("node_modules/.fast-worktree-scripts-pending")
+        .exists());
+    assert_eq!(w.fw(&main, &["check"]).out(), "deps ok (2 projects)\n");
+}
+
+/// Hold an exclusive `flock` on `path` while the value lives.
+fn hold_lock(path: &Path) -> HeldFillLock {
+    use std::os::unix::io::AsRawFd;
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .unwrap();
+    // SAFETY: a valid descriptor, unlocked when the file is closed.
+    assert_eq!(
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    HeldFillLock(f)
+}
+
+/// The seconds in `<what> (<took>s, waited <waited>s for lifecycle lock)`.
+fn took_and_waited(out: &str, what: &str) -> Option<(f64, f64)> {
+    let line = out.lines().find(|l| l.starts_with(what))?;
+    let inner = line.rsplit_once('(')?.1.strip_suffix(')')?;
+    let (took, waited) = inner.split_once(", waited ")?;
+    let waited = waited.strip_suffix("s for lifecycle lock")?;
+    Some((took.strip_suffix('s')?.parse().ok()?, waited.parse().ok()?))
+}
+
+#[test]
+fn the_wait_for_the_lifecycle_lock_is_shown_apart() {
+    let w = World::new();
+    let main = w.main();
+    // lib has no script, so this takes no lock; it makes the repository's
+    // cache directory.
+    w.fw(&main, &["install", "lib"]).assert_ok();
+    let repo = fs::read_dir(&w.cache)
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name() != "trash")
+        .unwrap()
+        .path();
+    let lock = hold_lock(&repo.join("lifecycle.lock"));
+    let mut c = Command::new(env!("CARGO_BIN_EXE_fast-worktree"));
+    w.env(&mut c);
+    let child = c
+        .args(["install", "app"])
+        .current_dir(&main)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    drop(lock);
+    let r = Run(child.wait_with_output().unwrap());
+    r.assert_ok();
+    let (took, waited) =
+        took_and_waited(&r.out(), "npm ci app (").unwrap_or_else(|| panic!("{}", r.out()));
+    assert!(waited >= 1.0, "{}", r.out());
+    assert!(took < waited, "the wait is not in the time: {}", r.out());
+}
+
+#[test]
+fn a_failing_rebuild_falls_back_to_npm_ci_with_its_scripts() {
+    let w = World::new();
+    let main = w.main();
+    with_scripts_everywhere(&w);
+    let r = w.fw_with(
+        &main,
+        &["install", "app"],
+        &[("FAKE_NPM_REBUILD_FAIL", "1")],
+    );
+    r.assert_ok();
+    assert!(
+        r.out()
+            .contains("note   app: npm rebuild failed, running npm ci with its scripts"),
+        "{}",
+        r.out()
+    );
+    let app = main.join("app");
+    assert!(
+        w.npm_log()
+            .contains(&format!("ci --prefer-offline {}", app.display())),
+        "{}",
+        w.npm_log()
+    );
+    assert!(app.join("node_modules/.package-lock.json").is_file());
+    assert!(!app
+        .join("node_modules/.fast-worktree-scripts-pending")
+        .exists());
+}
+
+#[test]
+fn no_script_runs_when_npm_ignores_scripts() {
+    let w = World::new();
+    let main = w.main();
+    with_scripts_everywhere(&w);
+    let r = w.fw_with(&main, &["install"], &[("FAKE_NPM_IGNORE_SCRIPTS", "1")]);
+    r.assert_ok();
+    assert_eq!(w.count("run "), 0, "{}", w.npm_log());
+    assert_eq!(w.count("rebuild "), 0, "{}", w.npm_log());
+}
+
+#[test]
+fn a_tree_whose_scripts_did_not_finish_is_installed_again() {
+    let w = World::new();
+    let main = w.main();
+    w.fw(&main, &["install", "app"]).assert_ok();
+    // As if the install had been stopped between npm ci and its scripts.
+    fs::write(
+        main.join("app/node_modules/.fast-worktree-scripts-pending"),
+        "",
+    )
+    .unwrap();
+    let r = w.fw(&main, &["check", "--quiet"]);
+    assert!(r.out().contains("missing deps: app (npm)"), "{}", r.out());
+    let r = w.fw(&main, &["install", "app"]);
+    r.assert_ok();
+    assert!(
+        r.out().contains(
+            "note   app: the install scripts in node_modules did not finish, installing again"
+        ),
+        "{}",
+        r.out()
+    );
+    // From the cache on macOS: the entry was stored after the scripts.
+    assert!(
+        r.out().contains("npm ci app (") || r.out().contains("clone  app from "),
+        "{}",
+        r.out()
+    );
+    let r = w.fw(&main, &["check", "--quiet"]);
+    assert!(!r.out().contains("app"), "{}", r.out());
+}
+
+#[test]
+fn a_git_dependency_is_installed_with_its_scripts_under_the_lock() {
+    let w = World::new();
+    let main = w.main();
+    let git_lock = r#"{"name":"app","lockfileVersion":3,"requires":true,"packages":{"":{"name":"app"},"node_modules/dep":{"version":"1.0.0","resolved":"git+ssh://git@example.com/dep.git#0123456789abcdef0123456789abcdef01234567"}}}"#;
+    w.commit(&main, &[("app/package-lock.json", git_lock)], "git dep");
+    w.fw(&main, &["install", "app"]).assert_ok();
+    let app = main.join("app");
+    assert!(
+        w.npm_log()
+            .contains(&format!("ci --prefer-offline {}", app.display())),
+        "{}",
+        w.npm_log()
+    );
+    assert_eq!(w.count("run "), 0, "npm ci ran them: {}", w.npm_log());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_delta_install_rebuilds_only_the_changed_dependencies() {
+    let w = World::new();
+    let main = w.main();
+    with_scripts_everywhere(&w);
+    w.fw(&main, &["add", "../wt1", "-b", "a", "HEAD"])
+        .assert_ok();
+    w.commit(
+        &main,
+        &[("app/package-lock.json", &lockfile_scripted("app", "1.1.0"))],
+        "bump native",
+    );
+    let r = w.fw(&main, &["add", "../wt2", "-b", "b", "HEAD"]);
+    r.assert_ok();
+    assert!(r.out().contains("delta  app from "), "{}", r.out());
+    let app = w.base.join("wt2/app");
+    let log = w.npm_log();
+    assert!(
+        log.contains(&format!("install --ignore-scripts {}", app.display())),
+        "{log}"
+    );
+    let rebuilds: Vec<&str> = log
+        .lines()
+        .filter(|l| l.starts_with("rebuild ") && l.ends_with(&app.display().to_string()))
+        .collect();
+    assert_eq!(
+        rebuilds,
+        vec![format!("rebuild native {}", app.display())],
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("run postinstall {}", app.display())),
+        "{log}"
+    );
+}
+
+/// The real npm on `PATH`, in a temp directory of its own: no user config,
+/// a cache of its own. `None` when there is no npm (the test is skipped).
+fn real_npm_env(base: &Path) -> Option<Vec<(String, String)>> {
+    let path = std::env::var("PATH").ok()?;
+    let ok = Command::new("npm")
+        .arg("-v")
+        .env("PATH", &path)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        return None;
+    }
+    fs::write(base.join("npmrc"), "").unwrap();
+    let v = |k: &str, p: PathBuf| (k.to_string(), p.display().to_string());
+    Some(vec![
+        ("PATH".into(), path),
+        v("npm_config_userconfig", base.join("npmrc")),
+        v("npm_config_cache", base.join("npm-cache")),
+        v("FAST_WORKTREE_CACHE", base.join("fw-cache")),
+        v("SCRIPT_LOG", base.join("scripts.log")),
+        ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+        ("GIT_AUTHOR_NAME".into(), "t".into()),
+        ("GIT_AUTHOR_EMAIL".into(), "t@example.com".into()),
+        ("GIT_COMMITTER_NAME".into(), "t".into()),
+        ("GIT_COMMITTER_EMAIL".into(), "t@example.com".into()),
+    ])
+}
+
+/// A script that appends `<what>` to `$SCRIPT_LOG` (and, with `file`, writes
+/// that file).
+fn logging_script(what: &str, file: Option<&str>) -> String {
+    let write = file.map_or(String::new(), |f| {
+        format!(
+            "f.mkdirSync(require('path').dirname('{f}'),{{recursive:true}});f.writeFileSync('{f}','built by '+process.env.npm_lifecycle_event);"
+        )
+    });
+    format!(
+        "node -e \"const f=require('fs');{write}f.appendFileSync(process.env.SCRIPT_LOG,'{what}\\\\n')\""
+    )
+}
+
+#[test]
+fn with_the_real_npm_the_tree_is_the_one_npm_ci_makes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let Some(env) = real_npm_env(&base) else {
+        eprintln!("skipped: no npm on PATH");
+        return;
+    };
+    let run = |dir: &Path, prog: &str, args: &[&str]| {
+        let out = Command::new(prog)
+            .args(args)
+            .current_dir(dir)
+            .envs(env.iter().map(|(k, v)| (k, v)))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{prog} {args:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // A dependency with an install script that builds a file, as a native
+    // addon's `node-gyp rebuild` does, packed as a tarball next to the
+    // checkouts (every checkout's `app` is two levels below `base`).
+    let dep = base.join("dep");
+    fs::create_dir_all(&dep).unwrap();
+    let dep_pkg = serde_json::json!({
+        "name": "dep", "version": "1.0.0",
+        "scripts": {
+            "install": logging_script("dep install", Some("build/Release/addon.node")),
+            "postinstall": logging_script("dep postinstall", None),
+        }
+    });
+    fs::write(dep.join("package.json"), dep_pkg.to_string()).unwrap();
+    run(&dep, "npm", &["pack", "-q"]);
+    let up = base.join("upstream");
+    let app_up = up.join("app");
+    fs::create_dir_all(&app_up).unwrap();
+    let app_pkg = serde_json::json!({
+        "name": "app", "version": "1.0.0",
+        "dependencies": { "dep": "file:../../dep/dep-1.0.0.tgz" },
+        "scripts": {
+            "preinstall": logging_script("app preinstall", None),
+            "postinstall": logging_script("app postinstall", Some("generated.txt")),
+            "prepare": logging_script("app prepare", None),
+        }
+    });
+    fs::write(app_up.join("package.json"), app_pkg.to_string()).unwrap();
+    run(
+        &app_up,
+        "npm",
+        &[
+            "install",
+            "--package-lock-only",
+            "--offline",
+            "--no-audit",
+            "--no-fund",
+        ],
+    );
+    fs::write(up.join(".gitignore"), "node_modules/\ngenerated.txt\n").unwrap();
+    run(&up, "git", &["init", "-q", "-b", "trunk"]);
+    run(&up, "git", &["add", "-A"]);
+    run(&up, "git", &["commit", "-qm", "init"]);
+    run(&base, "git", &["clone", "-q", "upstream", "reference"]);
+    run(&base, "git", &["clone", "-q", "upstream", "main"]);
+
+    let log = base.join("scripts.log");
+    // Making the lockfile ran the project's scripts too.
+    fs::write(&log, "").unwrap();
+    run(
+        &base.join("reference/app"),
+        "npm",
+        &["ci", "--prefer-offline", "--no-audit", "--no-fund"],
+    );
+    let reference_log = fs::read_to_string(&log).unwrap();
+    fs::write(&log, "").unwrap();
+    run(
+        &base.join("main"),
+        env!("CARGO_BIN_EXE_fast-worktree"),
+        &["install"],
+    );
+    let ours_log = fs::read_to_string(&log).unwrap();
+
+    let (r, m) = (base.join("reference/app"), base.join("main/app"));
+    for f in [
+        "node_modules/.package-lock.json",
+        "node_modules/dep/build/Release/addon.node",
+        "node_modules/dep/package.json",
+        "generated.txt",
+    ] {
+        assert_eq!(
+            fs::read(r.join(f)).unwrap(),
+            fs::read(m.join(f)).unwrap_or_default(),
+            "{f}"
+        );
+    }
+    // Every script once; the dependency's before the project's own.
+    let sorted = |s: &str| {
+        let mut v: Vec<&str> = s.lines().collect();
+        v.sort();
+        v.join("\n")
+    };
+    assert_eq!(sorted(&ours_log), sorted(&reference_log), "{ours_log}");
+    let at = |what: &str| {
+        ours_log
+            .find(what)
+            .unwrap_or_else(|| panic!("{what}: {ours_log}"))
+    };
+    assert!(at("dep postinstall") < at("app postinstall"), "{ours_log}");
+    assert!(at("app postinstall") < at("app prepare"), "{ours_log}");
+    assert!(!m
+        .join("node_modules/.fast-worktree-scripts-pending")
+        .exists());
 }

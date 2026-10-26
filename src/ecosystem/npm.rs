@@ -46,10 +46,28 @@
 //! `package.json` are run again in the clone, except where a
 //! `skip_lifecycle` rule says their inputs are unchanged. If one fails,
 //! the clone is thrown away so that the next `install` does not skip a
-//! broken tree. Everything that runs the project's own lifecycle (`npm
-//! ci`, `npm install` and those scripts) holds the repository's
-//! [`super::lifecycle_lock`], so only one runs at a time, and is run again
-//! when it failed because git found a config file locked.
+//! broken tree.
+//!
+//! Install scripts often write the repository's shared `.git/config` (a
+//! project's `prepare` running `husky`, a dependency's `postinstall`
+//! installing git hooks), so every run of them holds the repository's
+//! [`super::lifecycle_lock`] and they run one at a time, and a run that
+//! failed because git found a config file locked is tried again. The
+//! downloads do not need the lock: `npm ci` and the `npm install` of step 3
+//! run with `--ignore-scripts`, for every project at once, and then, under
+//! the lock, `npm rebuild <names>` runs the install scripts of the
+//! dependencies that have one (all of them after `npm ci`, the new or
+//! changed ones after `npm install`) and `npm run <script>` the project's
+//! own `preinstall`, `install`, `postinstall` and `prepare`, in npm's
+//! order. (A plain `npm rebuild` would run the project's own scripts in
+//! another order and leave out `prepare`.) Until those scripts are done,
+//! `node_modules/.fast-worktree-scripts-pending` marks the tree as not
+//! installed. A lockfile with a git dependency or a link (workspaces),
+//! whose scripts npm runs in ways `npm rebuild` does not repeat, is
+//! installed by `npm ci` / `npm install` with its scripts, under the lock,
+//! as is a project whose `npm rebuild` failed (an optional dependency whose
+//! build fails, which `npm ci` tolerates). With npm's `ignore-scripts` set,
+//! no script runs.
 //!
 //! Only macOS can clone directories; elsewhere steps 1 to 3 are skipped.
 
@@ -68,6 +86,9 @@ use std::time::{Duration, Instant};
 const LOCKFILE: &str = "package-lock.json";
 const HIDDEN_LOCKFILE: &str = "node_modules/.package-lock.json";
 const KEY_FILE: &str = "node_modules/.fast-worktree-key";
+/// Present while the install scripts of an install without them are still
+/// to run.
+const SCRIPTS_PENDING: &str = "node_modules/.fast-worktree-scripts-pending";
 const OWN_LIFECYCLE: [&str; 4] = ["preinstall", "install", "postinstall", "prepare"];
 const NPM_FLAGS: [&str; 3] = ["--prefer-offline", "--no-audit", "--no-fund"];
 
@@ -83,7 +104,7 @@ impl Ecosystem for Npm {
     }
 
     fn is_installed(&self, project: &Path) -> bool {
-        project.join(HIDDEN_LOCKFILE).is_file()
+        (project.join(HIDDEN_LOCKFILE).is_file() && !scripts_pending(project))
             // npm creates no node_modules at all for a lockfile without
             // dependencies; there is nothing to install.
             || fs::read(project.join(LOCKFILE)).is_ok_and(|l| !has_dependencies(&l))
@@ -104,10 +125,16 @@ impl Ecosystem for Npm {
         if !project.join("node_modules").is_dir() {
             return Ok(Vec::new());
         }
-        match run_own_lifecycle(&project, dir, rules, cache_repo) {
+        let start = Instant::now();
+        let mut waited = Duration::ZERO;
+        match run_scripts(&project, dir, &Scripts::own(rules), cache_repo, &mut waited) {
             Ok((mut notes, ran)) => {
                 if !ran.is_empty() {
-                    notes.push(format!("rerun  {dir}: {}", ran.join(", ")));
+                    let mut line = format!("rerun  {dir}: {}", ran.join(", "));
+                    if waited >= Duration::from_millis(50) {
+                        line.push_str(&format!(" ({})", super::timing(start, waited)));
+                    }
+                    notes.push(line);
                 }
                 Ok(notes)
             }
@@ -185,7 +212,7 @@ impl DonorProbe for FsProbe<'_> {
         fs::read(project.join(LOCKFILE)).is_ok_and(|b| b == self.lockfile)
     }
     fn tree_matches(&self, project: &Path) -> bool {
-        installed_tree_matches(project, self.lockfile)
+        !scripts_pending(project) && installed_tree_matches(project, self.lockfile)
     }
     fn node_version(&self, project: &Path) -> Option<String> {
         node_version(project).ok()
@@ -222,6 +249,8 @@ enum Source {
 
 fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
     let start = Instant::now();
+    // Time spent waiting for the lifecycle lock, shown apart.
+    let mut waited = Duration::ZERO;
     let target = super::project_path(&ctx.root, dir);
     let node_modules = target.join("node_modules");
     let mut lines = Vec::new();
@@ -241,7 +270,11 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
         }
         // Left by an install that did not finish, or made by hand: npm
         // writes `.package-lock.json` last.
-        let note = format!("note   {dir}: node_modules has no .package-lock.json");
+        let note = if scripts_pending(&target) {
+            format!("note   {dir}: the install scripts in node_modules did not finish")
+        } else {
+            format!("note   {dir}: node_modules has no .package-lock.json")
+        };
         if mode.clone_only() {
             return Ok(Report::missing(note));
         }
@@ -307,11 +340,11 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
                             save(&node_modules, &entry, true, &lockfile, dir, &mut lines);
                         }
                     }
-                    lines.extend(after_clone(ctx, &target, dir, &key)?);
+                    lines.extend(after_clone(ctx, &target, dir, &key, &mut waited)?);
                     lines.push(format!(
                         "clone  {dir} from {} ({})",
                         util::tilde(path),
-                        util::elapsed(start)
+                        super::timing(start, waited)
                     ));
                     return Ok(Report::done(lines.join("\n")));
                 }
@@ -327,7 +360,7 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
     if clone::SUPPORTED {
         if let Some(base) = cache::latest(&project_cache, &nodev, &entry) {
             cache::touch(&base);
-            match delta(&base, &target, &lockfile, &ctx.cache_repo) {
+            match delta(&base, &target, &lockfile, &ctx.cache_repo, &mut waited) {
                 Ok(()) => {
                     write_key(&target, &key);
                     save(&node_modules, &entry, false, &lockfile, dir, &mut lines);
@@ -338,7 +371,7 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
                     lines.push(format!(
                         "delta  {dir} from {} ({})",
                         util::tilde(&base),
-                        util::elapsed(start)
+                        super::timing(start, waited)
                     ));
                     return Ok(Report::done(lines.join("\n")));
                 }
@@ -347,9 +380,12 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
         }
     }
 
-    if let Err(log) = npm_ci(&target, &ctx.cache_repo) {
-        discard(&node_modules);
-        return Err(log);
+    match npm_ci(&target, dir, &lockfile, &ctx.cache_repo, &mut waited) {
+        Ok(notes) => lines.extend(notes),
+        Err(log) => {
+            discard(&node_modules);
+            return Err(log);
+        }
     }
     write_key(&target, &key);
     if clone::SUPPORTED && node_modules.is_dir() {
@@ -359,7 +395,7 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
             Duration::from_secs(cache::TTL_DAYS * 86_400),
         );
     }
-    lines.push(format!("npm ci {dir} ({})", util::elapsed(start)));
+    lines.push(format!("npm ci {dir} ({})", super::timing(start, waited)));
     Ok(Report::done(lines.join("\n")))
 }
 
@@ -403,6 +439,9 @@ fn has_packages(lockfile: &[u8]) -> bool {
 /// tree does not match it (someone ran `npm install` there). For trees
 /// without a key, only the lockfile can be compared.
 fn is_current(project: &Path, lockfile: &[u8], key: &str) -> bool {
+    if scripts_pending(project) {
+        return false;
+    }
     let node = |k: &str| k.split_once('-').map(|(_, n)| n.to_string());
     match fs::read_to_string(project.join(KEY_FILE)) {
         Ok(k) if k.trim() == key => true,
@@ -452,8 +491,15 @@ fn discard(node_modules: &Path) {
 }
 
 /// The project's own lifecycle, then the key. A failure discards the clone.
-fn after_clone(ctx: &Ctx, target: &Path, dir: &str, key: &str) -> Result<Vec<String>, String> {
-    match run_own_lifecycle(target, dir, &ctx.skip_lifecycle, &ctx.cache_repo) {
+fn after_clone(
+    ctx: &Ctx,
+    target: &Path,
+    dir: &str,
+    key: &str,
+    waited: &mut Duration,
+) -> Result<Vec<String>, String> {
+    let scripts = Scripts::own(&ctx.skip_lifecycle);
+    match run_scripts(target, dir, &scripts, &ctx.cache_repo, waited) {
         Ok((notes, _)) => {
             write_key(target, key);
             Ok(notes)
@@ -482,23 +528,33 @@ fn clone_from(src: &Path, node_modules: &Path, checked: bool) -> Result<(), Stri
 }
 
 /// Clone `base` (a cache entry for an older lockfile) into the project and
-/// bring it up to date with `npm install`. On error the tree is discarded
-/// and `package-lock.json` is as it was.
-fn delta(base: &Path, project: &Path, lockfile: &[u8], cache_repo: &Path) -> Result<(), String> {
+/// bring it up to date with `npm install`, then run the install scripts of
+/// what changed. On error the tree is discarded and `package-lock.json` is
+/// as it was.
+fn delta(
+    base: &Path,
+    project: &Path,
+    lockfile: &[u8],
+    cache_repo: &Path,
+    waited: &mut Duration,
+) -> Result<(), String> {
     let node_modules = project.join("node_modules");
     clone_from(base, &node_modules, cache::is_checked(base))?;
-    // `npm install` runs the project's own lifecycle too.
-    let lock = lifecycle_lock(cache_repo);
-    let out = Command::new("npm")
-        .arg("install")
-        .args(NPM_FLAGS)
-        .current_dir(project)
-        .stdin(Stdio::null())
-        .output();
-    drop(lock);
+    // Until the scripts have run, the tree is not installed.
+    set_scripts_pending(project);
+    let before = fs::read(project.join(HIDDEN_LOCKFILE)).unwrap_or_default();
+    let split = scripts_can_wait(lockfile);
+    let out = if split {
+        npm_output(project, &["install", "--ignore-scripts"])
+    } else {
+        // `npm install` runs the project's own lifecycle too.
+        let lock = lifecycle_lock(cache_repo);
+        *waited += lock.waited;
+        npm_output(project, &["install"])
+    };
     let lock_path = project.join(LOCKFILE);
     let rewritten = fs::read(&lock_path).map_or(true, |now| now != lockfile);
-    let why = match out {
+    let mut why = match out {
         Err(e) => Some(format!("cannot run npm: {e}")),
         Ok(o) if !o.status.success() => Some("npm install failed".to_string()),
         Ok(_) if rewritten => Some("npm install changed package-lock.json".to_string()),
@@ -507,7 +563,15 @@ fn delta(base: &Path, project: &Path, lockfile: &[u8], cache_repo: &Path) -> Res
         }
         Ok(_) => None,
     };
+    if why.is_none() && split {
+        let after = fs::read(project.join(HIDDEN_LOCKFILE)).unwrap_or_default();
+        let scripts = Scripts::install(scripted_packages(&after, Some(&before)));
+        if let Err(e) = run_install_scripts(project, &scripts, cache_repo, waited) {
+            why = Some(format!("install scripts failed after npm install: {e}"));
+        }
+    }
     let Some(why) = why else {
+        clear_scripts_pending(project);
         return Ok(());
     };
     if rewritten {
@@ -515,6 +579,19 @@ fn delta(base: &Path, project: &Path, lockfile: &[u8], cache_repo: &Path) -> Res
     }
     discard(&node_modules);
     Err(why)
+}
+
+/// `npm <args> --prefer-offline --no-audit --no-fund` in `project`, run
+/// again when it found the git config locked.
+fn npm_output(project: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    output_retrying_config_lock(|| {
+        let mut c = Command::new("npm");
+        c.args(args)
+            .args(NPM_FLAGS)
+            .current_dir(project)
+            .stdin(Stdio::null());
+        c
+    })
 }
 
 /// The project's own lifecycle scripts that exist in its `package.json`,
@@ -536,36 +613,175 @@ pub fn own_lifecycle_scripts(package_json: &[u8]) -> Vec<&'static str> {
         .collect()
 }
 
-/// Run the project's own lifecycle scripts, except those a rule skips, one
-/// run at a time per repository ([`lifecycle_lock`]); one that finds the
-/// git config locked is tried again. Returns a note per skipped script,
-/// and the scripts that ran.
-fn run_own_lifecycle(
+/// Whether the install scripts of this lockfile can run after an install
+/// without them (`--ignore-scripts`) and give the same tree: not when it
+/// has a git dependency (npm prepares those while fetching them) or a link
+/// (a workspace, whose scripts npm runs as part of the install), and not
+/// for a lockfile without `packages` (version 1), whose records say
+/// nothing about install scripts.
+pub fn scripts_can_wait(lockfile: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(lockfile) else {
+        return false;
+    };
+    let Some(packages) = v.get("packages").and_then(|p| p.as_object()) else {
+        return false;
+    };
+    packages
+        .iter()
+        .filter(|(k, _)| !k.is_empty())
+        .all(|(_, p)| {
+            let link = p.get("link").and_then(|l| l.as_bool()) == Some(true);
+            let git = p
+                .get("resolved")
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| r.starts_with("git") || r.starts_with("github:"));
+            !link && !git
+        })
+}
+
+/// The names of the installed packages with an install script
+/// (`hasInstallScript` in `node_modules/.package-lock.json`), for `npm
+/// rebuild`. With `before` (the record of the tree an `npm install`
+/// started from), only those that are new or changed. A package installed
+/// under an alias is named by both names; `npm rebuild` ignores a name it
+/// does not find.
+pub fn scripted_packages(hidden: &[u8], before: Option<&[u8]>) -> Vec<String> {
+    let parse = |b: &[u8]| {
+        serde_json::from_slice::<serde_json::Value>(b)
+            .ok()
+            .and_then(|v| v.get("packages").cloned())
+    };
+    let Some(serde_json::Value::Object(now)) = parse(hidden) else {
+        return Vec::new();
+    };
+    let then = before.and_then(parse);
+    let same = |k: &str, p: &serde_json::Value| {
+        let Some(old) = then.as_ref().and_then(|t| t.get(k)) else {
+            return false;
+        };
+        ["version", "resolved", "integrity"]
+            .iter()
+            .all(|f| old.get(f) == p.get(f))
+    };
+    let mut names: Vec<String> = Vec::new();
+    for (k, p) in &now {
+        if k.is_empty() || p.get("hasInstallScript").and_then(|h| h.as_bool()) != Some(true) {
+            continue;
+        }
+        if before.is_some() && same(k, p) {
+            continue;
+        }
+        let by_path = k
+            .rsplit_once("node_modules/")
+            .map_or(k.as_str(), |(_, n)| n);
+        names.push(by_path.to_string());
+        if let Some(n) = p.get("name").and_then(|n| n.as_str()) {
+            names.push(n.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// How a failed `npm rebuild` starts its log, so that [`npm_ci`] can tell
+/// it from a failing script of the project.
+const REBUILD_FAILED: &str = "npm rebuild failed";
+
+/// What [`run_scripts`] runs.
+struct Scripts<'a> {
+    /// Dependencies whose install scripts `npm rebuild` runs first.
+    rebuild: Vec<String>,
+    /// `skip_lifecycle` rules for the project's own scripts.
+    rules: &'a [SkipLifecycle],
+    /// Shown when one of the project's own scripts fails.
+    after: &'static str,
+}
+
+impl<'a> Scripts<'a> {
+    /// The project's own lifecycle after a clone, `skip_lifecycle` rules
+    /// applied.
+    fn own(rules: &'a [SkipLifecycle]) -> Scripts<'a> {
+        Scripts {
+            rebuild: Vec::new(),
+            rules,
+            after: " after clone",
+        }
+    }
+
+    /// Everything an install without scripts left out: the dependencies'
+    /// `rebuild` and the project's own lifecycle, with no rule (`npm ci`
+    /// would run them all).
+    fn install(rebuild: Vec<String>) -> Scripts<'static> {
+        Scripts {
+            rebuild,
+            rules: &[],
+            after: "",
+        }
+    }
+}
+
+/// Run what an install without scripts (`--ignore-scripts`) left out, as
+/// that install would have: nothing when npm's `ignore-scripts` is set.
+fn run_install_scripts(
+    project: &Path,
+    scripts: &Scripts,
+    cache_repo: &Path,
+    waited: &mut Duration,
+) -> Result<(), String> {
+    let own = fs::read(project.join("package.json"))
+        .map(|p| own_lifecycle_scripts(&p))
+        .unwrap_or_default();
+    if (scripts.rebuild.is_empty() && own.is_empty()) || ignore_scripts(project) {
+        return Ok(());
+    }
+    run_scripts(project, ".", scripts, cache_repo, waited).map(|_| ())
+}
+
+/// Whether npm's `ignore-scripts` is set for the project (in an `.npmrc`
+/// or the environment): then `npm ci` runs no script, and neither does
+/// fast-worktree in its place.
+fn ignore_scripts(project: &Path) -> bool {
+    Command::new("npm")
+        .args(["config", "get", "ignore-scripts"])
+        .current_dir(project)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+}
+
+/// Run `npm rebuild` of `scripts.rebuild`, then the project's own
+/// lifecycle scripts except those a rule skips, holding the repository's
+/// [`lifecycle_lock`] (taken only when something runs; the wait is added
+/// to `waited`). A run that finds the git config locked is tried again.
+/// Returns a note per skipped script, and the scripts that ran.
+fn run_scripts(
     project: &Path,
     dir: &str,
-    rules: &[SkipLifecycle],
+    scripts: &Scripts,
     cache_repo: &Path,
+    waited: &mut Duration,
 ) -> Result<(Vec<String>, Vec<&'static str>), String> {
-    let Ok(pkg) = fs::read(project.join("package.json")) else {
-        return Ok((Vec::new(), Vec::new()));
-    };
+    let own = fs::read(project.join("package.json"))
+        .map(|p| own_lifecycle_scripts(&p))
+        .unwrap_or_default();
     let mut notes = Vec::new();
     let mut ran = Vec::new();
     let mut lock = None;
-    for script in own_lifecycle_scripts(&pkg) {
-        if rules
-            .iter()
-            .any(|r| r.applies_to(dir, script) && r.inputs_unchanged(project))
-        {
-            notes.push(format!("note   {dir}: {script} skipped, inputs unchanged"));
-            continue;
-        }
+    let mut take = |waited: &mut Duration| {
         if lock.is_none() {
-            lock = Some(lifecycle_lock(cache_repo));
+            let l = lifecycle_lock(cache_repo);
+            *waited += l.waited;
+            lock = Some(l);
         }
+    };
+    if !scripts.rebuild.is_empty() {
+        take(waited);
         let out = output_retrying_config_lock(|| {
             let mut c = Command::new("npm");
-            c.args(["run", script])
+            c.arg("rebuild")
+                .args(&scripts.rebuild)
                 .current_dir(project)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -575,7 +791,38 @@ fn run_own_lifecycle(
         .map_err(|e| format!("cannot run npm: {e}"))?;
         if !out.status.success() {
             return Err(format!(
-                "npm run {script} failed after clone:\n{}",
+                "{REBUILD_FAILED}:\n{}",
+                util::tail(&String::from_utf8_lossy(&out.stderr), 30)
+            ));
+        }
+    }
+    for script in own {
+        if scripts
+            .rules
+            .iter()
+            .any(|r| r.applies_to(dir, script) && r.inputs_unchanged(project))
+        {
+            notes.push(format!("note   {dir}: {script} skipped, inputs unchanged"));
+            continue;
+        }
+        take(waited);
+        // `--ignore-scripts`: this script alone, not its `pre` and `post`
+        // ones (`npm run install` would also run `preinstall` and
+        // `postinstall`, which run on their own turn).
+        let out = output_retrying_config_lock(|| {
+            let mut c = Command::new("npm");
+            c.args(["run", script, "--ignore-scripts"])
+                .current_dir(project)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            c
+        })
+        .map_err(|e| format!("cannot run npm: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "npm run {script} failed{}:\n{}",
+                scripts.after,
                 util::tail(&String::from_utf8_lossy(&out.stderr), 30)
             ));
         }
@@ -584,29 +831,74 @@ fn run_own_lifecycle(
     Ok((notes, ran))
 }
 
-/// `npm ci`, which runs the project's own lifecycle: one at a time per
-/// repository ([`lifecycle_lock`]), and again when that found the git
-/// config locked. Its output is shown only when it fails.
-fn npm_ci(project: &Path, cache_repo: &Path) -> Result<(), String> {
-    let _lock = lifecycle_lock(cache_repo);
-    let out = output_retrying_config_lock(|| {
-        let mut c = Command::new("npm");
-        c.arg("ci")
-            .args(NPM_FLAGS)
-            .current_dir(project)
-            .stdin(Stdio::null());
-        c
-    })
-    .map_err(|e| format!("cannot run npm: {e}"))?;
-    if out.status.success() {
-        return Ok(());
+/// `npm ci`. Without its scripts first, for every project at once, then the
+/// scripts one at a time per repository ([`run_install_scripts`]); with
+/// them, under the [`lifecycle_lock`], when they cannot wait
+/// ([`scripts_can_wait`]) or `npm rebuild` failed. Its output is shown only
+/// when it fails. Returns notes to print.
+fn npm_ci(
+    project: &Path,
+    dir: &str,
+    lockfile: &[u8],
+    cache_repo: &Path,
+    waited: &mut Duration,
+) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+    if scripts_can_wait(lockfile) {
+        let out = npm_output(project, &["ci", "--ignore-scripts"])
+            .map_err(|e| format!("cannot run npm: {e}"))?;
+        if !out.status.success() {
+            return Err(npm_log(&out));
+        }
+        set_scripts_pending(project);
+        let hidden = fs::read(project.join(HIDDEN_LOCKFILE)).unwrap_or_default();
+        let scripts = Scripts::install(scripted_packages(&hidden, None));
+        match run_install_scripts(project, &scripts, cache_repo, waited) {
+            Ok(()) => {
+                clear_scripts_pending(project);
+                return Ok(notes);
+            }
+            Err(e) if e.starts_with(REBUILD_FAILED) => {
+                notes.push(format!(
+                    "note   {dir}: npm rebuild failed, running npm ci with its scripts"
+                ));
+            }
+            Err(e) => return Err(e),
+        }
     }
+    let lock = lifecycle_lock(cache_repo);
+    *waited += lock.waited;
+    let out = npm_output(project, &["ci"]).map_err(|e| format!("cannot run npm: {e}"))?;
+    if out.status.success() {
+        // npm ci starts from an empty node_modules; this is for one that
+        // did not.
+        clear_scripts_pending(project);
+        return Ok(notes);
+    }
+    Err(npm_log(&out))
+}
+
+/// The end of what npm printed, for a failure.
+fn npm_log(out: &std::process::Output) -> String {
     let log = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    Err(util::tail(&log, 30))
+    util::tail(&log, 30)
+}
+
+/// Whether the install scripts of the tree in `project` are still to run.
+fn scripts_pending(project: &Path) -> bool {
+    project.join(SCRIPTS_PENDING).symlink_metadata().is_ok()
+}
+
+fn set_scripts_pending(project: &Path) {
+    let _ = fs::write(project.join(SCRIPTS_PENDING), b"");
+}
+
+fn clear_scripts_pending(project: &Path) {
+    let _ = fs::remove_file(project.join(SCRIPTS_PENDING));
 }
 
 #[cfg(test)]
@@ -704,13 +996,65 @@ mod tests {
             if_equal: vec![["in".into(), "out".into()]],
         };
         // No npm is spawned: the only script is skipped.
-        let (notes, ran) =
-            run_own_lifecycle(p, "app", std::slice::from_ref(&rule), &p.join("cache")).unwrap();
+        let rules = std::slice::from_ref(&rule);
+        let mut waited = Duration::ZERO;
+        let (notes, ran) = run_scripts(
+            p,
+            "app",
+            &Scripts::own(rules),
+            &p.join("cache"),
+            &mut waited,
+        )
+        .unwrap();
         assert!(ran.is_empty());
         assert_eq!(
             notes,
             vec!["note   app: postinstall skipped, inputs unchanged"]
         );
+    }
+
+    #[test]
+    fn scripts_wait_unless_git_dependencies_links_or_version_1() {
+        let lock = |pkgs: &str| format!(r#"{{"lockfileVersion":3,"packages":{{"":{{}}{pkgs}}}}}"#);
+        assert!(scripts_can_wait(lock("").as_bytes()));
+        assert!(scripts_can_wait(
+            lock(r#","node_modules/a":{"version":"1.0.0","resolved":"https://r/a.tgz"}"#)
+                .as_bytes()
+        ));
+        assert!(!scripts_can_wait(
+            lock(r#","node_modules/a":{"resolved":"git+ssh://git@h/a.git#0123"}"#).as_bytes()
+        ));
+        assert!(!scripts_can_wait(
+            lock(r#","node_modules/w":{"resolved":"packages/w","link":true}"#).as_bytes()
+        ));
+        assert!(!scripts_can_wait(
+            br#"{"lockfileVersion":1,"dependencies":{"a":{}}}"#
+        ));
+        assert!(!scripts_can_wait(b"not json"));
+    }
+
+    #[test]
+    fn scripted_packages_are_named_and_only_changed_ones_after_an_install() {
+        let hidden = br#"{"packages":{
+            "node_modules/plain":{"version":"1.0.0"},
+            "node_modules/native":{"version":"2.0.0","hasInstallScript":true},
+            "node_modules/a/node_modules/@s/deep":{"version":"1.0.0","hasInstallScript":true},
+            "node_modules/alias":{"name":"real","version":"1.0.0","hasInstallScript":true}
+        }}"#;
+        assert_eq!(
+            scripted_packages(hidden, None),
+            vec!["@s/deep", "alias", "native", "real"]
+        );
+        let before = br#"{"packages":{
+            "node_modules/native":{"version":"2.0.0","hasInstallScript":true},
+            "node_modules/a/node_modules/@s/deep":{"version":"0.9.0","hasInstallScript":true}
+        }}"#;
+        assert_eq!(
+            scripted_packages(hidden, Some(before)),
+            vec!["@s/deep", "alias", "real"],
+            "native is unchanged"
+        );
+        assert!(scripted_packages(b"{}", None).is_empty());
     }
 
     /// A probe over a table of candidate facts that records what was asked.
