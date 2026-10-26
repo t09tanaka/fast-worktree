@@ -461,7 +461,7 @@ install = "pod install""#)
         let e = one("preset = \"bower\"").unwrap_err();
         assert_eq!(
             e,
-            vec!["clone[0]: unknown preset `bower` (known: npm, dart)"]
+            vec!["clone[0]: unknown preset `bower` (known: npm, dart, bundler)"]
         );
     }
 

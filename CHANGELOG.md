@@ -39,6 +39,16 @@ change bumps the minor version).
 - `plan [<path>]` lists, for each target, where its files would come
   from (a cache entry, a worktree, an incremental install, an install)
   and why the sources before it are not used, without changing anything.
+- A Bundler preset, `preset = "bundler"`, and a tracked `Gemfile.lock` is
+  a project for auto-detection, `config init` and `config check`. The
+  directory Bundler installs into (`BUNDLE_PATH` from the project's
+  `.bundle/config`, the environment or `~/.bundle/config`, else
+  `<dir>/vendor/bundle`) is cloned from the cache or a worktree with the
+  same `Gemfile.lock`, `ruby -v` and `RUBY_PLATFORM`, then checked with
+  `bundle check` (a clone it turns down is thrown away); else
+  `BUNDLE_PATH=<path> bundle install` runs and its result is cached. A
+  `BUNDLE_PATH` outside the worktree is not cloned: `bundle check`, else
+  `bundle install`.
 
 ## [0.2.1] - 2026-10-27
 

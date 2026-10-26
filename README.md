@@ -48,6 +48,10 @@ and removing the worktree again means deleting tens of thousands of files.
   `.git/config`, [one at a time](#install-scripts).
 - **Flutter and Dart too.** A tracked `pubspec.lock` is a project: `flutter
   pub get --offline` (then online), or `dart pub get` without Flutter.
+- **Ruby too.** A tracked `Gemfile.lock` is a project: the directory
+  Bundler installs into is cloned from the cache or another worktree with
+  the same `Gemfile.lock`, Ruby version and platform, and checked with
+  `bundle check`; else `bundle install` runs.
 - **Any other directory, by key.** A [`[[clone]]`](#what-each-worktree-gets-clone)
   names a directory such as CocoaPods' `Pods` or a build cache, the files
   that decide whether a copy can be reused, and the command that makes it;
@@ -99,7 +103,7 @@ its `Updating files` progress stay out of the output (its errors do not).
 fast-worktree install [--root <dir>] [--changed] [<project-dir>...]
 ```
 
-For every tracked `package-lock.json` and `pubspec.lock`, or for each
+For every tracked `package-lock.json`, `pubspec.lock` and `Gemfile.lock`, or for each
 [`[[clone]]`](#what-each-worktree-gets-clone) when there are any (or only
 the given project directories), makes the dependencies present. A project is
 named by its directory (relative to the current directory or to the
@@ -111,7 +115,8 @@ from the cache, else from a matching worktree, else incrementally from the
 latest cache entry, else with `npm ci --prefer-offline --no-audit
 --no-fund` (without its scripts first, see [install
 scripts](#install-scripts)). Dart projects: `pub get` as above; with neither `flutter` nor
-`dart` installed, a note and nothing else. A project whose dependencies
+`dart` installed, a note and nothing else. Bundler projects: see
+[the `bundler` preset](#what-each-worktree-gets-clone). A project whose dependencies
 are present is skipped; for npm that means `node_modules` has its
 `node_modules/.package-lock.json`, and a `node_modules` without one (an
 install that did not finish) is moved to the trash and installed again.
@@ -129,7 +134,8 @@ fast-worktree check [--quiet]
 ```
 
 Lists the projects without `node_modules/.package-lock.json` (npm) or
-`.dart_tool/package_config.json` (pub). It always exits 0 and runs nothing
+`.dart_tool/package_config.json` (pub) or the directory Bundler installs
+into (bundler). It always exits 0 and runs nothing
 but two quick `git` calls. `--quiet` prints only when something is missing.
 While the background install of [`hook create`](#claude-code-hooks) runs,
 it says so.
@@ -353,7 +359,7 @@ size = 2
 ## What each worktree gets: `[[clone]]`
 
 Without any `[[clone]]` in `.fast-worktree.toml`, every tracked
-`package-lock.json` and `pubspec.lock` is a project, found by itself
+`package-lock.json`, `pubspec.lock` and `Gemfile.lock` is a project, found by itself
 (above). That is all a repository needs to start. Once the file has one
 `[[clone]]`, only what the `[[clone]]` entries list is handled: a project
 they leave out gets nothing from `add`, `install`, `check` or the hooks, and
@@ -385,7 +391,26 @@ after = ["echo pods ready"]             # optional: after a clone or an install
   tree check against `node_modules/.package-lock.json`, the project's own
   install scripts after a clone, `skip_lifecycle`). `dart` is a `pub get`
   as above, with `path = "<dir>/.dart_tool"` and `key =
-  ["<dir>/pubspec.lock"]`. `dir` defaults to `.`, the root.
+  ["<dir>/pubspec.lock"]`. `bundler` is below. `dir` defaults to `.`, the
+  root.
+- **`bundler`** gets `key = ["<dir>/Gemfile.lock"]` and `key_commands =
+  ["ruby -v", "ruby -e 'print RUBY_PLATFORM'"]`: native extensions are
+  built for one Ruby and one platform. Its directory is the one Bundler
+  installs into, so that `bundle exec` finds what is there: `BUNDLE_PATH`
+  from the project's `.bundle/config`, else from the environment, else
+  from `~/.bundle/config` (Bundler's own order), relative to `dir`; else
+  `<dir>/vendor/bundle`. It is made present as a `[[clone]]` without a
+  preset is (below): from the cache, else from a worktree, else with
+  `BUNDLE_PATH=<path> bundle install`. After a clone, `bundle check` runs
+  with `BUNDLE_PATH` set to the clone, and a clone it turns down is thrown
+  away. Nothing is rewritten after a clone: the only files with the
+  worktree's path in them are the build logs (`gem_make.out`). A
+  `BUNDLE_PATH` outside the worktree holds gems every checkout shares:
+  nothing is cloned there, `bundle check` decides and `bundle install`
+  runs when it fails. `.bundle/config` is usually ignored by git, and
+  without it `bundle exec` looks for the system's gems: list it in
+  [`.worktreeinclude`](#ignored-files-worktreeinclude), or set
+  `BUNDLE_PATH`.
 - **Any field of a preset can be written** to replace its default: `key`
   with more files (their contents are hashed with the lockfile's),
   `key_commands` (npm puts their output in the key in place of `node -v`'s,
@@ -509,7 +534,7 @@ missing). What the file already says, comments included, is kept. With
 `config check` exits 1 and lists what it finds:
 
 - `unlisted`: a tracked lockfile of a preset (`package-lock.json`,
-  `pubspec.lock`) that no `[[clone]]` names;
+  `pubspec.lock`, `Gemfile.lock`) that no `[[clone]]` names;
 - `missing`: a `[[clone]]` whose lockfile or `key` file does not exist;
 - `invalid`: a mistake in the file, such as an unknown key, an unknown
   preset, a `path` that does not fit its preset, or a `[[clone]]` without a
@@ -953,7 +978,7 @@ fast-worktree: kept branch worktree-work: commit 21f7c601e324 is not on its upst
   so two checkouts with the same name never share entries. Next to an
   entry, `<entry>.ok` records that it was checked when stored (below).
   Only a tree whose `.package-lock.json` matches the lockfile is stored.
-  A `[[clone]]` without a preset has its entries under
+  A `[[clone]]` without a preset, and a Bundler project, has its entries under
   `<repo>-<hash>/<path, with / as __>/<key files sha256, 16 digits>-<key
   commands' output sha256, 8 digits>`, and `<entry>.src` records the
   worktree an entry was made in, for `rewrite_paths`.
@@ -961,7 +986,8 @@ fast-worktree: kept branch worktree-work: commit 21f7c601e324 is not on its upst
   Clones share blocks with their source, so the cache costs almost no disk
   while worktrees made from it exist.
 - `node_modules/.fast-worktree-key`, `.dart_tool/fast-worktree-key` and,
-  for a `[[clone]]` without a preset, `<path>/.fast-worktree-key` record
+  for a `[[clone]]` without a preset and a Bundler project,
+  `<path>/.fast-worktree-key` record
   what an install was made from, for `install --changed` (and `remove`). A tree
   without one is compared with its lockfile.
 - Trash: `<cache>/trash`. When the trash is on another volume than the
@@ -1044,7 +1070,8 @@ again, at most twice.
 
 Cloning needs macOS `clonefile(2)`. On other platforms the clone and delta
 stages are skipped and every npm project gets `npm ci`; the post-checkout
-hook only lists. A `[[clone]]` without a preset gets its `install`, and
+hook only lists. A `[[clone]]` without a preset gets its `install`, a
+Bundler project `bundle install`, and
 `remove` keeps nothing in the cache. `add`, `check`, `remove`,
 `.worktreeinclude`, Dart
 projects, the cache commands, the pool and the hooks work the same; there,

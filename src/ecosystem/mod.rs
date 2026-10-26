@@ -8,6 +8,7 @@
 //! a line in [`presets`]: auto-detection, `[[clone]] preset = "..."`,
 //! `config init`, `config check` and `plan` pick it up from there.
 
+pub mod bundler;
 pub mod dart;
 pub mod generic;
 pub mod npm;
@@ -198,7 +199,7 @@ pub trait Preset: Sync {
 
 /// The presets. A new one is one more line here.
 pub fn presets() -> &'static [&'static dyn Preset] {
-    &[&npm::Npm, &dart::Dart]
+    &[&npm::Npm, &dart::Dart, &bundler::Bundler]
 }
 
 /// The preset that `[[clone]] preset = "<name>"` names.

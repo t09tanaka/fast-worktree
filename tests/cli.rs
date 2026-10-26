@@ -199,6 +199,7 @@ impl World {
             .env("FAKE_NPM_LOG", self.base.join("npm.log"))
             .env("FAKE_PUB_LOG", self.base.join("pub.log"))
             .env("FAKE_POD_LOG", self.base.join("pod.log"))
+            .env("FAKE_BUNDLE_LOG", self.base.join("bundle.log"))
             .env("HOOK_LOG", self.base.join("hook.log"));
     }
 
@@ -4604,7 +4605,7 @@ fn config_check_reports_unlisted_lockfiles_missing_files_and_mistakes() {
     assert_eq!(
         r.out(),
         "invalid    unknown key `paht` in clone[2]\n\
-         invalid    clone[3]: unknown preset `yarn` (known: npm, dart)\n\
+         invalid    clone[3]: unknown preset `yarn` (known: npm, dart, bundler)\n\
          missing    clone[2]: ios/Podfile.lock does not exist\n\
          3 problems in .fast-worktree.toml\n"
     );
@@ -4765,4 +4766,278 @@ fn walk(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+// ---- 0.3: Bundler ----
+
+/// `ruby -v` prints the `.ruby-version` of the directory it runs in, as a
+/// version manager picks one per directory; `ruby -e` prints the platform.
+const FAKE_RUBY: &str = r#"#!/bin/sh
+case "$1" in
+  -v) cat .ruby-version 2>/dev/null || echo "ruby 3.3.6 [arm64-darwin23]" ;;
+  -e) printf '%s' arm64-darwin23 ;;
+  *) echo "fake ruby: unexpected $*" >&2; exit 1 ;;
+esac
+"#;
+
+/// A fake Bundler. The gems go to `BUNDLE_PATH` (from the environment, else
+/// from `.bundle/config`; without either, the system's, which fails):
+/// `install` writes `ruby/3.3.0/installed.lock` (a copy of `Gemfile.lock`)
+/// and a build log holding the project's path there, and `check` passes
+/// when that copy is the Gemfile's lockfile. Every call is logged with its
+/// `BUNDLE_PATH`.
+const FAKE_BUNDLE: &str = r#"#!/bin/sh
+BP=${BUNDLE_PATH:-$(sed -n 's/^BUNDLE_PATH: "\(.*\)"$/\1/p' .bundle/config 2>/dev/null)}
+echo "$1 ${BP:-none} $(pwd -P)" >> "$FAKE_BUNDLE_LOG"
+[ -n "$BP" ] || { echo "Could not find rack-3.1.8 in locally installed gems" >&2; exit 1; }
+case "$1" in
+  install)
+    if [ -n "$FAKE_BUNDLE_FAIL" ]; then echo "bundle: simulated failure" >&2; exit 1; fi
+    mkdir -p "$BP/ruby/3.3.0/gems/rack-3.1.8" "$BP/ruby/3.3.0/extensions"
+    cp Gemfile.lock "$BP/ruby/3.3.0/installed.lock"
+    pwd -P > "$BP/ruby/3.3.0/extensions/gem_make.out"
+    ;;
+  check)
+    G=${BUNDLE_GEMFILE:-Gemfile}
+    cmp -s "$G.lock" "$BP/ruby/3.3.0/installed.lock" || { echo "The following gems are missing" >&2; exit 1; }
+    ;;
+  *) echo "fake bundle: unexpected $*" >&2; exit 1 ;;
+esac
+"#;
+
+const GEMFILE_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.1.8)\n\nPLATFORMS\n  arm64-darwin-23\n\nDEPENDENCIES\n  rack\n";
+
+impl World {
+    /// Put the fake `ruby` and `bundle` on `PATH`, and commit a Bundler
+    /// project `shop` (and `files`) to the upstream, with the main checkout
+    /// brought up to it.
+    fn with_bundler(&self, files: &[(&str, &str)]) {
+        write_exe(&self.base.join("bin/ruby"), FAKE_RUBY);
+        write_exe(&self.base.join("bin/bundle"), FAKE_BUNDLE);
+        let up = self.base.join("upstream");
+        let mut all = vec![
+            (
+                "shop/Gemfile",
+                "source \"https://rubygems.org\"\ngem \"rack\"\n",
+            ),
+            ("shop/Gemfile.lock", GEMFILE_LOCK),
+            (
+                ".gitignore",
+                "node_modules/\nvendor/\n.bundle/\nshop/gems/\n",
+            ),
+        ];
+        all.extend_from_slice(files);
+        self.commit(&up, &all, "shop");
+        self.git(&self.main(), &["pull", "-q", "--ff-only"]);
+    }
+
+    fn bundle_log(&self) -> String {
+        fs::read_to_string(self.base.join("bundle.log")).unwrap_or_default()
+    }
+}
+
+#[test]
+fn bundler_gems_are_installed_then_cloned_and_checked() {
+    let w = World::new();
+    let main = w.main();
+    w.with_bundler(&[]);
+    let r = w.fw(&main, &["add", "../wt1", "-b", "a"]);
+    r.assert_ok();
+    let wt1 = w.base.join("wt1");
+    assert!(
+        r.out()
+            .contains("install shop (BUNDLE_PATH=vendor/bundle bundle install, "),
+        "{}",
+        r.out()
+    );
+    let gems = |wt: &Path| wt.join("shop/vendor/bundle/ruby/3.3.0");
+    assert!(gems(&wt1).join("installed.lock").is_file());
+    assert!(w.bundle_log().starts_with(&format!(
+        "install vendor/bundle {}\ncheck {} ",
+        wt1.join("shop").display(),
+        wt1.join("shop/vendor/bundle").display()
+    )));
+    assert_eq!(w.fw(&wt1, &["check"]).out(), "deps ok (3 projects)\n");
+    status_is_clean(&w, &wt1);
+
+    let r = w.fw(&main, &["add", "../wt2", "-b", "b"]);
+    r.assert_ok();
+    let wt2 = w.base.join("wt2");
+    let installs = || {
+        w.bundle_log()
+            .lines()
+            .filter(|l| l.starts_with("install "))
+            .count()
+    };
+    if !cfg!(target_os = "macos") {
+        assert!(r.out().contains("install shop ("), "{}", r.out());
+        assert_eq!(installs(), 2);
+        return;
+    }
+    let entries = w.entry_names(&w.cache, "shop__vendor__bundle");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert!(
+        r.out().contains("clone  shop from ") && r.out().contains(&entries[0]),
+        "{}",
+        r.out()
+    );
+    assert_eq!(installs(), 1, "{}", w.bundle_log());
+    // Checked after the clone, with the clone's BUNDLE_PATH.
+    assert!(
+        w.bundle_log().contains(&format!(
+            "check {} {}",
+            wt2.join("shop/vendor/bundle").display(),
+            wt2.join("shop/vendor/bundle").display()
+        )),
+        "{}",
+        w.bundle_log()
+    );
+    // No path is rewritten: the build log still names where it was built.
+    assert_eq!(
+        fs::read_to_string(gems(&wt2).join("extensions/gem_make.out")).unwrap(),
+        format!("{}\n", wt1.join("shop").display())
+    );
+
+    // A clone that `bundle check` turns down is thrown away: the next
+    // source, else bundle install.
+    let entry = w
+        .cache
+        .join(w.entry_dir_of("shop__vendor__bundle", &entries[0]));
+    fs::remove_file(entry.join("ruby/3.3.0/installed.lock")).unwrap();
+    let r = w.fw(&main, &["add", "../wt3", "-b", "c"]);
+    r.assert_ok();
+    assert!(
+        r.out()
+            .contains("note   shop: verify failed after the clone, not used"),
+        "{}",
+        r.out()
+    );
+    assert!(
+        r.out().contains(&format!(
+            "clone  shop from {}",
+            wt1.join("shop/vendor/bundle").display()
+        )),
+        "{}",
+        r.out()
+    );
+    for wt in [&wt1, &wt2] {
+        fs::remove_file(gems(wt).join("installed.lock")).unwrap();
+    }
+    let wt3 = w.base.join("wt3");
+    fs::remove_file(gems(&wt3).join("installed.lock")).unwrap();
+    let r = w.fw(&main, &["add", "../wt4", "-b", "d"]);
+    r.assert_ok();
+    assert!(r.out().contains("install shop ("), "{}", r.out());
+    assert_eq!(installs(), 2, "{}", w.bundle_log());
+
+    // Another Ruby: neither the cache nor a worktree, installed again.
+    w.commit(&main, &[("shop/.ruby-version", "ruby 3.4.1\n")], "ruby");
+    let r = w.fw(&main, &["add", "../wt5", "-b", "e", "HEAD"]);
+    r.assert_ok();
+    assert!(r.out().contains("install shop ("), "{}", r.out());
+    assert_eq!(installs(), 3, "{}", w.bundle_log());
+}
+
+impl World {
+    /// `<repo>/<slug>/<name>`, relative to the cache, of an entry.
+    fn entry_dir_of(&self, slug: &str, name: &str) -> PathBuf {
+        let repo = fs::read_dir(&self.cache)
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().join(slug).join(name).is_dir())
+            .unwrap()
+            .file_name();
+        Path::new(&repo).join(slug).join(name)
+    }
+}
+
+#[test]
+fn bundler_follows_bundle_path_from_the_projects_config() {
+    let w = World::new();
+    let main = w.main();
+    w.with_bundler(&[(".worktreeinclude", "shop/.bundle/config\n")]);
+    fs::create_dir_all(main.join("shop/.bundle")).unwrap();
+    fs::write(
+        main.join("shop/.bundle/config"),
+        "---\nBUNDLE_PATH: \"gems\"\n",
+    )
+    .unwrap();
+    let r = w.fw(&main, &["add", "../wt", "-b", "a"]);
+    r.assert_ok();
+    let wt = w.base.join("wt");
+    assert!(
+        r.out()
+            .contains("install shop (BUNDLE_PATH=gems bundle install, "),
+        "{}",
+        r.out()
+    );
+    assert!(wt.join("shop/gems/ruby/3.3.0/installed.lock").is_file());
+    assert!(!wt.join("shop/vendor").exists());
+    let r = w.fw(&wt, &["plan", "."]);
+    assert!(
+        r.out().contains("shop (bundler)\n  from  present\n"),
+        "{}",
+        r.out()
+    );
+
+    // Gems outside the worktree are shared: nothing to clone, bundle check
+    // decides.
+    let shared = w.base.join("shared-gems");
+    fs::write(
+        wt.join("shop/.bundle/config"),
+        format!("BUNDLE_PATH: \"{}\"\n", shared.display()),
+    )
+    .unwrap();
+    let r = w.fw(&wt, &["install", "shop"]);
+    r.assert_ok();
+    assert!(
+        r.out().contains("install shop (bundle install, "),
+        "{}",
+        r.out()
+    );
+    assert!(shared.join("ruby/3.3.0/installed.lock").is_file());
+    let r = w.fw(&wt, &["install", "--changed", "shop"]);
+    assert!(
+        r.out().contains(&format!(
+            "skip   shop (gems in {}, outside the worktree)",
+            shared.display()
+        )),
+        "{}",
+        r.out()
+    );
+    let r = w.fw(&wt, &["plan", "."]);
+    assert!(
+        r.out().contains(&format!(
+            "shop (bundler)\n  from  present (bundle check)\n  not   clone: the gems are in {}, outside the worktree\n",
+            shared.display()
+        )),
+        "{}",
+        r.out()
+    );
+}
+
+#[test]
+fn config_init_and_check_know_gemfile_lock() {
+    let w = World::new();
+    let main = w.main();
+    w.with_bundler(&[]);
+    fs::write(
+        main.join(".fast-worktree.toml"),
+        "[[clone]]\npreset = \"npm\"\ndir = \"app\"\n[[clone]]\npreset = \"npm\"\ndir = \"lib\"\n",
+    )
+    .unwrap();
+    let r = w.fw(&main, &["config", "check"]);
+    r.assert_fails();
+    assert_eq!(
+        r.out(),
+        "unlisted   shop/Gemfile.lock (bundler) is in no [[clone]]; \
+         `fast-worktree config init` adds it\n1 problem in .fast-worktree.toml\n"
+    );
+    let r = w.fw(&main, &["config", "init"]);
+    r.assert_ok();
+    assert_eq!(
+        r.out(),
+        "add    [[clone]] preset = \"bundler\", dir = \"shop\"\n"
+    );
+    w.fw(&main, &["config", "check"]).assert_ok();
 }
