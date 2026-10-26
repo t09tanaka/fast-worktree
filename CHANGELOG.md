@@ -56,6 +56,14 @@ change bumps the minor version).
   whose directory has no tracked lockfile as missing, and one that a
   `[[clone]]` also lists as invalid.
 
+### Fixed
+
+- `wait` could report "the background install stopped before it
+  finished" for an install that was running: the marker was rewritten in
+  place when the background process put its pid in it, and a marker read
+  empty in that moment looked interrupted. The marker and the result file
+  are now written to a temporary file and renamed over the old one.
+
 ## [0.2.1] - 2026-10-27
 
 ### Changed

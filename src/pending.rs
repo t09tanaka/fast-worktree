@@ -123,6 +123,23 @@ fn decide(
     }
 }
 
+/// Write `path` whole: into a temporary file next to it, renamed over it.
+/// A reader finds the old contents or the new ones, never a file cut short
+/// (`fs::write` truncates first, and a marker read empty in that moment
+/// looks like an interrupted install).
+fn write_whole(path: &Path, contents: &str) -> io::Result<()> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        name.unwrap_or_default(),
+        std::process::id()
+    ));
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
 /// Forget an interrupted install's marker.
 pub fn clear_marker(root: &Path) {
     if let Some(dir) = git_dir(root) {
@@ -136,7 +153,7 @@ pub fn spawn(root: &Path, dirs: &[String]) -> io::Result<()> {
     let dir =
         git_dir(root).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no git directory"))?;
     let _ = fs::remove_file(dir.join(RESULT));
-    fs::write(dir.join(MARKER), format!("{}\n", now_secs()))?;
+    write_whole(&dir.join(MARKER), &format!("{}\n", now_secs()))?;
     let log = fs::File::create(dir.join(LOG))?;
     let exe = std::env::current_exe()?;
     let mut c = Command::new(exe);
@@ -223,9 +240,9 @@ pub fn run_deferred(root: &Path, f: impl FnOnce() -> Result<i32>) -> i32 {
     // also finds the lock held for as long as this process lives.
     let _lock = dir.as_ref().map(|d| try_flock(&d.join(LOCK)));
     if let Some(d) = &dir {
-        let _ = fs::write(
-            d.join(MARKER),
-            format!("{} {}\n", now_secs(), std::process::id()),
+        let _ = write_whole(
+            &d.join(MARKER),
+            &format!("{} {}\n", now_secs(), std::process::id()),
         );
     }
     let code = match f() {
@@ -236,7 +253,7 @@ pub fn run_deferred(root: &Path, f: impl FnOnce() -> Result<i32>) -> i32 {
         }
     };
     if let Some(d) = &dir {
-        let _ = fs::write(d.join(RESULT), if code == 0 { "ok\n" } else { "failed\n" });
+        let _ = write_whole(&d.join(RESULT), if code == 0 { "ok\n" } else { "failed\n" });
         let _ = fs::remove_file(d.join(MARKER));
     }
     code
@@ -466,6 +483,39 @@ mod tests {
         // Gone, and no result either: nothing to wait for.
         let mut reads = vec![None, Some(marker.clone())];
         assert_eq!(decide(|| reads.pop().flatten(), || None, 2), State::None);
+    }
+
+    #[test]
+    fn the_marker_is_replaced_whole_never_rewritten_in_place() {
+        // `wait` reads the marker while the background process puts its pid
+        // in it. Rewritten in place, it is empty for a moment, and an empty
+        // marker reads as an interrupted install. A reader that opened it
+        // before must still see the old one whole: the new one is another
+        // file, renamed over it.
+        use std::io::Read;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let dir = root.join(".git");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join(MARKER), "100\n").unwrap();
+        let mut before = fs::File::open(dir.join(MARKER)).unwrap();
+        run_deferred(root, move || {
+            let mut seen = String::new();
+            before.read_to_string(&mut seen).unwrap();
+            assert_eq!(seen, "100\n", "the marker was rewritten in place");
+            let now = fs::read_to_string(dir.join(MARKER)).unwrap();
+            assert_eq!(marker_pid(&now), Some(std::process::id() as i32));
+            Ok(0)
+        });
+        let names: Vec<_> = fs::read_dir(root.join(".git"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains(".tmp")),
+            "a temporary file was left: {names:?}"
+        );
     }
 
     #[test]
