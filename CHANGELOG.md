@@ -25,14 +25,26 @@ change bumps the minor version).
   recorded in `<path>/.fast-worktree-key` only once all of that succeeded,
   and only a `path` with that record (or where `verify` passes) counts as
   installed, for `check`, `install` and as a source; when the install,
-  `verify` or an `after` fails, `path` is moved away. Targets with a
-  preset are installed before those without.
+  `verify` or an `after` fails, `path` is moved away. A `path` that is
+  there without that record and that `verify` does not vouch for (a
+  build's output, a hand-made `Pods`) is not fast-worktree's: `install`
+  leaves it as it is and says so, `check` lists it apart without asking
+  for an install, and only `install --changed` makes it again. A `path`
+  that is made again (that one, or one recorded from other key files) is
+  moved away only once its replacement is complete, and put back when
+  nothing can replace it (no cache entry, no worktree, no `install`) or
+  the replacement fails; the Bundler preset's directory in the worktree
+  is handled the same way. Targets with a preset are installed before
+  those without.
 - fast-worktree touches only what is its own: a `[[clone]]` (or a project
   found by its lockfile) whose `dir`, `path` or `key` leads out of the
   worktree through a symlink, whose `path` holds tracked files, or whose
   `path` holds another target's `path` or `dir`, is refused with the
   reason, and `path` is looked at again right before it is moved away,
-  cloned into, rewritten or handed to the cache.
+  cloned into, rewritten or handed to the cache. A `[[clone]]` that is
+  refused stops the command; a project found by its lockfile (without any
+  `[[clone]]`) is left out with a warning on stderr, and `add`, `hook
+  create`, `check` and `install` go on with the others.
 - When a `.fast-worktree.toml` has at least one `[[clone]]`, only what the
   entries list is handled; without any, the tracked lockfiles are detected
   as before, with the same cache keys.
@@ -85,10 +97,17 @@ change bumps the minor version).
 - `remove` no longer stops at a `.fast-worktree.toml` it cannot read: it
   says so, runs no `pre_remove` hook, keeps nothing in the cache, and
   removes the worktree after its usual checks, as `hook remove` does
-  (which no longer runs hooks from an empty config in its place).
+  (which no longer runs hooks from an empty config in its place). The
+  warning says first that no `pre_remove` hook was run, and names the
+  file it could not read.
 
 ### Fixed
 
+- Two runs storing the same cache entry at once could leave it with the
+  records (`<entry>.src`, `<entry>.ok`) of the one whose copy was not
+  kept. The check that the entry is not there, the records and the rename
+  into place are now done under a lock in the project's directory of the
+  cache.
 - The post-checkout hook (`check --post-checkout`) cloned the detected
   projects in a new worktree whose `.fast-worktree.toml` it could not read;
   it now says so and does nothing, as plain `check` does.

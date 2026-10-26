@@ -25,6 +25,12 @@
 //! lent to another worktree or kept in the cache, unless `verify` vouches
 //! for it.
 //!
+//! Nor is it fast-worktree's: a `path` there without a record (a build's
+//! output, a hand-made `Pods`) is left as it is by `install`, and made
+//! again only with `--changed`. What is made again (that, or a `path`
+//! recorded from another key) is moved aside, into the trash, until its
+//! replacement is complete, and put back when nothing replaces it.
+//!
 //! `verify` runs in a copy of this worktree's own: after a clone, after an
 //! install, and in a `path` without a record. It never runs in a cache
 //! entry, nor in another worktree whose recorded key is ours.
@@ -60,6 +66,10 @@ impl Preset for Generic {
 
     fn is_installed(&self, root: &Path, t: &Target) -> bool {
         is_installed(root, t)
+    }
+
+    fn is_unrecorded(&self, root: &Path, t: &Target) -> bool {
+        is_unrecorded(root, t)
     }
 
     fn install(&self, ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
@@ -137,8 +147,13 @@ enum Standing {
     /// Without a record, and `verify` passes in it: it is taken as made
     /// from `key`, and recorded so.
     Verified,
-    /// To be made again, and why.
+    /// Made by fast-worktree from another key: to be made again, and why.
     Stale(String),
+    /// Without a record of its key, and no `verify` vouches for it: not
+    /// known to be fast-worktree's (made by hand, by a build, or left by an
+    /// install that was killed). Left as it is, unless `--changed` asks for
+    /// it to be made again; and why.
+    Unrecorded(String),
 }
 
 fn standing(ctx: &Ctx, t: &Target, path: &Path, key: &str) -> Standing {
@@ -147,10 +162,65 @@ fn standing(ctx: &Ctx, t: &Target, path: &Path, key: &str) -> Standing {
         Some(_) => Standing::Stale("its key changed".into()),
         None => match &t.verify {
             Some(v) if super::succeeds(path, v, &ctx.root, &ctx.main) => Standing::Verified,
-            Some(_) => Standing::Stale("no record of its key, and verify fails".into()),
-            None => Standing::Stale("no record of its key".into()),
+            Some(_) => Standing::Unrecorded("no record of its key, and verify fails".into()),
+            None => Standing::Unrecorded("no record of its key".into()),
         },
     }
+}
+
+/// Whether `path` is a directory in the worktree without a record of its
+/// key: one that `install` leaves as it is (unless `verify` vouches for
+/// it). Cheap, for `check`.
+pub fn is_unrecorded(root: &Path, t: &Target) -> bool {
+    let path = root.join(&t.path);
+    target::inside(root, &t.path).is_ok()
+        && path.is_dir()
+        && path.join(KEY_FILE).symlink_metadata().is_err()
+}
+
+/// What was in `path` before it is made again, moved into the trash (kept
+/// there for a day, should this process die) until the new one is
+/// complete: deleted then, else put back.
+struct Aside {
+    at: PathBuf,
+    why: String,
+}
+
+/// How long what was moved aside stays in the trash at most.
+const ASIDE_SECS: u64 = 86_400;
+
+impl Aside {
+    /// The new `path` is complete: delete the old one.
+    fn drop_it(self) {
+        trash::spawn_rm(&self.at);
+    }
+
+    /// Nothing replaced it: put it back at `path`. Returns a line to print
+    /// when that could not be done.
+    fn put_back(self, ctx: &Ctx, t: &Target, path: &Path) -> Option<String> {
+        let back = target::inside(&ctx.root, &t.path).and_then(|()| {
+            if path.symlink_metadata().is_ok() {
+                return Err(format!("{} is there again", t.path));
+            }
+            fs::rename(&self.at, path).map_err(|e| e.to_string())
+        });
+        back.err().map(|e| {
+            format!(
+                "note   {}: could not put it back ({e}); it is in {} for a day",
+                t.name,
+                util::tilde(&self.at)
+            )
+        })
+    }
+}
+
+/// Where [`make`] got `path` from.
+enum Made {
+    /// A line to print.
+    From(String),
+    /// Nothing could make it: no source to clone, and no `install` (or only
+    /// clones were allowed).
+    Nothing,
 }
 
 /// Why the worktree `w` cannot lend its `path` to a worktree whose key is
@@ -243,13 +313,14 @@ fn install(ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
     let path = ctx.root.join(&t.path);
     let mut lines = Vec::new();
     let key = key(&ctx.root, &ctx.main, t)?;
+    let mut aside = None;
     if path.symlink_metadata().is_ok() {
         let up_to_date = if mode.reinstalls_changed() {
             "up to date"
         } else {
             "already present"
         };
-        match standing(ctx, t, &path, &key) {
+        let why = match standing(ctx, t, &path, &key) {
             Standing::Current => {
                 return Ok(Report::kept(format!("skip   {name} ({up_to_date})")));
             }
@@ -259,58 +330,121 @@ fn install(ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
                     "skip   {name} ({up_to_date}, verify passes)"
                 )));
             }
-            Standing::Stale(why) => {
-                target::inside(&ctx.root, &t.path)?;
-                trash::trash(&path).map_err(|e| format!("cannot move {} away: {e}", t.path))?;
-                lines.push(format!("note   {name}: {why}, making it again"));
+            Standing::Unrecorded(why) if !mode.reinstalls_changed() => {
+                return Ok(Report::kept(format!(
+                    "skip   {name} ({why}: not made by fast-worktree, left as it is; \
+                     `fast-worktree install --changed {name}` makes it again)"
+                )));
             }
+            Standing::Stale(why) | Standing::Unrecorded(why) => why,
+        };
+        // Out of the way until the new one is complete, and put back when
+        // nothing replaces it.
+        target::inside(&ctx.root, &t.path)?;
+        let at = trash::keep(&path, ASIDE_SECS)
+            .map_err(|e| format!("cannot move {} away: {e}", t.path))?;
+        aside = Some(Aside { at, why });
+    }
+    let made = make(ctx, t, mode, &path, &key, start, &mut lines);
+    let Some(aside) = aside else {
+        return match made? {
+            Made::From(line) => {
+                lines.push(line);
+                Ok(Report::done(lines.join("\n")))
+            }
+            Made::Nothing if mode.clone_only() => Ok(Report::missing(lines.join("\n"))),
+            Made::Nothing => {
+                lines.push(format!(
+                    "note   {name}: nothing to clone it from and no install to make it"
+                ));
+                Ok(Report::done(lines.join("\n")))
+            }
+        };
+    };
+    let why = aside.why.clone();
+    match made {
+        Ok(Made::From(line)) => {
+            aside.drop_it();
+            lines.push(format!("note   {name}: {why}, made again"));
+            lines.push(line);
+            Ok(Report::done(lines.join("\n")))
+        }
+        Ok(Made::Nothing) => {
+            lines.extend(aside.put_back(ctx, t, &path));
+            // The install that runs later makes it again.
+            if mode.clone_only() && t.install.is_some() {
+                return Ok(Report::missing(lines.join("\n")));
+            }
+            lines.push(format!(
+                "note   {name}: {why}, but nothing to clone it from and no install to make it again: left as it is"
+            ));
+            Ok(Report::kept(lines.join("\n")))
+        }
+        Err(e) => {
+            let mut e = e;
+            if let Some(l) = aside.put_back(ctx, t, &path) {
+                e.push('\n');
+                e.push_str(&l);
+            }
+            Err(e)
         }
     }
-    let entry = entry(&ctx.cache_repo, t, &key);
+}
+
+/// Make `path` (not there now) from the first source that works: the
+/// cache, another worktree, then `install` (unless `mode` allows only
+/// clones). `lines` gets the sources that were tried and not used. On
+/// error nothing is left at `path`.
+fn make(
+    ctx: &Ctx,
+    t: &Target,
+    mode: Mode,
+    path: &Path,
+    key: &str,
+    start: Instant,
+    lines: &mut Vec<String>,
+) -> Result<Made, String> {
+    let name = t.name.as_str();
+    let entry = entry(&ctx.cache_repo, t, key);
     if clone::SUPPORTED {
         if entry.is_dir() {
             cache::touch(&entry);
             match clone_in(ctx, t, &entry, cache::source(&entry)) {
                 Ok(()) => {
-                    finish(ctx, t, &path, &key)?;
-                    lines.push(format!(
+                    finish(ctx, t, path, key)?;
+                    return Ok(Made::From(format!(
                         "clone  {name} from {} ({})",
                         util::tilde(&entry),
                         util::elapsed(start)
-                    ));
-                    return Ok(Report::done(lines.join("\n")));
+                    )));
                 }
                 Err(why) => lines.push(format!("note   {name}: {why}, not used")),
             }
         }
         let ours = outputs(&ctx.root, &ctx.main, t)?;
         for w in ctx.worktrees.iter().filter(|w| **w != ctx.root) {
-            if not_a_donor(ctx, t, w, &ours, &key).is_some() {
+            if not_a_donor(ctx, t, w, &ours, key).is_some() {
                 continue;
             }
             let src = w.join(&t.path);
             match clone_in(ctx, t, &src, Some(w.clone())) {
                 Ok(()) => {
-                    finish(ctx, t, &path, &key)?;
-                    lines.push(format!(
+                    finish(ctx, t, path, key)?;
+                    return Ok(Made::From(format!(
                         "clone  {name} from {} ({})",
                         util::tilde(&src),
                         util::elapsed(start)
-                    ));
-                    return Ok(Report::done(lines.join("\n")));
+                    )));
                 }
                 Err(why) => lines.push(format!("note   {name}: {why}, not used")),
             }
         }
     }
     if mode.clone_only() {
-        return Ok(Report::missing(lines.join("\n")));
+        return Ok(Made::Nothing);
     }
     let Some(cmd) = &t.install else {
-        lines.push(format!(
-            "note   {name}: nothing to clone it from and no install to make it"
-        ));
-        return Ok(Report::done(lines.join("\n")));
+        return Ok(Made::Nothing);
     };
     let cwd = super::project_path(&ctx.root, &t.dir);
     // What a failed install leaves is not an install.
@@ -324,29 +458,31 @@ fn install(ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
             }
         })
         .and_then(|()| match &t.verify {
-            Some(v) => super::run_quietly(&path, v, &ctx.root, &ctx.main)
+            Some(v) => super::run_quietly(path, v, &ctx.root, &ctx.main)
                 .map_err(|e| format!("verify failed after the install: {e}")),
             None => Ok(()),
         });
     if let Err(e) = made {
         if target::inside(&ctx.root, &t.path).is_ok() {
-            discard(&path);
+            discard(path);
         }
         return Err(e);
     }
     if clone::SUPPORTED {
         // Not checked for absolute symlinks (see the module's notes). The
         // key goes in when the entry is cloned.
-        if let Err(e) = cache::store(&path, &entry, true, &ctx.root) {
+        if let Err(e) = cache::store(path, &entry, true, &ctx.root) {
             lines.push(format!("note   {name}: cache not saved: {e}"));
         }
         if let Some(dir) = entry.parent() {
             cache::prune(dir, Duration::from_secs(cache::TTL_DAYS * 86_400));
         }
     }
-    finish(ctx, t, &path, &key)?;
-    lines.push(format!("install {name} ({cmd}, {})", util::elapsed(start)));
-    Ok(Report::done(lines.join("\n")))
+    finish(ctx, t, path, key)?;
+    Ok(Made::From(format!(
+        "install {name} ({cmd}, {})",
+        util::elapsed(start)
+    )))
 }
 
 fn plan(ctx: &Ctx, t: &Target, mode: Mode, fresh: bool) -> Plan {
@@ -359,6 +495,8 @@ fn plan(ctx: &Ctx, t: &Target, mode: Mode, fresh: bool) -> Plan {
         Ok(k) => k,
         Err(e) => return Plan::new(format!("nothing: {e}"), why),
     };
+    // What is there, made again only when something replaces it.
+    let mut stale = false;
     if !fresh && path.symlink_metadata().is_ok() {
         match standing(ctx, t, &path, &key) {
             Standing::Current if mode.reinstalls_changed() => {
@@ -366,7 +504,16 @@ fn plan(ctx: &Ctx, t: &Target, mode: Mode, fresh: bool) -> Plan {
             }
             Standing::Current => return Plan::new("present", why),
             Standing::Verified => return Plan::new("present (verify passes)", why),
-            Standing::Stale(no) => why.push(format!("present: {no}")),
+            Standing::Unrecorded(no) if !mode.reinstalls_changed() => {
+                return Plan::new(
+                    format!("present ({no}: not made by fast-worktree, left as it is)"),
+                    why,
+                )
+            }
+            Standing::Stale(no) | Standing::Unrecorded(no) => {
+                why.push(format!("present: {no}"));
+                stale = true;
+            }
         }
     }
     // A clone is checked with verify once it is made, in this worktree.
@@ -377,6 +524,7 @@ fn plan(ctx: &Ctx, t: &Target, mode: Mode, fresh: bool) -> Plan {
     };
     let install = || match &t.install {
         Some(c) => format!("install ({c})"),
+        None if stale => "nothing (no install): the one there is left as it is".to_string(),
         None => "nothing (no install)".to_string(),
     };
     if !clone::SUPPORTED {

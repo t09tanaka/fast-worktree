@@ -454,14 +454,27 @@ after = ["echo pods ready"]             # optional: after a clone or an install
   install, `verify` or an `after` fails, `path` is moved away. `verify`
   runs in this worktree's `path` and in another worktree's without a
   record, never in a cache entry.
+
+  A `path` that is there without that record, and that `verify` does not
+  vouch for (or that has no `verify`), was not made by fast-worktree: a
+  build's output or a hand-made directory, say. `install` leaves it as it
+  is and says so, it is not lent to another worktree, and `check` lists it
+  apart (`not made by fast-worktree, left as it is: <target>`) instead of
+  asking for an install. Only `install --changed` makes it again. A `path`
+  that is made again (that one, or one recorded from other key files) is
+  moved away only once its replacement is complete: when nothing can
+  replace it (no cache entry, no worktree to clone from, no `install`) or
+  the replacement fails, it is put back.
 - **What fast-worktree touches.** `path` is moved away, cloned into and
   handed to the cache whole, so it must be fast-worktree's own: a `dir`,
   `path` or `key` that leads out of the worktree through a symlink, a
   `path` that holds tracked files, and a `path` that holds another
   target's `path` or `dir` are refused (`install`, `add` and the hooks
-  stop with the reason, and `config check` reports them). Where a project
-  found by its lockfile hits this, an [`[[ignore]]`](#leaving-a-project-out-ignore)
-  leaves it out. `path` is looked at again right before it is moved,
+  stop with the reason, and `config check` reports them). A project found
+  by its lockfile (without any `[[clone]]`) that hits this is left out
+  with a warning, and the others are handled; an
+  [`[[ignore]]`](#leaving-a-project-out-ignore) leaves it out without the
+  warning. `path` is looked at again right before it is moved,
   cloned into or rewritten.
 - **Order.** The targets with a preset are installed first, in parallel,
   then those without one: `pod install` needs what `flutter pub get`

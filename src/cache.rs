@@ -6,7 +6,10 @@
 //! records that the tree was checked for absolute symlinks when it was
 //! stored, so cloning it does not walk every file again, and `<key>.src`
 //! the worktree it was made in, for `rewrite_paths`. These live outside the
-//! entry so that they are never cloned into a worktree.
+//! entry so that they are never cloned into a worktree. They are written
+//! before the entry is renamed into place, under a lock ([`STORE_LOCK`])
+//! that a second run storing the same entry waits for, so that it finds
+//! the entry there and leaves the first run's records alone.
 //!
 //! An entry's modification time is its "last used": it is set when the
 //! entry is stored and each time it is cloned.
@@ -24,6 +27,35 @@ pub const TTL_DAYS: u64 = 7;
 const MARKER_SUFFIX: &str = ".ok";
 const SOURCE_SUFFIX: &str = ".src";
 const TMP_INFIX: &str = ".tmp-";
+
+/// The lock, in a project's directory of the cache, held from the check
+/// that an entry is not there to its rename into place, and while records
+/// without an entry are removed: so that no run writes or removes the
+/// records of an entry that another run has just put there. Its name
+/// starts with a dot and it is a file: never taken for an entry.
+const STORE_LOCK: &str = ".store.lock";
+
+/// An exclusive `flock` on the [`STORE_LOCK`] of `dir`, held while the
+/// value lives. `None` when it cannot be taken (a file system without
+/// locks), and then nothing waits.
+fn store_lock(dir: &Path) -> Option<fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(STORE_LOCK))
+        .ok()?;
+    loop {
+        // SAFETY: a valid open descriptor; the lock goes when it is closed.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Some(f);
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
+    }
+}
 
 /// Where the "checked" marker of `entry` lives.
 pub fn marker(entry: &Path) -> PathBuf {
@@ -103,7 +135,9 @@ pub fn store(
     clone::clone_dir(node_modules, &tmp).map_err(|e| e.to_string())?;
     let _ = fs::remove_dir_all(tmp.join(".cache"));
     touch(&tmp);
-    // The records first: an entry is never seen without them.
+    let _lock = store_lock(parent);
+    // The records first: an entry is never seen without them. Under the
+    // lock, a run that comes second finds the entry here and writes none.
     if entry.exists() {
         let _ = trash::trash(&tmp);
         return Ok(());
@@ -141,6 +175,11 @@ pub fn adopt(dir: &Path, entry: &Path, made_in: &Path) -> Result<bool, String> {
     let parent = entry.parent().ok_or("no parent")?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let _ = fs::remove_dir_all(dir.join(".cache"));
+    let _lock = store_lock(parent);
+    // As in `store`: another run may have put it there since.
+    if entry.exists() {
+        return Ok(false);
+    }
     mark_checked(entry);
     record_source(entry, made_in);
     touch(dir);
@@ -200,6 +239,7 @@ pub fn prune(project_dir: &Path, ttl: Duration) -> Vec<PathBuf> {
             removed.push(e.path());
         }
     }
+    let _lock = (!markers.is_empty()).then(|| store_lock(project_dir));
     for m in markers {
         let s = m.to_string_lossy();
         let entry = Path::new(
@@ -562,6 +602,72 @@ mod tests {
             !seen_bare.load(Ordering::Relaxed),
             "an entry was there without its records"
         );
+    }
+
+    /// `n` directories `<base>/wt<i>/Pods`, each holding `who` = `i`.
+    fn contenders(base: &Path, n: usize) -> Vec<PathBuf> {
+        (0..n)
+            .map(|i| {
+                let wt = base.join(format!("wt{i}"));
+                fs::create_dir_all(wt.join("Pods")).unwrap();
+                fs::write(wt.join("Pods/who"), i.to_string()).unwrap();
+                wt
+            })
+            .collect()
+    }
+
+    /// Run `put(i)` in `n` threads at once.
+    fn at_once(n: usize, put: impl Fn(usize) + Sync) {
+        let start = std::sync::Barrier::new(n);
+        std::thread::scope(|s| {
+            for i in 0..n {
+                let (start, put) = (&start, &put);
+                s.spawn(move || {
+                    start.wait();
+                    put(i);
+                });
+            }
+        });
+    }
+
+    /// The worktree recorded for `entry` is the one its contents came from.
+    #[track_caller]
+    fn records_match(entry: &Path, wts: &[PathBuf]) {
+        let who: usize = fs::read_to_string(entry.join("who"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(source(entry), Some(wts[who].clone()), "{}", entry.display());
+        assert!(is_checked(entry));
+    }
+
+    #[test]
+    fn the_records_of_an_entry_adopted_twice_at_once_are_the_winners() {
+        let t = tempfile::tempdir().unwrap();
+        for round in 0..40 {
+            let base = t.path().join(format!("r{round}"));
+            let wts = contenders(&base, 4);
+            let entry = base.join("c/repo/Pods/0123456789abcdef-01234567");
+            at_once(wts.len(), |i| {
+                let _ = adopt(&wts[i].join("Pods"), &entry, &wts[i]);
+            });
+            records_match(&entry, &wts);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_records_of_an_entry_stored_twice_at_once_are_the_winners() {
+        let t = tempfile::tempdir().unwrap();
+        for round in 0..40 {
+            let base = t.path().join(format!("r{round}"));
+            let wts = contenders(&base, 4);
+            let entry = base.join("c/repo/Pods/0123456789abcdef-01234567");
+            at_once(wts.len(), |i| {
+                store(&wts[i].join("Pods"), &entry, true, &wts[i]).unwrap();
+            });
+            records_match(&entry, &wts);
+        }
     }
 
     #[test]

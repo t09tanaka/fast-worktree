@@ -222,14 +222,18 @@ pub fn run(opts: Opts) -> Result<i32> {
 
 /// The worktree's `.fast-worktree.toml`, or `None`, said on stderr, when it
 /// cannot be read: then no `pre_remove` hook runs and nothing is kept in
-/// the cache, and the worktree is removed all the same.
+/// the cache, and the worktree is removed all the same. Which hooks it
+/// would have run cannot be told, so the warning says that none ran, and
+/// which file could not be read.
 pub fn config_or_warn(path: &Path) -> Option<Config> {
     match Config::load(path) {
         Ok(cfg) => Some(cfg),
         Err(e) => {
             errln!(
-                "fast-worktree: {e}; removing it without the pre_remove hooks, \
-                 and keeping nothing of it in the cache"
+                "fast-worktree: NO pre_remove hook was run: cannot read {}, so \
+                 which ones it lists is unknown; removing the worktree without \
+                 them, and keeping nothing of it in the cache. The error: {e}",
+                util::tilde(&path.join(crate::hooks::FILE))
             );
             None
         }

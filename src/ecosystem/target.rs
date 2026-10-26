@@ -399,22 +399,32 @@ pub fn inside(root: &Path, path: &str) -> std::result::Result<(), String> {
 /// `path` that holds tracked files (one `git ls-files`), which moving it
 /// away would take with it.
 pub fn check_fs(root: &Path, targets: &[Target], names: &[String]) -> Vec<String> {
+    check_each(root, targets, names)
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect()
+}
+
+/// [`check_fs`], each problem with the index in `targets` of the target it
+/// refuses: `None` for one that is no single target's (the tracked files
+/// cannot be listed).
+fn check_each(root: &Path, targets: &[Target], names: &[String]) -> Vec<(Option<usize>, String)> {
     let mut errors = Vec::new();
     let mut paths: Vec<(usize, String)> = Vec::new();
     for (i, t) in targets.iter().enumerate() {
         let name = &names[i];
         if t.dir != "." {
             if let Err(why) = real_rel(root, &t.dir) {
-                errors.push(format!("{name}: dir `{}` {why}", t.dir));
+                errors.push((Some(i), format!("{name}: dir `{}` {why}", t.dir)));
             }
         }
         match real_rel(root, &t.path) {
             Ok(real) => paths.push((i, real)),
-            Err(why) => errors.push(format!("{name}: path `{}` {why}", t.path)),
+            Err(why) => errors.push((Some(i), format!("{name}: path `{}` {why}", t.path))),
         }
         for k in &t.key {
             if let Err(why) = real_rel(root, k) {
-                errors.push(format!("{name}: key `{k}` {why}"));
+                errors.push((Some(i), format!("{name}: key `{k}` {why}")));
             }
         }
     }
@@ -430,17 +440,31 @@ pub fn check_fs(root: &Path, targets: &[Target], names: &[String]) -> Vec<String
         Ok(files) => {
             for (i, p) in &paths {
                 if let Some(f) = files.iter().find(|f| under(f, p)) {
-                    errors.push(format!(
-                        "{}: path `{}` holds tracked files ({f}), \
-                         and fast-worktree moves the whole directory away",
-                        names[*i], targets[*i].path
+                    errors.push((
+                        Some(*i),
+                        format!(
+                            "{}: path `{}` holds tracked files ({f}), \
+                             and fast-worktree moves the whole directory away",
+                            names[*i], targets[*i].path
+                        ),
                     ));
                 }
             }
         }
-        Err(e) => errors.push(format!("cannot list the tracked files: {e}")),
+        Err(e) => errors.push((None, format!("cannot list the tracked files: {e}"))),
     }
     errors
+}
+
+/// Print `line` on stderr, once per process: [`targets`] runs more than
+/// once in one command.
+fn warn_once(line: String) {
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if !said.contains(&line) {
+        crate::util::warn(&line);
+        said.push(line);
+    }
 }
 
 /// Whether the directory `rel` of the worktree `root` holds tracked files.
@@ -451,22 +475,32 @@ pub fn holds_tracked(root: &Path, rel: &str) -> bool {
 
 /// What the worktree at `root` gets: the `[[clone]]` entries of `cfg`, or,
 /// without any, the projects [`discover`] finds, but those `[[ignore]]`
-/// leaves out. An error when one of them would have fast-worktree touch
-/// what is not its own ([`check_fs`]).
+/// leaves out. A target that would have fast-worktree touch what is not
+/// its own ([`check_fs`]) is an error when a `[[clone]]` names it; one that
+/// was detected is left out, with a warning on stderr, and the others are
+/// still handled.
 pub fn targets(root: &Path, cfg: &Config) -> Result<Vec<Target>> {
     let file = crate::hooks::FILE;
     if cfg.clone.is_empty() {
         let mut found = discover(root)?;
         found.retain(|t| !cfg.ignore.iter().any(|i| i.covers(t.preset.name(), &t.dir)));
         let names: Vec<String> = found.iter().map(Target::label).collect();
-        let errors = check_fs(root, &found, &names);
-        if !errors.is_empty() {
-            return Err(Error(format!(
-                "{}; leave the project out with an [[ignore]] in {file}",
-                errors.join("; ")
-            )));
+        let problems = check_each(root, &found, &names);
+        if let Some((_, e)) = problems.iter().find(|(i, _)| i.is_none()) {
+            return Err(Error(e.clone()));
         }
-        return Ok(found);
+        for (_, e) in &problems {
+            warn_once(format!(
+                "fast-worktree: {e}; left out (an [[ignore]] in {file} leaves it out without this warning)\n"
+            ));
+        }
+        let refused: Vec<usize> = problems.iter().filter_map(|(i, _)| *i).collect();
+        return Ok(found
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !refused.contains(i))
+            .map(|(_, t)| t)
+            .collect());
     }
     let found = resolve(&cfg.clone).map_err(|e| Error(format!("{file}: {}", e.join("; "))))?;
     let names: Vec<String> = (0..found.len()).map(|i| format!("clone[{i}]")).collect();
@@ -682,6 +716,49 @@ install = "pod install""#)
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "web");
         assert!(targets(Path::new("/nonexistent-root"), &Config::default()).is_err());
+    }
+
+    #[test]
+    fn a_detected_target_that_is_refused_leaves_the_others() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        for f in [
+            "web/package-lock.json",
+            "api/package-lock.json",
+            // Moving api/node_modules away would take this with it.
+            "api/node_modules/patched/index.js",
+        ] {
+            std::fs::create_dir_all(root.join(f).parent().unwrap()).unwrap();
+            std::fs::write(root.join(f), "{}").unwrap();
+            git(&["add", "-f", f]);
+        }
+        let got = targets(root, &Config::default()).unwrap();
+        let names: Vec<&str> = got.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["web"]);
+        // Named by a [[clone]], it stops everything, as before.
+        let cfg = crate::hooks::parse(
+            "[[clone]]\npreset = \"npm\"\ndir = \"api\"\n\n[[clone]]\npreset = \"npm\"\ndir = \"web\"\n",
+        )
+        .unwrap()
+        .0;
+        let e = targets(root, &cfg).unwrap_err().0;
+        assert!(
+            e.starts_with(
+                ".fast-worktree.toml: clone[0]: path `api/node_modules` holds tracked files"
+            ),
+            "{e}"
+        );
     }
 
     #[test]

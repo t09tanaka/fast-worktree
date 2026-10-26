@@ -158,6 +158,15 @@ pub trait Preset: Sync {
     /// subprocesses.
     fn is_installed(&self, root: &Path, t: &Target) -> bool;
 
+    /// Whether the target is not installed but its directory is there
+    /// without a record of what it was made from: something
+    /// [`Preset::install`] leaves as it is, unless `--changed` asks for it
+    /// to be made again. For `check`, which then does not ask for an
+    /// install. Cheap, as [`Preset::is_installed`].
+    fn is_unrecorded(&self, _root: &Path, _t: &Target) -> bool {
+        false
+    }
+
     /// Make `t` present in `ctx.root`. Returns what to print, or on
     /// failure the log to show.
     fn install(&self, ctx: &Ctx, t: &Target, mode: Mode) -> std::result::Result<Report, String>;

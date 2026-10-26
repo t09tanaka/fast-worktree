@@ -70,6 +70,15 @@ impl Preset for Bundler {
         }
     }
 
+    fn is_unrecorded(&self, root: &Path, t: &Target) -> bool {
+        // As in `is_installed`: only a directory that `is_installed` asks
+        // for a record of.
+        match locate(root, t) {
+            Where::Inside(l) if l.path == t.path => generic::is_unrecorded(root, &l),
+            _ => false,
+        }
+    }
+
     fn install(&self, ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
         match locate_checked(&ctx.root, t) {
             Where::Inside(t) => generic::Generic.install(ctx, &t, mode),

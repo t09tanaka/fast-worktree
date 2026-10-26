@@ -43,8 +43,24 @@ pub fn run(quiet: bool) -> i32 {
         util::say(&report_pending(&missing));
         return 0;
     }
+    let unrecorded = labels(&unrecorded(&root, &projects));
+    util::say(&report_unrecorded(&unrecorded, quiet));
     util::say(&report(&missing, projects.len(), quiet));
     0
+}
+
+/// Directories that are there without a record of what they were made
+/// from, which `install` leaves as they are: not listed as missing, so that
+/// `check` never sends anyone to an install that would not touch them (or,
+/// with `--changed`, would replace them). Said only when not `quiet`.
+pub fn report_unrecorded(unrecorded: &[String], quiet: bool) -> String {
+    if quiet {
+        return String::new();
+    }
+    unrecorded
+        .iter()
+        .map(|u| format!("not made by fast-worktree, left as it is: {u}\n"))
+        .collect()
 }
 
 /// While `hook create`'s background install runs.
@@ -64,10 +80,21 @@ fn in_cache(dir: &std::path::Path) -> bool {
     dir.canonicalize().is_ok_and(|d| d.starts_with(&root))
 }
 
+/// The targets that are not installed, but those [`unrecorded`] names.
 fn missing(root: &Path, projects: &[Target]) -> Vec<Target> {
     projects
         .iter()
-        .filter(|p| !p.preset.is_installed(root, p))
+        .filter(|p| !p.preset.is_installed(root, p) && !p.preset.is_unrecorded(root, p))
+        .cloned()
+        .collect()
+}
+
+/// The targets whose directory is there without a record of its key
+/// ([`crate::ecosystem::Preset::is_unrecorded`]).
+fn unrecorded(root: &Path, projects: &[Target]) -> Vec<Target> {
+    projects
+        .iter()
+        .filter(|p| !p.preset.is_installed(root, p) && p.preset.is_unrecorded(root, p))
         .cloned()
         .collect()
 }

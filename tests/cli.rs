@@ -5419,17 +5419,146 @@ fn a_failed_install_leaves_nothing_that_counts_as_installed() {
     fs::write(wt1.join("Pods/made-from"), "half\n").unwrap();
     assert_eq!(
         w.fw(&wt1, &["check"]).out(),
-        "missing deps: Pods (clone)\nrun `fast-worktree install` to install them\n"
+        "not made by fast-worktree, left as it is: Pods (clone)\ndeps ok (1 projects)\n"
     );
     let r = w.fw(&main, &["add", "../wt2", "-b", "b"]);
     r.assert_fails();
     assert!(!r.out().contains("clone  Pods from"), "{}", r.out());
     assert!(!w.base.join("wt2/Pods").exists());
-    // `install` makes it again rather than keep it (and fails again).
+    // `install` leaves it as it is; `install --changed` makes it again
+    // (and fails again), and puts it back.
     let r = w.fw(&wt1, &["install"]);
+    r.assert_ok();
+    assert!(r.out().contains("left as it is"), "{}", r.out());
+    let r = w.fw(&wt1, &["install", "--changed"]);
     r.assert_fails();
     assert!(r.out().contains("FAILED Pods:"), "{}", r.out());
-    assert!(!wt1.join("Pods").exists());
+    assert_eq!(
+        fs::read_to_string(wt1.join("Pods/made-from")).unwrap(),
+        "half\n"
+    );
+}
+
+#[test]
+fn install_leaves_a_directory_it_did_not_make() {
+    let w = World::new();
+    let main = w.main();
+    // A build cache: no install, no verify. The build makes `build`.
+    w.publish(
+        &[
+            ("k", "v1\n"),
+            (".gitignore", "node_modules/\nbuild/\nPods/\n"),
+            (
+                ".fast-worktree.toml",
+                "[[clone]]\npath = \"build\"\nkey = [\"k\"]\n\n\
+                 [[clone]]\npath = \"Pods\"\nkey = [\"k\"]\n\
+                 install = \"mkdir -p Pods && cp k Pods/made-from\"\n",
+            ),
+        ],
+        "build",
+    );
+    fs::create_dir_all(main.join("build")).unwrap();
+    fs::write(main.join("build/out.o"), "built\n").unwrap();
+    fs::create_dir_all(main.join("Pods")).unwrap();
+    fs::write(main.join("Pods/mine"), "by hand\n").unwrap();
+    let r = w.fw(&main, &["install"]);
+    r.assert_ok();
+    // Both are still there, as they were.
+    assert_eq!(
+        fs::read_to_string(main.join("build/out.o")).unwrap(),
+        "built\n"
+    );
+    assert_eq!(
+        fs::read_to_string(main.join("Pods/mine")).unwrap(),
+        "by hand\n"
+    );
+    assert!(
+        r.out().contains(
+            "skip   build (no record of its key: not made by fast-worktree, left as it is"
+        ),
+        "{}",
+        r.out()
+    );
+    assert!(
+        r.out().contains("skip   Pods (no record of its key"),
+        "{}",
+        r.out()
+    );
+    // `check` does not send anyone to `install` for them.
+    let r = w.fw(&main, &["check"]);
+    assert!(!r.out().contains("missing deps"), "{}", r.out());
+    assert!(
+        r.out()
+            .contains("not made by fast-worktree, left as it is: build (clone)\n"),
+        "{}",
+        r.out()
+    );
+    assert!(
+        r.out()
+            .contains("not made by fast-worktree, left as it is: Pods (clone)\n"),
+        "{}",
+        r.out()
+    );
+    assert_eq!(w.fw(&main, &["check", "--quiet"]).out(), "");
+    let r = w.fw(&main, &["plan", "."]);
+    r.assert_ok();
+    assert!(
+        r.out().contains("build (clone)\n  from  present (no record of its key: not made by fast-worktree, left as it is)\n"),
+        "{}",
+        r.out()
+    );
+    // `--changed` makes them again, but only what something can replace:
+    // nothing makes `build`, so it stays.
+    let r = w.fw(&main, &["install", "--changed"]);
+    r.assert_ok();
+    assert!(
+        r.out().contains(
+            "note   build: no record of its key, but nothing to clone it from and no install to make it again: left as it is"
+        ),
+        "{}",
+        r.out()
+    );
+    assert_eq!(
+        fs::read_to_string(main.join("build/out.o")).unwrap(),
+        "built\n"
+    );
+    assert!(
+        r.out()
+            .contains("note   Pods: no record of its key, made again"),
+        "{}",
+        r.out()
+    );
+    assert_eq!(
+        fs::read_to_string(main.join("Pods/made-from")).unwrap(),
+        "v1\n"
+    );
+    assert!(!main.join("Pods/mine").exists());
+    // One that fast-worktree made from other key files is made again
+    // without `--changed`, but only when something replaces it.
+    fs::write(
+        main.join("build/.fast-worktree-key"),
+        "0000000000000000-00000000\n",
+    )
+    .unwrap();
+    let r = w.fw(&main, &["install"]);
+    r.assert_ok();
+    assert!(
+        r.out()
+            .contains("note   build: its key changed, but nothing to clone it from"),
+        "{}",
+        r.out()
+    );
+    assert_eq!(
+        fs::read_to_string(main.join("build/out.o")).unwrap(),
+        "built\n"
+    );
+    let r = w.fw(&main, &["plan", "."]);
+    assert!(
+        r.out()
+            .contains("  from  nothing (no install): the one there is left as it is\n"),
+        "{}",
+        r.out()
+    );
 }
 
 #[test]
@@ -5669,22 +5798,22 @@ fn remove_goes_on_without_a_config_it_cannot_read() {
     let r = w.fw(&main, &["remove", "../wt"]);
     r.assert_ok();
     assert!(!wt.exists());
-    assert!(
-        r.err().contains("removing it without the pre_remove hooks"),
-        "{}",
-        r.err()
-    );
+    // It says that no pre_remove hook ran, and which file it could not read.
+    let said = |r: &Run, wt: &Path| {
+        let said = format!(
+            "fast-worktree: NO pre_remove hook was run: cannot read {}, ",
+            wt.join(".fast-worktree.toml").display()
+        );
+        assert!(r.err().contains(&said), "{}", r.err());
+    };
+    said(&r, &wt);
     // hook remove does the same.
     let hooked = w.hook_worktree("broken");
     w.commit(&hooked, &[(".fast-worktree.toml", "[[clone]\n")], "broken");
     let r = w.hook_remove(&hooked);
     r.assert_ok();
     assert!(!hooked.exists());
-    assert!(
-        r.err().contains("removing it without the pre_remove hooks"),
-        "{}",
-        r.err()
-    );
+    said(&r, &hooked);
     assert!(!w.hook_log().contains("pre_remove"), "{}", w.hook_log());
 }
 
