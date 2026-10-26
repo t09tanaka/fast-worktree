@@ -375,7 +375,7 @@ fn remove_worktree() -> Result<()> {
         let why = if dirty {
             "it had uncommitted changes"
         } else if !subs.is_empty() {
-            "it has submodules"
+            "it has submodules checked out"
         } else {
             "another worktree was inside it"
         };

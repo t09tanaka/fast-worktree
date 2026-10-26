@@ -381,20 +381,32 @@ size = 1
 or for one repository in the main checkout's `.fast-worktree.toml`, which
 wins over the user config. `size = 0` turns it off.
 
-- **Spares.** `pool fill` fetches origin's default branch and, until there
-  are `size` spares, runs `git worktree add --detach` of it, `install`, and
-  `git worktree lock --reason "fast-worktree pool"`. A spare is only put
-  in place once it is complete. `FAST_WORKTREE_SKIP=1` keeps the
+- **Spares.** `pool fill` fetches origin's default branch (for at most 60
+  seconds, else as last fetched) and, until there are `size` spares, runs
+  `git worktree add --detach` of it, `install`, and `git worktree lock
+  --reason "fast-worktree pool"`. A spare is only put in place once it is
+  complete. `FAST_WORKTREE_SKIP=1` keeps the
   [post-checkout hook](#post-checkout-hook) out of the way meanwhile.
 - **Taking one.** `add` renames a spare to a name of its own (two `add`s
   never get the same one: the rename either succeeds or finds it gone),
   unlocks it, `git worktree move`s it to `<path>`, and `git switch -c
   <branch> <start-point>`s there. Then `install --changed` installs again
-  only the projects whose lockfile (or Node version) differs, and the
-  project's own install scripts run again where its tracked files changed
-  between the spare's commit and `<start-point>` (`skip_lifecycle` rules
-  apply). The `.worktreeinclude` files and the `post_add` hooks follow, as
+  only the projects whose lockfile (or Node version) differs, and the other
+  projects run their own install steps again where the worktree is now
+  (below). The `.worktreeinclude` files and the `post_add` hooks follow, as
   for any `add`.
+- **Made in one place, used in another.** A spare is made in the pool and
+  moved to `<path>` when it is taken. It cannot be made where it will be
+  used: that path is only known when `add` runs. So whatever its install
+  wrote by absolute path points into the pool. Against that, a spare keeps
+  no `node_modules` with a symlink whose target is absolute (the `add`
+  that takes the spare installs that project again), and after the move
+  each npm project's own `preinstall` / `install` / `postinstall` /
+  `prepare` run again (`skip_lifecycle` rules apply), and each Flutter
+  project runs `flutter pub get --offline` again (it writes the project's
+  path into `ios/Flutter/Generated.xcconfig` and
+  `.flutter-plugins-dependencies`). Anything else that records its own
+  absolute path is not rewritten.
 - **Refilling.** Taking a spare starts `pool fill` in the background. Only
   one fill runs per repository at a time (a lock in the pool directory);
   its output goes to `fill.log` there.
@@ -421,14 +433,14 @@ $ cat ~/.config/fast-worktree/config.toml
 [pool]
 size = 1
 $ fast-worktree pool fill
-2026-10-26 11:43 fill  started
+2026-10-26 13:03 fill  started
 note   api: postinstall skipped, inputs unchanged
-clone  api from ~/Library/Caches/fast-worktree/monorepo-5386f750/api/263f7cb8e0876026-v20.13.1 (0.1s)
+clone  api from ~/Library/Caches/fast-worktree/monorepo-9da4d4fc/api/263f7cb8e0876026-v20.13.1 (0.1s)
 pub get mobile (flutter, 0.3s)
-clone  web from ~/Library/Caches/fast-worktree/monorepo-5386f750/web/02ed81ddfaf462f9-v20.13.1 (0.3s)
-deps done in 0.3s
-2026-10-26 11:43 spare wt-1793015016-83598-0 at 738710b ready (0.4s)
-2026-10-26 11:43 fill  done: 1 of 1 ready
+clone  web from ~/Library/Caches/fast-worktree/monorepo-9da4d4fc/web/02ed81ddfaf462f9-v20.13.1 (0.3s)
+deps done in 0.4s
+2026-10-26 13:03 spare wt-1793019788-59566-0 at 005cb21 ready (0.4s)
+2026-10-26 13:03 fill  done: 1 of 1 ready
 $ fast-worktree add ../monorepo-b -b feature/b
 worktree from the pool in 0.1s
 copy   .env
@@ -436,24 +448,26 @@ skip   api (up to date)
 skip   mobile (up to date)
 skip   web (up to date)
 deps done in 0.1s
+note   api: postinstall skipped, inputs unchanged
+rerun  web: postinstall
 hook   post_add: echo "ready: $(basename "$FAST_WORKTREE_PATH")"
 ready: monorepo-b
 $ fast-worktree pool status
 pool   1 of 1 ready (size from [pool] in ~/.config/fast-worktree/config.toml)
 ID                     COMMIT   BEHIND origin/main  CREATED
-wt-1793015016-83772-0  738710b  0                   2026-10-26 11:43 UTC
+wt-1793019788-59890-0  005cb21  0                   2026-10-26 13:03 UTC
 misses 0 (an add found no spare ready)
 $ git -C ../upstream commit -q --allow-empty -m "move on"
 $ fast-worktree pool refresh
-drop   wt-1793015016-83772-0 (behind origin/main)
+drop   wt-1793019788-59890-0 (behind origin/main)
 dropped 1 spare(s) behind origin/main
 note   api: postinstall skipped, inputs unchanged
-clone  api from ~/Library/Caches/fast-worktree/monorepo-5386f750/api/263f7cb8e0876026-v20.13.1 (0.1s)
+clone  api from ~/Library/Caches/fast-worktree/monorepo-9da4d4fc/api/263f7cb8e0876026-v20.13.1 (0.1s)
 pub get mobile (flutter, 0.3s)
-clone  web from ~/Library/Caches/fast-worktree/monorepo-5386f750/web/02ed81ddfaf462f9-v20.13.1 (0.3s)
-deps done in 0.4s
-2026-10-26 11:43 spare wt-1793015017-83997-0 at ef7230b ready (0.4s)
-2026-10-26 11:43 fill  done: 1 of 1 ready
+clone  web from ~/Library/Caches/fast-worktree/monorepo-9da4d4fc/web/02ed81ddfaf462f9-v20.13.1 (0.3s)
+deps done in 0.3s
+2026-10-26 13:03 spare wt-1793019789-60373-0 at 50c46ff ready (0.4s)
+2026-10-26 13:03 fill  done: 1 of 1 ready
 $ fast-worktree pool clear
 removed 1 spare(s) (deleting in background)
 ```
@@ -513,17 +527,51 @@ out; if the worktree exists, it is used as it is.
   running.
 - It exits non-zero only when git cannot create the worktree. Dependencies
   or `post_add` hooks that fail are warnings, and the path is printed.
+- It always starts from origin's default branch. It does not read Claude
+  Code's `worktree.baseRef` setting.
+- The fetch never waits for a password, a passphrase or a host key prompt:
+  it runs with `GIT_TERMINAL_PROMPT=0` and `-o BatchMode=yes` added to the
+  ssh command git would use (`GIT_SSH_COMMAND`, else `core.sshCommand`,
+  else `ssh`; one named by `GIT_SSH` alone is left as it is). So does the
+  fetch of `pool fill`. The background install runs in a session of its
+  own, without a terminal.
+- Claude Code waits for the hook's output to end. A `post_add` hook that
+  runs while it waits (when nothing is left to the background) and leaves
+  a process behind that still holds stderr, such as `some-server &`, can
+  keep Claude Code waiting. Redirect such a process's output (`some-server
+  >/dev/null 2>&1 &`).
 
 **`hook remove`** reads `worktree_path`. Claude Code takes exit 0 for "the
 worktree is gone", and calls the hook only after you agreed to remove the
 worktree (or with `discard_changes`), so it always deletes it:
 
-- It refuses (exit 1, nothing deleted) a path that is not a linked
-  worktree of a repository, the main checkout, and a spare of the pool.
+- It refuses (exit 1, nothing deleted, no hook run) a path that is not a
+  linked worktree of a repository, the main checkout, a spare of the pool,
+  a worktree you locked (`git worktree lock`; a lock the pool left is
+  fine), one that cannot be renamed away (as for `remove`), and one with a
+  submodule git directory that cannot go with it (below).
+- If its background install is still running, it stops it first, with
+  everything it started (`SIGTERM`, then `SIGKILL` after 3 seconds), so
+  that nothing writes into the worktree once it is gone.
 - It runs the `pre_remove` hooks, moves the worktree into the trash and
-  runs `git worktree prune`. A worktree with uncommitted or untracked
-  changes is kept in the trash for at least 24 hours, and the command to
-  get them back is printed.
+  removes its own entry from git, and no other (it does not run `git
+  worktree prune`, as for `remove`). When the path is already gone, it
+  removes the one entry registered at that path, if git has exactly one.
+- It keeps the worktree in the trash for at least 24 hours, and prints the
+  command to get it back, when it has uncommitted or untracked changes (as
+  `remove` counts them, whatever `status.showUntrackedFiles` says), when it
+  has submodules checked out, or when another registered worktree is
+  inside it. Submodules keep their git directories in the worktree's
+  entry, which goes; each one's is moved into the submodule as its `.git`
+  first, so their commits go with it (`git submodule absorbgitdirs` moves
+  them back after a restore). A worktree inside is not deleted: it stays
+  registered where it is now, in the trash, and the command to move it out
+  is printed.
+- When it keeps a worktree, and when the worktree's detached `HEAD` is on
+  no branch, that commit is kept in
+  `refs/fast-worktree/kept/<name>-<UTC date>-<time>`, named in the output,
+  so that gc does not take it. Those refs stay until you delete them
+  (`git update-ref -d <ref>`).
 - Claude Code never deletes the branch of a worktree a hook created. `hook
   remove` deletes `worktree-<name>` only when its commit is on its
   upstream, a remote branch or the default branch; otherwise it keeps it
@@ -537,31 +585,32 @@ to `~`:
 $ echo '{"name":"demo","cwd":"'"$PWD"'"}' | fast-worktree hook create
 Preparing worktree (new branch 'worktree-demo')
 branch 'worktree-demo' set up to track 'origin/main'.
-HEAD is now at ef7230b move on
-worktree added in 0.1s
+HEAD is now at 50c46ff move on
+worktree added in 0.0s
 copy   .env
 note   api: postinstall skipped, inputs unchanged
-clone  api from ~/Library/Caches/fast-worktree/monorepo-5386f750/api/263f7cb8e0876026-v20.13.1 (0.1s)
+clone  api from ~/Library/Caches/fast-worktree/monorepo-9da4d4fc/api/263f7cb8e0876026-v20.13.1 (0.1s)
 later  mobile (installed in the background)
-clone  web from ~/Library/Caches/fast-worktree/monorepo-5386f750/web/02ed81ddfaf462f9-v20.13.1 (0.2s)
+clone  web from ~/Library/Caches/fast-worktree/monorepo-9da4d4fc/web/02ed81ddfaf462f9-v20.13.1 (0.3s)
 deps done in 0.3s
 later  started; `fast-worktree wait` waits for it
 ~/monorepo/.claude/worktrees/demo
 $ fast-worktree wait .claude/worktrees/demo
 waiting for the background install in ~/monorepo/.claude/worktrees/demo
 background install done
-$ cd .claude/worktrees/demo && git branch --show-current && fast-worktree check && cat .env
+$ (cd .claude/worktrees/demo && git branch --show-current && fast-worktree check && cat .env)
 worktree-demo
 deps ok (3 projects)
 API_TOKEN=dev-only
-$ cd .claude/worktrees/demo && echo wip > notes.txt
+$ echo wip > .claude/worktrees/demo/notes.txt
 $ echo '{"worktree_path":"'"$PWD"'/.claude/worktrees/demo"}' | fast-worktree hook remove
 hook   pre_remove: echo "bye: $(basename "$FAST_WORKTREE_PATH")"
 bye: demo
-removed ~/monorepo/.claude/worktrees/demo (moved to ~/Library/Caches/fast-worktree/trash/keep-1793101418-1793015018-84449-0915856000-demo)
+removed ~/monorepo/.claude/worktrees/demo (moved to ~/Library/Caches/fast-worktree/trash/keep-1793106191-1793019791-61112-0116067000-demo)
 deleted branch worktree-demo
-fast-worktree: it had uncommitted changes; they are kept in ~/Library/Caches/fast-worktree/trash/keep-1793101418-1793015018-84449-0915856000-demo for at least 24 hours
-to restore them: git -C ~/monorepo worktree add ~/monorepo/.claude/worktrees/demo ef7230b09d7a8ca0493fc9010b89cd8f41f199a6 && rsync -a --exclude=.git ~/Library/Caches/fast-worktree/trash/keep-1793101418-1793015018-84449-0915856000-demo/ ~/monorepo/.claude/worktrees/demo/
+fast-worktree: it had uncommitted changes; it is kept in ~/Library/Caches/fast-worktree/trash/keep-1793106191-1793019791-61112-0116067000-demo for at least 24 hours
+to restore them: git -C ~/monorepo worktree add ~/monorepo/.claude/worktrees/demo refs/fast-worktree/kept/demo-20261026-130311 && rsync -a --exclude=/.git ~/Library/Caches/fast-worktree/trash/keep-1793106191-1793019791-61112-0116067000-demo/ ~/monorepo/.claude/worktrees/demo/
+fast-worktree: its HEAD 50c46ff4cb8f is kept as refs/fast-worktree/kept/demo-20261026-130311 (`git update-ref -d refs/fast-worktree/kept/demo-20261026-130311` drops it)
 ```
 
 `worktree-demo` was deleted because its commit is on `origin/main`. A
@@ -571,8 +620,8 @@ worktree with a commit of its own keeps its branch:
 $ echo '{"worktree_path":"'"$PWD"'/.claude/worktrees/work"}' | fast-worktree hook remove
 hook   pre_remove: echo "bye: $(basename "$FAST_WORKTREE_PATH")"
 bye: work
-removed ~/monorepo/.claude/worktrees/work (moved to ~/Library/Caches/fast-worktree/trash/1793015019-84681-0940792000-work)
-fast-worktree: kept branch worktree-work: commit 929fa465af2d is not on its upstream, a remote branch or the default branch
+removed ~/monorepo/.claude/worktrees/work (moved to ~/Library/Caches/fast-worktree/trash/1793019792-61600-0225457000-work)
+fast-worktree: kept branch worktree-work: commit 21f7c601e324 is not on its upstream, a remote branch or the default branch
 ```
 
 ## Where things live
@@ -597,13 +646,14 @@ fast-worktree: kept branch worktree-work: commit 929fa465af2d is not on its upst
   where. Each run deletes again whatever an interrupted background deletion
   left in the trash or in a sibling it has a note for. Entries named
   `keep-<unix time>-...`
-  (worktrees `hook remove` deleted with changes in them) are left alone
-  until that time.
+  (worktrees `hook remove` kept) are left alone until that time.
+- `refs/fast-worktree/kept/*` in the repository: commits `hook remove`
+  kept (above).
 - Pool: `<cache>/<repo>-<hash>/pool`, with one directory per spare
   (`wt-<unix time>-<pid>-<n>`), `fill.log`, `fill.lock` and `misses` (one
   line per `add` that found no spare).
 - The background install of `hook create` keeps its marker
-  (`fast-worktree-installing`), log and result in the worktree's own git
+  (`fast-worktree-installing`), lock, log and result in the worktree's own git
   directory (`.git/worktrees/<name>/` of the repository), not in the
   worktree, where `git status` would show them.
 

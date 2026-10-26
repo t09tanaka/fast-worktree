@@ -44,20 +44,43 @@ change bumps the minor version).
   `<cache>/<repo>/pool` with `git worktree add --detach` of origin's default
   branch, `install` and `git worktree lock`. `add` takes one by renaming
   it, moves it into place with `git worktree move`, switches to the new
-  branch, installs only the projects whose lockfile changed, runs a
-  project's own install scripts again where its tracked files changed, and
-  starts `pool fill` in the background. Without a spare, or when the move
-  fails, `add` creates the worktree as before and counts a miss.
+  branch, installs only the projects whose lockfile changed, runs the
+  other projects' own install steps again where the worktree now is, and
+  starts `pool fill` in the background, in a session of its own. Without
+  a spare, or when the move fails, `add` creates the worktree as before
+  and counts a miss.
 - `pool status`, `pool fill`, `pool refresh` and `pool clear`.
 - `hook create` and `hook remove` for Claude Code's `WorktreeCreate` and
   `WorktreeRemove` hooks, and `hook print-config` to print them for a
   settings file. `hook create` makes `<main>/.claude/worktrees/<name>` on
   branch `worktree-<name>` from origin's default branch, prints only the
   path on stdout, installs what can be cloned and leaves the rest to a
-  background `install --changed`; it fails only when git does. `hook
-  remove` deletes the worktree even with changes (kept in the trash for at
-  least 24 hours, with the command to restore them) and deletes
-  `worktree-<name>` only when its commit is on another ref.
+  background `install --changed`, in a session of its own; it fails only
+  when git does. It always starts from origin's default branch (Claude
+  Code's `worktree.baseRef` is not read). `hook remove` deletes the
+  worktree even with changes and deletes `worktree-<name>` only when its
+  commit is on another ref. It keeps the worktree in the trash for at least
+  24 hours, with the command to restore it, when it has uncommitted or
+  untracked changes (whatever `status.showUntrackedFiles` says), when it
+  has submodules checked out (their git directories are moved into them
+  first, so unpushed submodule commits go with it) or when another
+  registered worktree is inside it (that one stays registered where it is now). A
+  kept worktree's `HEAD`, and a detached `HEAD` on no branch, is kept in
+  `refs/fast-worktree/kept/<name>-<date>-<time>`. It stops a background
+  install still running in the worktree first. It removes only the
+  worktree's own entry from git, also when the path is already gone, and
+  never runs `git worktree prune`. It refuses, before the `pre_remove`
+  hooks, a worktree the user locked, one that cannot be renamed away, and
+  one with a submodule git directory that cannot go with it.
+- Fetches of `hook create` and `pool fill` never wait for a prompt:
+  `GIT_TERMINAL_PROMPT=0`, and `-o BatchMode=yes` added to the user's
+  `GIT_SSH_COMMAND` or `core.sshCommand` (or `ssh`). `pool fill` gives its
+  fetch at most 60 seconds.
+- A spare from the pool keeps no `node_modules` with an absolute symlink,
+  and after it is moved into place its npm projects' own install scripts
+  and its Flutter projects' `flutter pub get --offline` run again there.
+  `pool clear` and a spare that cannot be used remove only their own
+  entries from git.
 - `wait [<path>]`: wait for the background install of `hook create`;
   `check` says when one is running.
 
