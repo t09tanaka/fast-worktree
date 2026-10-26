@@ -110,7 +110,12 @@ enum PoolCmd {
     /// List the spares: commit, how far behind origin, when made, misses
     Status,
     /// Make spares until the pool has its size
-    Fill,
+    Fill {
+        /// First wait for the background install of this worktree, if one
+        /// is running (for the refill that `add` and `hook create` start)
+        #[arg(long, hide = true, value_name = "WORKTREE")]
+        after: Option<PathBuf>,
+    },
     /// Drop the spares behind origin's default branch and fill again
     Refresh,
     /// Remove every spare
@@ -194,7 +199,7 @@ fn main() {
         }),
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::Status => pool::status(),
-            PoolCmd::Fill => pool::fill(),
+            PoolCmd::Fill { after } => pool::fill(after.as_deref()),
             PoolCmd::Refresh => pool::refresh(),
             PoolCmd::Clear => pool::clear(),
         },

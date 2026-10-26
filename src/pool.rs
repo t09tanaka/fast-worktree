@@ -4,7 +4,12 @@
 //! Spares live in `<cache>/<repo>/pool/wt-<unix seconds>-<pid>-<n>`. Each is
 //! `git worktree add --detach` of origin's default branch, then `install`,
 //! then `git worktree lock --reason "fast-worktree pool"`, built under a
-//! hidden name (`.new-<id>`) and renamed into place only when ready.
+//! hidden name (`.new-<id>`) and renamed into place only when ready. The
+//! repository's own git hooks do not run for a spare (`core.hooksPath` is
+//! an empty directory for that `git worktree add`): whatever a
+//! `post-checkout` hook sets up belongs to the worktree where it ends up,
+//! and it runs there, with the `git switch` that puts the spare on its
+//! branch.
 //!
 //! Taking one is a rename to a hidden name of our own (`.claimed-<pid>-<id>`):
 //! the rename either succeeds or finds the spare gone, so two `add`s never
@@ -13,7 +18,11 @@
 //! If the move fails (another file system, say), the spare is put back.
 //!
 //! `fill` holds `pool/fill.lock` (`flock`) while it works, so only one runs
-//! per repository; a second one sees the lock and exits.
+//! per repository; a second one sees the lock and exits. The refill that an
+//! `add` (or `hook create`) starts, whether it took a spare or found none,
+//! starts when that command is done, and waits for its background install
+//! when there is one (`pool fill --after <worktree>`), so that the two do
+//! not install at the same time.
 //!
 //! The pool is off unless `[pool] size` is set, in the main checkout's
 //! `.fast-worktree.toml` or in the user's `config.toml`.
@@ -21,9 +30,11 @@
 //! A spare is made in the pool and used somewhere else, so whatever its
 //! install recorded by absolute path points into the pool. A `node_modules`
 //! with a symlink whose target is absolute is therefore not kept in a spare
-//! (the `add` that takes it installs that project again), and after the
-//! move the projects' own install steps run again where the worktree now is
-//! ([`crate::ecosystem::Ecosystem::rerun_own_scripts`]).
+//! (the `add` that takes it installs that project again); after the move,
+//! the path where the spare was made is replaced with the new one in the
+//! files Flutter generated ([`crate::ecosystem::dart::rewrite_moved_paths`]),
+//! and the npm projects' own install steps run again where the worktree now
+//! is ([`crate::ecosystem::Ecosystem::rerun_own_scripts`]).
 
 use crate::cmd::install;
 use crate::ecosystem::{self, Mode};
@@ -43,6 +54,11 @@ pub const LOCK_REASON: &str = "fast-worktree pool";
 pub const SPARE_PREFIX: &str = "wt-";
 const BUILDING_PREFIX: &str = ".new-";
 const CLAIMED_PREFIX: &str = ".claimed-";
+/// The empty directory a spare's `git worktree add` takes for its hooks.
+const NO_HOOKS_PREFIX: &str = ".no-hooks-";
+/// How long a refill waits for the background install it was started
+/// after.
+const AFTER_LIMIT: Duration = Duration::from_secs(30 * 60);
 const MISSES: &str = "misses";
 const FILL_LOCK: &str = "fill.lock";
 pub const FILL_LOG: &str = "fill.log";
@@ -167,9 +183,10 @@ fn new_id() -> String {
 /// What [`take`] got.
 #[derive(Debug)]
 pub enum Taken {
-    /// The spare is now the worktree at the target; `commit` is the commit
-    /// it was made at.
-    Spare { commit: String },
+    /// The spare is now the worktree at the target; `made_at` are the
+    /// paths of the directory it was made in (as written, and the real
+    /// path).
+    Spare { made_at: Vec<PathBuf> },
     /// No spare was ready.
     Empty,
     /// A spare was found but could not be moved; it was put back.
@@ -186,7 +203,9 @@ pub fn take(main: &Path, target: &Path) -> Taken {
             continue; // another `add` took it first
         }
         return match settle(main, &claimed, target) {
-            Ok(commit) => Taken::Spare { commit },
+            Ok(()) => Taken::Spare {
+                made_at: building_paths(&pool, &s.id),
+            },
             Err(why) => {
                 put_back(main, &claimed, &s.path);
                 Taken::Failed(why.to_string())
@@ -197,13 +216,10 @@ pub fn take(main: &Path, target: &Path) -> Taken {
 }
 
 /// Tell git where the claimed spare is, unlock it and move it to `target`.
-/// Returns its commit.
-fn settle(main: &Path, claimed: &Path, target: &Path) -> Result<String> {
+fn settle(main: &Path, claimed: &Path, target: &Path) -> Result<()> {
     let claimed_s = claimed.to_string_lossy();
     git::output(main, &["worktree", "repair", &claimed_s])?;
-    let commit = git::output(claimed, &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
+    git::output(claimed, &["rev-parse", "HEAD"])?;
     git::output(main, &["worktree", "unlock", &claimed_s])?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
@@ -218,7 +234,7 @@ fn settle(main: &Path, claimed: &Path, target: &Path) -> Result<String> {
         );
         return Err(e);
     }
-    Ok(commit)
+    Ok(())
 }
 
 /// Undo a claim: lock again and rename back.
@@ -231,6 +247,20 @@ fn put_back(main: &Path, claimed: &Path, spare: &Path) {
     if fs::rename(claimed, spare).is_ok() {
         let _ = git::output(main, &["worktree", "repair", &spare.to_string_lossy()]);
     }
+}
+
+/// Where the spare `id` was made: `<pool>/.new-<id>`, as `pool` is written
+/// and as its real path, when that differs.
+fn building_paths(pool: &Path, id: &str) -> Vec<PathBuf> {
+    let name = format!("{BUILDING_PREFIX}{id}");
+    let mut v = vec![pool.join(&name)];
+    if let Ok(real) = pool.canonicalize() {
+        let real = real.join(&name);
+        if !v.contains(&real) {
+            v.push(real);
+        }
+    }
+    v
 }
 
 /// Note that an `add` found no spare.
@@ -254,15 +284,16 @@ pub fn misses(pool: &Path) -> usize {
 }
 
 /// Start `fast-worktree pool fill` in the background, detached, with its
-/// output in `pool/fill.log`.
-pub fn spawn_fill(main: &Path) {
+/// output in `pool/fill.log`. With `after`, it first waits for the
+/// background install of that worktree, if one is running.
+pub fn spawn_fill(main: &Path, after: Option<&Path>) {
     let pool = dir(main);
-    if let Err(e) = try_spawn_fill(main, &pool) {
+    if let Err(e) = try_spawn_fill(main, &pool, after) {
         println!("note   pool: cannot start `pool fill`: {e}");
     }
 }
 
-fn try_spawn_fill(main: &Path, pool: &Path) -> io::Result<()> {
+fn try_spawn_fill(main: &Path, pool: &Path, after: Option<&Path>) -> io::Result<()> {
     fs::create_dir_all(pool)?;
     let log_path = pool.join(FILL_LOG);
     let fresh = fs::metadata(&log_path).is_ok_and(|m| m.len() > LOG_LIMIT);
@@ -274,8 +305,11 @@ fn try_spawn_fill(main: &Path, pool: &Path) -> io::Result<()> {
         .open(&log_path)?;
     let exe = std::env::current_exe()?;
     let mut c = Command::new(exe);
-    c.args(["pool", "fill"])
-        .current_dir(main)
+    c.args(["pool", "fill"]);
+    if let Some(a) = after {
+        c.arg("--after").arg(a);
+    }
+    c.current_dir(main)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -331,8 +365,10 @@ fn fetched_base(main: &Path) -> Result<String> {
     Ok(format!("origin/{base}"))
 }
 
-/// `pool fill`: make spares until there are `size`.
-pub fn fill() -> Result<i32> {
+/// `pool fill`: make spares until there are `size`. With `after`, first
+/// wait (holding the fill lock) for the background install of that
+/// worktree, if one is running.
+pub fn fill(after: Option<&Path>) -> Result<i32> {
     let main = main_here()?;
     let (size, _) = size(&main);
     if size == 0 {
@@ -344,9 +380,37 @@ pub fn fill() -> Result<i32> {
         println!("{} fill  another fill is running", stamp());
         return Ok(0);
     };
+    if let Some(a) = after {
+        wait_for_install(a);
+    }
     println!("{} fill  started", stamp());
     let base = fetched_base(&main)?;
     fill_locked(&main, &pool, size, &base)
+}
+
+/// Wait while the background install of the worktree `root` runs, for at
+/// most [`AFTER_LIMIT`].
+fn wait_for_install(root: &Path) {
+    if pending::state(root) != pending::State::Running {
+        return;
+    }
+    println!(
+        "{} fill  waiting for the background install in {}",
+        stamp(),
+        util::tilde(root)
+    );
+    let start = Instant::now();
+    while pending::state(root) == pending::State::Running {
+        if start.elapsed() > AFTER_LIMIT {
+            println!(
+                "{} fill  still running after {}, filling anyway",
+                stamp(),
+                util::elapsed(start)
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn fill_locked(main: &Path, pool: &Path, size: u32, base: &str) -> Result<i32> {
@@ -370,13 +434,28 @@ fn make_spare(main: &Path, pool: &Path, base: &str) -> Result<()> {
     let id = new_id();
     let building = pool.join(format!("{BUILDING_PREFIX}{id}"));
     let b = building.to_string_lossy().into_owned();
-    // FAST_WORKTREE_SKIP: a post-checkout hook running fast-worktree stays
-    // out of the way; the install below does the work.
-    git::output_with_env(
+    // None of the repository's hooks: what a post-checkout hook sets up
+    // (and a post-checkout hook running fast-worktree would install) is for
+    // the worktree where the spare ends up, where it runs on `git switch`.
+    let no_hooks = pool.join(format!("{NO_HOOKS_PREFIX}{id}"));
+    fs::create_dir_all(&no_hooks)?;
+    let hooks_path = format!("core.hooksPath={}", no_hooks.display());
+    let added = git::output_with_env(
         main,
-        &["worktree", "add", "-q", "--detach", &b, base],
+        &[
+            "-c",
+            &hooks_path,
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &b,
+            base,
+        ],
         &[("FAST_WORKTREE_SKIP", "1")],
-    )?;
+    );
+    let _ = fs::remove_dir(&no_hooks);
+    added?;
     let installed = Config::load(&building)
         .and_then(|cfg| install::install_deps(&building, &[], &cfg, Mode::Missing))
         .map(|i| i.ok);
@@ -562,6 +641,13 @@ pub fn clear() -> Result<i32> {
     let now = now_secs();
     for e in fs::read_dir(&pool).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
+        if let Some(created) = name.strip_prefix(NO_HOOKS_PREFIX).and_then(created_of) {
+            // Empty, unless something put a file there.
+            if created + LEFTOVER_SECS < now {
+                let _ = fs::remove_dir(e.path());
+            }
+            continue;
+        }
         let rest = name.strip_prefix(BUILDING_PREFIX).or_else(|| {
             // `.claimed-<pid>-wt-...`
             name.strip_prefix(CLAIMED_PREFIX)

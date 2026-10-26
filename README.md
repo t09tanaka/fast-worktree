@@ -403,8 +403,10 @@ wins over the user config. `size = 0` turns it off.
   seconds, else as last fetched) and, until there are `size` spares, runs
   `git worktree add --detach` of it, `install`, and `git worktree lock
   --reason "fast-worktree pool"`. A spare is only put in place once it is
-  complete. `FAST_WORKTREE_SKIP=1` keeps the
-  [post-checkout hook](#post-checkout-hook) out of the way meanwhile.
+  complete. The repository's own git hooks do not run for that `git
+  worktree add` (it gets an empty directory as `core.hooksPath`): what a
+  `post-checkout` hook sets up for a worktree belongs to the worktree the
+  spare becomes, and it runs there, on the `git switch` of `add`.
 - **Taking one.** `add` renames a spare to a name of its own (two `add`s
   never get the same one: the rename either succeeds or finds it gone),
   unlocks it, `git worktree move`s it to `<path>`, and `git switch -c
@@ -420,18 +422,25 @@ wins over the user config. `size = 0` turns it off.
   no `node_modules` with a symlink whose target is absolute (the `add`
   that takes the spare installs that project again), and after the move
   each npm project's own `preinstall` / `install` / `postinstall` /
-  `prepare` run again (`skip_lifecycle` rules apply), and each Flutter
-  project runs `flutter pub get --offline` again (it writes the project's
-  path into `ios/Flutter/Generated.xcconfig` and
-  `.flutter-plugins-dependencies`). Anything else that records its own
-  absolute path is not rewritten.
-- **Refilling.** Taking a spare starts `pool fill` in the background. Only
-  one fill runs per repository at a time (a lock in the pool directory);
-  its output goes to `fill.log` there.
+  `prepare` run again (`skip_lifecycle` rules apply). In each Dart
+  project, the path where the spare was made is replaced with the new one
+  in the ignored text files under `.dart_tool/`, `ios/Flutter/`,
+  `macos/Flutter/ephemeral/`, `linux/flutter/ephemeral/`,
+  `windows/flutter/ephemeral/` and in `.flutter-plugins*`, where `flutter
+  pub get` writes the project's path (`FLUTTER_APPLICATION_PATH` in
+  `ios/Flutter/Generated.xcconfig`, for example). `pub get` itself would
+  not: it leaves those files alone while they are current. Anything else
+  that records its own absolute path is not rewritten.
+- **Refilling.** When `add` is done, whether it took a spare or found
+  none, it starts `pool fill` in the background; after `hook create`, the
+  fill first waits for the background install. So the refill never
+  installs at the same time as the command that started it. Only one fill
+  runs per repository at a time (a lock in the pool directory); its output
+  goes to `fill.log` there.
 - **No spare ready**, because a fill is still busy for example: `add`
-  creates the worktree as usual and counts a miss. If the spare cannot be
-  moved (`<path>` on another file system), it is put back and the worktree
-  is created as usual.
+  creates the worktree as usual, counts a miss, and starts the refill as
+  above. If the spare cannot be moved (`<path>` on another file system),
+  it is put back and the worktree is created as usual.
 - A spare made at an older commit still works: the difference is
   installed on top. One that is far behind takes as long as a fresh
   worktree; `pool refresh` replaces the spares that are behind.
@@ -714,6 +723,14 @@ inside `node_modules`, so the clone carries it. After cloning:
   generation), are run again if its `package.json` has them, unless a
   `skip_lifecycle` rule applies. If one fails, the clone is removed, so the
   next `install` does not take a broken tree for an installed one.
+- Those scripts often write the repository's shared `.git/config` (`git
+  config core.hooksPath ...`), which git lets only one process write at a
+  time. So every run of a project's own lifecycle (`npm ci`, `npm install`
+  and the scripts above, in any fast-worktree command of the repository)
+  holds a lock, `<cache>/<repo>-<hash>/lifecycle.lock`, and they run one
+  at a time; projects that need `npm ci` are installed one after another.
+  A run that still fails with `could not lock config file` (something
+  else had it) is tried again, at most twice.
 
 ## Platforms
 

@@ -46,13 +46,16 @@
 //! `package.json` are run again in the clone, except where a
 //! `skip_lifecycle` rule says their inputs are unchanged. If one fails,
 //! the clone is thrown away so that the next `install` does not skip a
-//! broken tree.
+//! broken tree. Everything that runs the project's own lifecycle (`npm
+//! ci`, `npm install` and those scripts) holds the repository's
+//! [`super::lifecycle_lock`], so only one runs at a time, and is run again
+//! when it failed because git found a config file locked.
 //!
 //! Only macOS can clone directories; elsewhere steps 1 to 3 are skipped.
 
 pub mod tree_match;
 
-use super::{Ctx, Ecosystem, Mode, Report};
+use super::{lifecycle_lock, output_retrying_config_lock, Ctx, Ecosystem, Mode, Report};
 use crate::hooks::SkipLifecycle;
 use crate::paths::{hex, project_slug};
 use crate::{cache, clone, trash, util};
@@ -95,12 +98,13 @@ impl Ecosystem for Npm {
         root: &Path,
         dir: &str,
         rules: &[SkipLifecycle],
+        cache_repo: &Path,
     ) -> Result<Vec<String>, String> {
         let project = super::project_path(root, dir);
         if !project.join("node_modules").is_dir() {
             return Ok(Vec::new());
         }
-        match run_own_lifecycle(&project, dir, rules) {
+        match run_own_lifecycle(&project, dir, rules, cache_repo) {
             Ok((mut notes, ran)) => {
                 if !ran.is_empty() {
                     notes.push(format!("rerun  {dir}: {}", ran.join(", ")));
@@ -323,7 +327,7 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
     if clone::SUPPORTED {
         if let Some(base) = cache::latest(&project_cache, &nodev, &entry) {
             cache::touch(&base);
-            match delta(&base, &target, &lockfile) {
+            match delta(&base, &target, &lockfile, &ctx.cache_repo) {
                 Ok(()) => {
                     write_key(&target, &key);
                     save(&node_modules, &entry, false, &lockfile, dir, &mut lines);
@@ -343,7 +347,7 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
         }
     }
 
-    if let Err(log) = npm_ci(&target) {
+    if let Err(log) = npm_ci(&target, &ctx.cache_repo) {
         discard(&node_modules);
         return Err(log);
     }
@@ -449,7 +453,7 @@ fn discard(node_modules: &Path) {
 
 /// The project's own lifecycle, then the key. A failure discards the clone.
 fn after_clone(ctx: &Ctx, target: &Path, dir: &str, key: &str) -> Result<Vec<String>, String> {
-    match run_own_lifecycle(target, dir, &ctx.skip_lifecycle) {
+    match run_own_lifecycle(target, dir, &ctx.skip_lifecycle, &ctx.cache_repo) {
         Ok((notes, _)) => {
             write_key(target, key);
             Ok(notes)
@@ -480,15 +484,18 @@ fn clone_from(src: &Path, node_modules: &Path, checked: bool) -> Result<(), Stri
 /// Clone `base` (a cache entry for an older lockfile) into the project and
 /// bring it up to date with `npm install`. On error the tree is discarded
 /// and `package-lock.json` is as it was.
-fn delta(base: &Path, project: &Path, lockfile: &[u8]) -> Result<(), String> {
+fn delta(base: &Path, project: &Path, lockfile: &[u8], cache_repo: &Path) -> Result<(), String> {
     let node_modules = project.join("node_modules");
     clone_from(base, &node_modules, cache::is_checked(base))?;
+    // `npm install` runs the project's own lifecycle too.
+    let lock = lifecycle_lock(cache_repo);
     let out = Command::new("npm")
         .arg("install")
         .args(NPM_FLAGS)
         .current_dir(project)
         .stdin(Stdio::null())
         .output();
+    drop(lock);
     let lock_path = project.join(LOCKFILE);
     let rewritten = fs::read(&lock_path).map_or(true, |now| now != lockfile);
     let why = match out {
@@ -529,18 +536,22 @@ pub fn own_lifecycle_scripts(package_json: &[u8]) -> Vec<&'static str> {
         .collect()
 }
 
-/// Run the project's own lifecycle scripts, except those a rule skips.
-/// Returns a note per skipped script, and the scripts that ran.
+/// Run the project's own lifecycle scripts, except those a rule skips, one
+/// run at a time per repository ([`lifecycle_lock`]); one that finds the
+/// git config locked is tried again. Returns a note per skipped script,
+/// and the scripts that ran.
 fn run_own_lifecycle(
     project: &Path,
     dir: &str,
     rules: &[SkipLifecycle],
+    cache_repo: &Path,
 ) -> Result<(Vec<String>, Vec<&'static str>), String> {
     let Ok(pkg) = fs::read(project.join("package.json")) else {
         return Ok((Vec::new(), Vec::new()));
     };
     let mut notes = Vec::new();
     let mut ran = Vec::new();
+    let mut lock = None;
     for script in own_lifecycle_scripts(&pkg) {
         if rules
             .iter()
@@ -549,14 +560,19 @@ fn run_own_lifecycle(
             notes.push(format!("note   {dir}: {script} skipped, inputs unchanged"));
             continue;
         }
-        let out = Command::new("npm")
-            .args(["run", script])
-            .current_dir(project)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("cannot run npm: {e}"))?;
+        if lock.is_none() {
+            lock = Some(lifecycle_lock(cache_repo));
+        }
+        let out = output_retrying_config_lock(|| {
+            let mut c = Command::new("npm");
+            c.args(["run", script])
+                .current_dir(project)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            c
+        })
+        .map_err(|e| format!("cannot run npm: {e}"))?;
         if !out.status.success() {
             return Err(format!(
                 "npm run {script} failed after clone:\n{}",
@@ -568,15 +584,20 @@ fn run_own_lifecycle(
     Ok((notes, ran))
 }
 
-/// `npm ci`. Its output is shown only when it fails.
-fn npm_ci(project: &Path) -> Result<(), String> {
-    let out = Command::new("npm")
-        .arg("ci")
-        .args(NPM_FLAGS)
-        .current_dir(project)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run npm: {e}"))?;
+/// `npm ci`, which runs the project's own lifecycle: one at a time per
+/// repository ([`lifecycle_lock`]), and again when that found the git
+/// config locked. Its output is shown only when it fails.
+fn npm_ci(project: &Path, cache_repo: &Path) -> Result<(), String> {
+    let _lock = lifecycle_lock(cache_repo);
+    let out = output_retrying_config_lock(|| {
+        let mut c = Command::new("npm");
+        c.arg("ci")
+            .args(NPM_FLAGS)
+            .current_dir(project)
+            .stdin(Stdio::null());
+        c
+    })
+    .map_err(|e| format!("cannot run npm: {e}"))?;
     if out.status.success() {
         return Ok(());
     }
@@ -683,7 +704,8 @@ mod tests {
             if_equal: vec![["in".into(), "out".into()]],
         };
         // No npm is spawned: the only script is skipped.
-        let (notes, ran) = run_own_lifecycle(p, "app", std::slice::from_ref(&rule)).unwrap();
+        let (notes, ran) =
+            run_own_lifecycle(p, "app", std::slice::from_ref(&rule), &p.join("cache")).unwrap();
         assert!(ran.is_empty());
         assert_eq!(
             notes,

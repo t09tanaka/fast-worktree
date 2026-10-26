@@ -10,10 +10,12 @@
 //! pub get`. With neither, the project is skipped with a note. Packages
 //! live in pub's own shared cache, so there is nothing to clone.
 //!
-//! `flutter pub get` also writes absolute paths of the project
-//! (`ios/Flutter/Generated.xcconfig`, `.flutter-plugins-dependencies`), so
-//! in a spare from the pool, moved to where it is used, a Flutter project
-//! runs `flutter pub get --offline` again.
+//! `flutter pub get` also writes absolute paths of the project into
+//! ignored files (`ios/Flutter/Generated.xcconfig`,
+//! `.flutter-plugins-dependencies`...), and does not write them again
+//! while they are current. In a spare from the pool, moved to where it is
+//! used, [`rewrite_moved_paths`] replaces the path where the spare was made
+//! with the new one in those files.
 
 use super::{Ctx, Ecosystem, Mode, Report};
 use crate::paths::hex;
@@ -51,41 +53,88 @@ impl Ecosystem for Dart {
             &Tools::find(),
         )
     }
-
-    fn rerun_own_scripts(
-        &self,
-        root: &Path,
-        dir: &str,
-        _rules: &[crate::hooks::SkipLifecycle],
-    ) -> Result<Vec<String>, String> {
-        let project = super::project_path(root, dir);
-        let Some(flutter) = Tools::find().flutter else {
-            return Ok(Vec::new());
-        };
-        if !is_flutter(&project) || !project.join(PACKAGE_CONFIG).is_file() {
-            return Ok(Vec::new());
-        }
-        let start = Instant::now();
-        match pub_get(&flutter, &project, true) {
-            Ok(()) => Ok(vec![format!(
-                "rerun  {dir}: flutter pub get --offline ({})",
-                util::elapsed(start)
-            )]),
-            Err(log) => {
-                // Not current here: the next `install` gets it again.
-                let _ = fs::remove_file(project.join(PACKAGE_CONFIG));
-                Err(log)
-            }
-        }
-    }
 }
 
-/// Whether the project's `pubspec.yaml` depends on the Flutter SDK.
-fn is_flutter(project: &Path) -> bool {
-    fs::read_to_string(project.join("pubspec.yaml")).is_ok_and(|y| {
-        y.lines()
-            .any(|l| l.trim().trim_matches(['"', '\'']).replace(' ', "") == "sdk:flutter")
-    })
+/// Where in a project `pub get` and the Flutter tools write files that
+/// hold the project's absolute path (pathspecs relative to the project).
+const GENERATED: [&str; 6] = [
+    ".dart_tool",
+    "ios/Flutter",
+    "macos/Flutter/ephemeral",
+    "linux/flutter/ephemeral",
+    "windows/flutter/ephemeral",
+    ".flutter-plugins*",
+];
+
+/// The worktree of `project` moved from one of `from` (the paths where it
+/// was made, as written into files) to `to`: in the ignored files under
+/// [`GENERATED`], replace them with `to`. Files with a NUL byte (binary)
+/// and symlinks are left alone. Returns how many files were rewritten.
+pub fn rewrite_moved_paths(project: &Path, from: &[PathBuf], to: &Path) -> usize {
+    let Ok(listed) = crate::git::output(
+        project,
+        &[
+            &[
+                "ls-files",
+                "-z",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--",
+            ][..],
+            &GENERATED[..],
+        ]
+        .concat(),
+    ) else {
+        return 0;
+    };
+    // Longest first: one may end with another (`/private/var/...` and
+    // `/var/...`).
+    let mut from: Vec<Vec<u8>> = from
+        .iter()
+        .map(|p| p.as_os_str().as_encoded_bytes().to_vec())
+        .filter(|p| !p.is_empty())
+        .collect();
+    from.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    from.dedup();
+    let to = to.as_os_str().as_encoded_bytes();
+    let mut n = 0;
+    for rel in listed.split('\0').filter(|r| !r.is_empty()) {
+        let file = project.join(rel);
+        if !fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&file) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+        let mut text = bytes.clone();
+        for f in &from {
+            text = replace_all(&text, f, to);
+        }
+        if text != bytes && fs::write(&file, &text).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `haystack` with every `needle` replaced by `with`.
+fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < haystack.len() {
+        if haystack[i..].starts_with(needle) {
+            out.extend_from_slice(with);
+            i += needle.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// The SDK commands available, found once per install.
@@ -175,18 +224,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_flutter_project_depends_on_the_sdk() {
-        let t = tempfile::tempdir().unwrap();
-        let p = t.path();
-        assert!(!is_flutter(p));
-        fs::write(p.join("pubspec.yaml"), "name: x\n").unwrap();
-        assert!(!is_flutter(p));
-        fs::write(
-            p.join("pubspec.yaml"),
-            "name: x\ndependencies:\n  flutter:\n    sdk: flutter\n",
-        )
-        .unwrap();
-        assert!(is_flutter(p));
+    fn replace_all_replaces_every_occurrence() {
+        assert_eq!(replace_all(b"a/x b/x", b"/x", b"/yy"), b"a/yy b/yy");
+        assert_eq!(replace_all(b"none", b"/x", b"/y"), b"none");
+        assert_eq!(replace_all(b"", b"/x", b"/y"), b"");
     }
 
     #[test]

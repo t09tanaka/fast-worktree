@@ -16,8 +16,17 @@ use tempfile::TempDir;
 const FAKE_NPM: &str = r#"#!/bin/sh
 P=$(pwd -P)
 echo "$1 $2 $P" >> "$FAKE_NPM_LOG"
+# Fails while another call that set the same directory is running: the
+# project's own lifecycle writing a file that only one writer may hold.
+exclusive() {
+  [ -n "$FAKE_NPM_EXCLUSIVE" ] || return 0
+  mkdir "$FAKE_NPM_EXCLUSIVE" 2>/dev/null || { echo "fake npm: another lifecycle is running" >&2; exit 1; }
+  sleep 0.5
+  rmdir "$FAKE_NPM_EXCLUSIVE"
+}
 case "$1" in
   ci)
+    exclusive
     if [ -n "$FAKE_NPM_SLEEP" ]; then sleep "$FAKE_NPM_SLEEP"; fi
     # Like npm, which resolves its prefix once: write by absolute path.
     if [ -n "$FAKE_NPM_ABS_WRITE" ]; then mkdir -p "$P/node_modules/late"; fi
@@ -37,7 +46,14 @@ case "$1" in
     echo updated > node_modules/dep/index.js
     ;;
   run)
+    exclusive
     if [ -n "$FAKE_NPM_RUN_FAIL" ]; then echo "script failed" >&2; exit 1; fi
+    # The first call fails as git does when another process holds the
+    # repository's config.
+    if [ -n "$FAKE_NPM_RUN_LOCKED_ONCE" ] && [ ! -e "$FAKE_NPM_RUN_LOCKED_ONCE" ]; then
+      : > "$FAKE_NPM_RUN_LOCKED_ONCE"
+      echo "error: could not lock config file .git/config: File exists" >&2; exit 1
+    fi
     ;;
   *) echo "fake npm: unexpected $*" >&2; exit 1 ;;
 esac
@@ -2634,39 +2650,89 @@ fn a_spare_is_checked_for_absolute_symlinks_and_its_scripts_run_again_after_the_
     );
 }
 
+/// `flutter pub get` that, like the real one, writes the project's absolute
+/// path into generated files, and leaves them alone when they are there.
+const FAKE_FLUTTER_GEN: &str = r#"#!/bin/sh
+P=$(pwd -P)
+echo "$(basename "$0") $* $P" >> "$FAKE_PUB_LOG"
+mkdir -p .dart_tool ios/Flutter linux/flutter/ephemeral
+echo '{}' > .dart_tool/package_config.json
+[ -f ios/Flutter/Generated.xcconfig ] || printf 'FLUTTER_ROOT=/sdk\nFLUTTER_APPLICATION_PATH=%s\n' "$P" > ios/Flutter/Generated.xcconfig
+[ -f ios/Flutter/flutter_export_environment.sh ] || { printf '#!/bin/sh\nexport "FLUTTER_APPLICATION_PATH=%s"\n' "$P" > ios/Flutter/flutter_export_environment.sh; chmod +x ios/Flutter/flutter_export_environment.sh; }
+[ -f linux/flutter/ephemeral/flutter_native_integration.env ] || printf 'PROJECT=%s\n' "$P" > linux/flutter/ephemeral/flutter_native_integration.env
+[ -f .flutter-plugins-dependencies ] || printf '{"root":"%s/","plugins":[]}' "$P" > .flutter-plugins-dependencies
+[ -f .dart_tool/blob.bin ] || printf 'bin\000%s' "$P" > .dart_tool/blob.bin
+"#;
+
 #[test]
-fn a_flutter_spare_runs_pub_get_again_after_the_move() {
+fn a_flutter_spare_has_the_paths_in_its_generated_files_rewritten_after_the_move() {
     let w = World::new();
     let main = w.main();
     let up = w.base.join("upstream");
     w.commit(
         &up,
         &[
-            (".gitignore", "node_modules/\n.dart_tool/\n"),
+            (
+                ".gitignore",
+                "node_modules/\n.dart_tool/\n.flutter-plugins*\n\
+                 **/ios/Flutter/Generated.xcconfig\n**/ios/Flutter/flutter_export_environment.sh\n\
+                 **/linux/flutter/ephemeral/\n",
+            ),
             (
                 "mobile/pubspec.yaml",
                 "name: mobile\ndependencies:\n  flutter:\n    sdk: flutter\n",
             ),
             ("mobile/pubspec.lock", "packages: {}\n"),
+            (
+                "mobile/ios/Flutter/Debug.xcconfig",
+                "#include \"Generated.xcconfig\"\n",
+            ),
         ],
         "mobile",
     );
     w.git(&main, &["pull", "-q"]);
-    write_exe(&w.base.join("flutter-bin/flutter"), FAKE_PUB);
+    write_exe(&w.base.join("flutter-bin/flutter"), FAKE_FLUTTER_GEN);
     let path = w.path_with(&["flutter-bin"]);
     w.pool_size(1);
     w.fw_with(&main, &["pool", "fill"], &[("PATH", &path)])
         .assert_ok();
+    let spare = w.spares().pop().unwrap();
+    let made = fs::read_to_string(spare.join("mobile/ios/Flutter/Generated.xcconfig")).unwrap();
+    assert!(made.contains("/pool/.new-wt-"), "{made}");
     let _lock = hold_fill_lock(&w.pool_dir());
+    let pub_calls = fs::read_to_string(w.base.join("pub.log")).unwrap();
     let r = w.fw_with(&main, &["add", "../wt", "-b", "feat"], &[("PATH", &path)]);
     r.assert_ok();
     assert!(r.out().contains("worktree from the pool"), "{}", r.out());
     let mobile = w.base.join("wt/mobile");
-    let log = fs::read_to_string(w.base.join("pub.log")).unwrap();
+    for f in [
+        "ios/Flutter/Generated.xcconfig",
+        "ios/Flutter/flutter_export_environment.sh",
+        "linux/flutter/ephemeral/flutter_native_integration.env",
+        ".flutter-plugins-dependencies",
+    ] {
+        let text = fs::read_to_string(mobile.join(f)).unwrap();
+        assert!(text.contains(&mobile.display().to_string()), "{f}: {text}");
+        assert!(!text.contains("/pool/"), "{f}: {text}");
+    }
     assert!(
-        log.contains(&format!("flutter pub get --offline {}\n", mobile.display())),
-        "{log}"
+        fs::metadata(mobile.join("ios/Flutter/flutter_export_environment.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o100
+            != 0
     );
+    // A binary file is left as it is.
+    let blob = fs::read(mobile.join(".dart_tool/blob.bin")).unwrap();
+    assert!(String::from_utf8_lossy(&blob).contains("/pool/.new-wt-"));
+    // `pub get` does not run again: it would not rewrite them.
+    assert_eq!(
+        fs::read_to_string(w.base.join("pub.log")).unwrap(),
+        pub_calls
+    );
+    assert!(r.out().contains("paths  mobile: "), "{}", r.out());
+    status_is_clean(&w, &w.base.join("wt"));
 }
 
 #[test]
@@ -3054,4 +3120,223 @@ fn hook_remove_puts_the_submodules_back_when_one_cannot_be_moved() {
     // Once it can be, it is.
     w.hook_remove(&wt).assert_ok();
     assert!(!wt.exists());
+}
+
+#[test]
+fn the_projects_own_lifecycle_runs_one_at_a_time() {
+    let w = World::new();
+    let busy = w.base.join("busy");
+    // Both projects install at once; their `npm ci` (which runs their own
+    // lifecycle) must not.
+    let r = w.fw_with(
+        &w.main(),
+        &["add", "../wt", "-b", "feat"],
+        &[("FAKE_NPM_EXCLUSIVE", busy.to_str().unwrap())],
+    );
+    r.assert_ok();
+    assert_eq!(w.count("ci "), 2, "{}", w.npm_log());
+}
+
+#[test]
+fn a_lifecycle_script_that_finds_the_git_config_locked_is_run_again() {
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(1);
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    let _lock = hold_fill_lock(&w.pool_dir());
+    let once = w.base.join("locked-once");
+    let r = w.fw_with(
+        &main,
+        &["add", "../wt", "-b", "feat"],
+        &[("FAKE_NPM_RUN_LOCKED_ONCE", once.to_str().unwrap())],
+    );
+    r.assert_ok();
+    assert!(once.exists(), "{}", w.npm_log());
+    assert!(r.out().contains("rerun  app: postinstall"), "{}", r.all());
+    let app = w.base.join("wt/app");
+    let runs = w
+        .npm_log()
+        .lines()
+        .filter(|l| *l == format!("run postinstall {}", app.display()))
+        .count();
+    assert_eq!(runs, 2, "{}", w.npm_log());
+}
+
+/// A `post_add` hook that waits a little, then copies the pool's fill log
+/// to `$SNAP_DIR/<worktree name>`: what a refill wrote while `add` ran.
+const SNAPSHOT_FILL_LOG: &str = r#"
+[[post_add]]
+run = 'sleep 1; find "$FAST_WORKTREE_CACHE" -name fill.log -exec cat {} + > "$SNAP_DIR/$(basename "$FAST_WORKTREE_PATH")" 2>/dev/null; true'
+"#;
+
+#[test]
+fn the_refill_starts_when_the_add_is_done() {
+    let w = World::new();
+    let main = w.main();
+    w.commit(
+        &w.base.join("upstream"),
+        &[(".fast-worktree.toml", SNAPSHOT_FILL_LOG)],
+        "hooks",
+    );
+    w.git(&main, &["pull", "-q"]);
+    let snaps = w.base.join("snaps");
+    fs::create_dir_all(&snaps).unwrap();
+    let env = [("SNAP_DIR", snaps.to_str().unwrap())];
+    w.pool_size(1);
+    let fill_log = || fs::read_to_string(w.pool_dir().join("fill.log")).unwrap_or_default();
+
+    // No spare ready: the refill still starts, after the add.
+    let r = w.fw_with(&main, &["add", "../miss", "-b", "miss"], &env);
+    r.assert_ok();
+    assert!(r.out().contains("no spare ready"), "{}", r.out());
+    assert_eq!(fs::read_to_string(snaps.join("miss")).unwrap(), "");
+    wait_until("the refill", || {
+        fill_log().contains("fill  done: 1 of 1 ready")
+    });
+
+    // A spare taken.
+    let before = fill_log();
+    let r = w.fw_with(&main, &["add", "../hit", "-b", "hit"], &env);
+    r.assert_ok();
+    assert!(r.out().contains("worktree from the pool"), "{}", r.out());
+    assert_eq!(fs::read_to_string(snaps.join("hit")).unwrap(), before);
+    wait_until("the second refill", || {
+        fill_log().matches("fill  done: 1 of 1 ready").count() == 2
+    });
+}
+
+#[test]
+fn the_refill_waits_for_the_background_install_of_hook_create() {
+    let w = World::new();
+    w.pool_size(1);
+    let r = w.hook_create("bg", &[("FAKE_NPM_SLEEP", "2")]);
+    r.assert_ok();
+    assert!(r.err().contains("later"), "{}", r.err());
+    let path = PathBuf::from(last_line(&r.out()));
+    let marker = w.main().join(".git/worktrees/bg/fast-worktree-installing");
+    let fill_log = || fs::read_to_string(w.pool_dir().join("fill.log")).unwrap_or_default();
+    wait_until("the refill to wait", || {
+        fill_log().contains("waiting for the background install")
+    });
+    assert!(marker.exists());
+    assert!(!fill_log().contains("fill  started"), "{}", fill_log());
+    w.fw(&path, &["wait"]).assert_ok();
+    wait_until("the refill", || {
+        fill_log().contains("fill  done: 1 of 1 ready")
+    });
+}
+
+#[test]
+fn a_spare_is_made_without_the_repositorys_hooks_which_run_where_it_is_taken() {
+    let w = World::new();
+    let main = w.main();
+    // A hook with a side effect, such as reserving something for the
+    // worktree it runs in: here it records where it ran.
+    write_exe(
+        &w.base.join("githooks/post-checkout"),
+        "#!/bin/sh\n[ -z \"$CHECKOUT_LOG\" ] || pwd -P >> \"$CHECKOUT_LOG\"\n",
+    );
+    w.git(
+        &main,
+        &[
+            "config",
+            "core.hooksPath",
+            w.base.join("githooks").to_str().unwrap(),
+        ],
+    );
+    let log = w.base.join("checkout.log");
+    let env = [("CHECKOUT_LOG", log.to_str().unwrap())];
+    w.pool_size(1);
+    w.fw_with(&main, &["pool", "fill"], &env).assert_ok();
+    assert_eq!(fs::read_to_string(&log).unwrap_or_default(), "");
+    let _lock = hold_fill_lock(&w.pool_dir());
+    let r = w.fw_with(&main, &["add", "../wt", "-b", "feat"], &env);
+    r.assert_ok();
+    assert!(r.out().contains("worktree from the pool"), "{}", r.out());
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        format!("{}\n", w.base.join("wt").display())
+    );
+}
+
+/// Whether `git --version` output is at least `major.minor`.
+fn git_at_least(version: &str, major: u32, minor: u32) -> bool {
+    let mut nums = version
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or("")
+        .split('.')
+        .map(|n| n.parse::<u32>().unwrap_or(0));
+    let v = (nums.next().unwrap_or(0), nums.next().unwrap_or(0));
+    v >= (major, minor)
+}
+
+#[test]
+fn git_versions_compare() {
+    assert!(git_at_least("git version 2.56.0\n", 2, 48));
+    assert!(git_at_least("git version 2.48.1 (Apple Git-1)", 2, 48));
+    assert!(!git_at_least("git version 2.45.0", 2, 48));
+    assert!(!git_at_least("git version 2.39.5 (Apple Git-154)", 2, 48));
+}
+
+#[test]
+fn everything_works_with_relative_worktree_paths() {
+    let w = World::new();
+    let main = w.main();
+    let version = w.git(&main, &["--version"]);
+    if !git_at_least(&version, 2, 48) {
+        eprintln!(
+            "skipped: {} has no worktree.useRelativePaths",
+            version.trim()
+        );
+        return;
+    }
+    w.git(&main, &["config", "worktree.useRelativePaths", "true"]);
+    let relative = |wt: &Path| {
+        let dot = fs::read_to_string(wt.join(".git")).unwrap();
+        let gitdir = dot.trim().strip_prefix("gitdir: ").unwrap();
+        assert!(Path::new(gitdir).is_relative(), "{}: {dot}", wt.display());
+        let back = fs::read_to_string(wt.join(gitdir).join("gitdir")).unwrap();
+        assert!(
+            Path::new(back.trim()).is_relative(),
+            "{}: {back}",
+            wt.display()
+        );
+    };
+
+    w.fw(&main, &["add", "../plain", "-b", "plain"]).assert_ok();
+    let plain = w.base.join("plain");
+    relative(&plain);
+    w.fw(&main, &["remove", plain.to_str().unwrap()])
+        .assert_ok();
+    assert!(!plain.exists());
+
+    let r = w.hook_create("h", &[]);
+    r.assert_ok();
+    let h = PathBuf::from(last_line(&r.out()));
+    relative(&h);
+    w.fw(&h, &["wait"]).assert_ok();
+    w.hook_remove(&h).assert_ok();
+    assert!(!h.exists());
+
+    w.pool_size(2);
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    for s in w.spares() {
+        relative(&s);
+    }
+    let _lock = hold_fill_lock(&w.pool_dir());
+    let r = w.fw(&main, &["add", "../pooled", "-b", "pooled"]);
+    r.assert_ok();
+    assert!(r.out().contains("worktree from the pool"), "{}", r.out());
+    let pooled = w.base.join("pooled");
+    relative(&pooled);
+    status_is_clean(&w, &pooled);
+    w.fw(&main, &["remove", pooled.to_str().unwrap()])
+        .assert_ok();
+    let r = w.fw(&main, &["pool", "clear"]);
+    r.assert_ok();
+    assert!(r.out().contains("removed 1 spare(s)"), "{}", r.out());
+    let list = w.git(&main, &["worktree", "list", "--porcelain"]);
+    assert_eq!(list.matches("worktree ").count(), 1, "{list}");
+    assert_eq!(w.git(&main, &["worktree", "prune", "-n", "-v"]), "");
 }

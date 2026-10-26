@@ -8,7 +8,12 @@ pub mod npm;
 use crate::error::Result;
 use crate::git;
 use crate::hooks::SkipLifecycle;
+use std::fs;
+use std::io;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 /// What an install needs to know about its surroundings.
 pub struct Ctx {
@@ -107,17 +112,88 @@ pub trait Ecosystem: Sync {
     /// Run the project's own install steps again on dependencies that are
     /// already present, because the worktree moved (a spare from the pool:
     /// what those steps wrote by absolute path points into the pool) and
-    /// its tracked files may have changed. Returns notes to print. On
-    /// failure the dependencies are moved away, so the next `install`
-    /// installs them again.
+    /// its tracked files may have changed. `cache_repo` is the
+    /// repository's directory in the cache (for [`lifecycle_lock`]).
+    /// Returns notes to print. On failure the dependencies are moved away,
+    /// so the next `install` installs them again.
     fn rerun_own_scripts(
         &self,
         _root: &Path,
         _dir: &str,
         _rules: &[SkipLifecycle],
+        _cache_repo: &Path,
     ) -> std::result::Result<Vec<String>, String> {
         Ok(Vec::new())
     }
+}
+
+/// The lock file, in the repository's directory in the cache, that every
+/// run of a project's own lifecycle holds.
+pub const LIFECYCLE_LOCK: &str = "lifecycle.lock";
+
+/// An exclusive `flock` on `<cache_repo>/lifecycle.lock`, held while the
+/// value lives.
+pub struct LifecycleLock(#[allow(dead_code)] Option<fs::File>);
+
+/// Wait until no other run of a project's own lifecycle in this repository
+/// is going on (in another process, or for another project in this one),
+/// and hold the lock. Those scripts often write the repository's shared
+/// `.git/config` (`git config core.hooksPath ...`), which git lets only one
+/// writer hold at a time. A lock that cannot be taken (a file system
+/// without locks, say) is not waited for.
+pub fn lifecycle_lock(cache_repo: &Path) -> LifecycleLock {
+    let file = fs::create_dir_all(cache_repo).and_then(|()| {
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(cache_repo.join(LIFECYCLE_LOCK))
+    });
+    let Ok(f) = file else {
+        return LifecycleLock(None);
+    };
+    loop {
+        // SAFETY: a valid open descriptor; the lock goes when it is closed.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return LifecycleLock(Some(f));
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return LifecycleLock(None);
+        }
+    }
+}
+
+/// What git prints when another process holds a config file it is about
+/// to write.
+const CONFIG_LOCKED: &str = "could not lock config file";
+
+/// How many more times a run that found the git config locked is tried.
+pub const CONFIG_LOCK_RETRIES: u32 = 2;
+
+/// Run the command `make` builds, and again (after a short wait, at most
+/// [`CONFIG_LOCK_RETRIES`] more times) while it fails because git found a
+/// config file locked: something outside fast-worktree writing it at that
+/// moment.
+pub fn output_retrying_config_lock(
+    mut make: impl FnMut() -> Command,
+) -> io::Result<std::process::Output> {
+    let mut attempt = 0;
+    loop {
+        let out = make().output()?;
+        let locked = !out.status.success()
+            && (contains(&out.stderr, CONFIG_LOCKED) || contains(&out.stdout, CONFIG_LOCKED));
+        if !locked || attempt == CONFIG_LOCK_RETRIES {
+            return Ok(out);
+        }
+        attempt += 1;
+        std::thread::sleep(Duration::from_millis(300 * u64::from(attempt)));
+    }
+}
+
+fn contains(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle.as_bytes())
 }
 
 pub fn all() -> Vec<&'static dyn Ecosystem> {

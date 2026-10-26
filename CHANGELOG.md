@@ -46,9 +46,12 @@ change bumps the minor version).
   it, moves it into place with `git worktree move`, switches to the new
   branch, installs only the projects whose lockfile changed, runs the
   other projects' own install steps again where the worktree now is, and
-  starts `pool fill` in the background, in a session of its own. Without
-  a spare, or when the move fails, `add` creates the worktree as before
-  and counts a miss.
+  when it is done starts `pool fill` in the background, in a session of
+  its own (after a background install of `hook create`, when there is
+  one). Without a spare, or when the move fails, `add` creates the
+  worktree as before, counts a miss, and starts the refill the same way.
+  The repository's own git hooks do not run when a spare is made; they run
+  on the `git switch` in the worktree where it ends up.
 - `pool status`, `pool fill`, `pool refresh` and `pool clear`.
 - `hook create` and `hook remove` for Claude Code's `WorktreeCreate` and
   `WorktreeRemove` hooks, and `hook print-config` to print them for a
@@ -84,7 +87,15 @@ change bumps the minor version).
   fetch at most 60 seconds.
 - A spare from the pool keeps no `node_modules` with an absolute symlink,
   and after it is moved into place its npm projects' own install scripts
-  and its Flutter projects' `flutter pub get --offline` run again there.
+  run again there, and in the ignored files Flutter generates in its Dart
+  projects (`.dart_tool/`, `ios/Flutter/`, `*/flutter/ephemeral/`,
+  `macos/Flutter/ephemeral/`, `.flutter-plugins*`) the path where it was
+  made is replaced with the new one (text files only).
+- The projects' own lifecycle runs (`npm ci`, `npm install`, and the
+  scripts run again after a clone or a move) take a lock per repository,
+  `<cache>/<repo>/lifecycle.lock`, so that only one runs at a time, and
+  one that fails because git could not lock a config file is run again
+  (at most twice).
   `pool clear` and a spare that cannot be used remove only their own
   entries from git.
 - `wait [<path>]`: wait for the background install of `hook create`;

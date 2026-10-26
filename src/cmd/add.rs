@@ -2,10 +2,10 @@
 //! `.worktreeinclude` files, then `install`, in one command.
 
 use super::install;
-use crate::ecosystem::{Mode, Project};
+use crate::ecosystem::{self, dart, Mode, Project};
 use crate::error::Result;
 use crate::hooks::Config;
-use crate::{git, include, pending, pool, trash, util};
+use crate::{git, include, paths, pending, pool, trash, util};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -52,13 +52,21 @@ pub enum Branch {
 /// With `defer`, nothing that downloads or builds runs here: what a clone
 /// cannot provide is installed by a detached `install --changed`, which
 /// then runs the `post_add` hooks (see [`pending`]).
+///
+/// When the pool is on, a refill starts at the end, whether a spare was
+/// taken or not; it waits for the background install, if there is one.
 pub fn create(here: &Path, path: &Path, branch: &Branch, defer: bool) -> Result<bool> {
     let start = Instant::now();
     let main = install::main_checkout(here)?;
     // Relative to the current directory, also for the git commands the
     // pool runs in the main checkout.
     let path = &std::env::current_dir()?.join(path);
-    let spare = from_pool(&main, path, branch);
+    let pool_on = pool::size(&main).0 > 0;
+    let spare = if pool_on {
+        from_pool(&main, path, branch)
+    } else {
+        None
+    };
     if spare.is_none() {
         let p = path.to_string_lossy().into_owned();
         let mut args = vec!["worktree", "add", &p];
@@ -69,29 +77,39 @@ pub fn create(here: &Path, path: &Path, branch: &Branch, defer: bool) -> Result<
         // A post-checkout hook that calls `fast-worktree check
         // --post-checkout` would clone dependencies here before the full
         // install below; it is told to do nothing.
-        git::run_with_env(here, &args, &[("FAST_WORKTREE_SKIP", "1")])?;
+        if let Err(e) = git::run_with_env(here, &args, &[("FAST_WORKTREE_SKIP", "1")]) {
+            if pool_on {
+                pool::spawn_fill(&main, None);
+            }
+            return Err(e);
+        }
         println!("worktree added in {}", util::elapsed(start));
     } else {
         println!("worktree from the pool in {}", util::elapsed(start));
     }
     let root = path.canonicalize()?;
-    Ok(match prepare(&root, spare.as_deref(), defer) {
+    let ok = match prepare(&root, spare.as_ref(), defer) {
         Ok(ok) => ok,
         Err(e) => {
             eprintln!("fast-worktree: {e}");
             false
         }
-    })
+    };
+    if pool_on {
+        pool::spawn_fill(&main, Some(&root));
+    }
+    Ok(ok)
 }
 
-/// Take a spare for `path` when the pool is on, and start refilling it.
-/// Returns the commit the spare was made at, with the worktree now at
-/// `path` on `branch`; `None` when the worktree is still to be made.
-fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<String> {
-    let (size, _) = pool::size(main);
-    if size == 0 {
-        return None;
-    }
+/// A spare taken from the pool, now the worktree.
+struct Spare {
+    /// Where it was made (see [`pool::Taken::Spare`]).
+    made_at: Vec<PathBuf>,
+}
+
+/// Take a spare for `path`. Returns it, with the worktree now at `path` on
+/// `branch`; `None` when the worktree is still to be made.
+fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<Spare> {
     if path.symlink_metadata().is_ok() {
         println!(
             "note   pool: {} exists, so no spare is moved there",
@@ -99,10 +117,8 @@ fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<String> {
         );
         return None;
     }
-    let taken = pool::take(main, path);
-    pool::spawn_fill(main);
-    let commit = match taken {
-        pool::Taken::Spare { commit } => commit,
+    let made_at = match pool::take(main, path) {
+        pool::Taken::Spare { made_at } => made_at,
         pool::Taken::Empty => {
             pool::record_miss(main);
             println!("note   pool: no spare ready, creating the worktree");
@@ -126,7 +142,7 @@ fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<String> {
         .status()
         .is_ok_and(|s| s.success());
     if switched {
-        return Some(commit);
+        return Some(Spare { made_at });
     }
     // The worktree is gone again; `create` makes it the usual way.
     println!("note   pool: git switch failed in the spare, creating the worktree");
@@ -140,8 +156,11 @@ fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<String> {
 }
 
 /// Everything after the worktree exists. Returns whether it all succeeded.
-fn prepare(root: &Path, spare: Option<&str>, defer: bool) -> Result<bool> {
+fn prepare(root: &Path, spare: Option<&Spare>, defer: bool) -> Result<bool> {
     copy_included(root);
+    if let Some(s) = spare {
+        rewrite_moved(root, &s.made_at);
+    }
     let cfg = Config::load(root)?;
     let mode = match (spare.is_some(), defer) {
         (false, false) => Mode::Missing,
@@ -175,16 +194,41 @@ fn prepare(root: &Path, spare: Option<&str>, defer: bool) -> Result<bool> {
     Ok(done.ok && hooks_ok)
 }
 
+/// In the files Flutter generated in a spare's Dart projects, replace the
+/// path where the spare was made (`made_at`) with `root`.
+fn rewrite_moved(root: &Path, made_at: &[PathBuf]) {
+    let Ok(projects) = ecosystem::discover(root) else {
+        return;
+    };
+    for p in projects.iter().filter(|p| p.ecosystem.name() == "pub") {
+        let project = ecosystem::project_path(root, &p.dir);
+        let n = dart::rewrite_moved_paths(&project, made_at, root);
+        if n > 0 {
+            println!(
+                "paths  {}: {n} generated file(s) pointed to where the spare was made, rewritten",
+                p.dir
+            );
+        }
+    }
+}
+
 /// A spare's dependencies were installed where the pool made it, and
 /// whatever its projects' own install steps wrote by absolute path points
 /// there. Run those steps again for the projects among `kept`, here.
 /// Returns the projects where that failed.
 fn rerun_moved(root: &Path, kept: &[Project], cfg: &Config) -> Vec<Project> {
+    let cache_repo = match install::main_checkout(root) {
+        Ok(main) => paths::cache_root().join(paths::repo_key(&main)),
+        Err(e) => {
+            println!("note   {e}");
+            return kept.to_vec();
+        }
+    };
     let mut failed = Vec::new();
     for p in kept {
         match p
             .ecosystem
-            .rerun_own_scripts(root, &p.dir, &cfg.skip_lifecycle)
+            .rerun_own_scripts(root, &p.dir, &cfg.skip_lifecycle, &cache_repo)
         {
             Ok(notes) => {
                 for n in notes {
