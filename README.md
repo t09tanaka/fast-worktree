@@ -70,7 +70,7 @@ Or download a binary from the
 ## Usage
 
 ```sh
-fast-worktree add <path> -b <branch> [<start-point>]
+fast-worktree add <path> -b <branch> [--fetch-timeout <secs>] [<start-point>]
 ```
 
 Runs `git worktree add <path> -b <branch> <start-point>`, copies the files
@@ -79,9 +79,13 @@ the `post_add` hooks. With the [pool](#the-pool) on, a ready worktree is
 moved to `<path>` instead of `git worktree add`. Without `<start-point>`, the new branch starts from
 origin's default branch, freshly fetched: it is read from
 `refs/remotes/origin/HEAD` (set with `git remote set-head origin -a` when
-missing), never assumed to be `main`. `git worktree add` runs with
-`FAST_WORKTREE_SKIP=1`, so a [post-checkout hook](#post-checkout-hook) stays
-out of the way.
+missing), never assumed to be `main`. The fetch never waits for a
+prompt (as in [`hook create`](#claude-code-hooks)) and is stopped after
+`--fetch-timeout` seconds (default 30). When it fails or is stopped, the
+branch starts from origin's default branch as last fetched, with a note on
+stderr; only when there is no such ref does `add` fail. `git worktree add`
+runs with `FAST_WORKTREE_SKIP=1`, so a [post-checkout hook](#post-checkout-hook)
+stays out of the way.
 
 ```sh
 fast-worktree install [--root <dir>] [--changed] [<project-dir>...]
@@ -559,9 +563,9 @@ out; if the worktree exists, it is used as it is.
 - The fetch never waits for a password, a passphrase or a host key prompt:
   it runs with `GIT_TERMINAL_PROMPT=0` and `-o BatchMode=yes` added to the
   ssh command git would use (`GIT_SSH_COMMAND`, else `core.sshCommand`,
-  else `ssh`; one named by `GIT_SSH` alone is left as it is). So does the
-  fetch of `pool fill`. The background install runs in a session of its
-  own, without a terminal.
+  else `ssh`; one named by `GIT_SSH` alone is left as it is). So do the
+  fetches of `add` and `pool fill`. The background install runs in a
+  session of its own, without a terminal.
 - Claude Code waits for the hook's output to end. A `post_add` hook that
   runs while it waits (when nothing is left to the background) and leaves
   a process behind that still holds stderr, such as `some-server &`, can

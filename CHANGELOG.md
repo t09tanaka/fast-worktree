@@ -7,7 +7,11 @@ change bumps the minor version).
 
 ## [Unreleased]
 
-## [0.2.0]
+## [0.2.0] - 2026-10-27
+
+The first published release. It includes everything listed under
+[0.1.0](#010---2026-10-27), which was not published on its own; the
+changes and fixes below are relative to it.
 
 ### Added
 
@@ -83,8 +87,9 @@ change bumps the minor version).
   one with a submodule git directory that cannot go with it.
 - Fetches of `hook create` and `pool fill` never wait for a prompt:
   `GIT_TERMINAL_PROMPT=0`, and `-o BatchMode=yes` added to the user's
-  `GIT_SSH_COMMAND` or `core.sshCommand` (or `ssh`). `pool fill` gives its
-  fetch at most 60 seconds.
+  `GIT_SSH_COMMAND` or `core.sshCommand` (or `ssh`). `hook create` gives
+  its fetch at most 5 seconds and `pool fill` 60; after that, or when the
+  fetch fails, they go on from origin's default branch as last fetched.
 - A spare from the pool keeps no `node_modules` with an absolute symlink,
   and after it is moved into place its npm projects' own install scripts
   run again there, and in the ignored files Flutter generates in its Dart
@@ -110,6 +115,13 @@ change bumps the minor version).
 
 ### Changed
 
+- The fetch of `add` (without a start point) runs like those of `hook
+  create` and `pool fill`: it never waits for a prompt, and it is stopped
+  after `--fetch-timeout <secs>` (default 30). When it fails or is
+  stopped, the branch starts from origin's default branch as last fetched,
+  with a note on stderr; only when there is no such ref does `add` fail.
+  Before, a credential helper that waited without a terminal held `add` up
+  for good.
 - Cache entries are checked for absolute symlinks once, when stored, and
   marked with `<entry>.ok`; clones from the cache no longer walk the tree.
   An install result with an absolute symlink is not cached.
@@ -135,8 +147,12 @@ change bumps the minor version).
   worktrees and directories with their own `.git` are left out, and a
   matching directory with one inside (`.claude/` with
   `.claude/worktrees/<name>/`) is copied around it.
-- `check` exits 0 when its stdout is a closed pipe, instead of panicking
-  with exit code 101.
+- No command panics (exit code 101) any more when its stdout or stderr is
+  a pipe whose reader has gone, as in `fast-worktree pool status | head
+  -1`: what cannot be written is dropped and the command carries on.
+  `check` exits 0 then, as always.
+- `wait` no longer reports a background install that finished between
+  its look at the marker and its check of the process as interrupted.
 - `install --changed` installs again when a git dependency moved to
   another commit (the tree check now compares `resolved`).
 - `remove` finds the entry of a worktree whose `gitdir` file is relative
@@ -145,7 +161,10 @@ change bumps the minor version).
   `packages` to compare, is cached when npm recorded it in
   `node_modules/.package-lock.json`.
 
-## [0.1.0]
+## [0.1.0] - 2026-10-27
+
+Not published on its own: it is part of 0.2.0, the first published
+release.
 
 ### Added
 
