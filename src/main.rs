@@ -12,6 +12,7 @@ mod include;
 mod paths;
 mod pending;
 mod pool;
+mod submodules;
 mod trash;
 mod util;
 

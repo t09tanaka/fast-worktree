@@ -203,6 +203,56 @@ pub fn unmerged_into(dir: &Path, branch: &str) -> Option<String> {
     (status.code() == Some(1)).then_some(short)
 }
 
+/// The administrative directory of the worktree registered at `path`, for
+/// when `path` is gone or broken and [`admin_dir`] cannot ask git there:
+/// the one entry of `<common dir>/worktrees/*` whose `gitdir` file points
+/// at `path/.git` and that `git worktree list`, run in `dir` (any checkout
+/// of the repository), lists at `path`. `None` unless exactly one matches.
+pub fn find_admin(dir: &Path, path: &Path) -> Result<Option<PathBuf>> {
+    let common = output(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = PathBuf::from(common.trim_end_matches('\n'));
+    let listed = worktrees(dir)?;
+    let same = |a: &Path| comparable(a) == comparable(path);
+    if !listed.iter().any(|w| same(&w.path)) {
+        return Ok(None);
+    }
+    let mut found = Vec::new();
+    for e in fs::read_dir(common.join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let admin = e.path();
+        let Ok(text) = fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        let gitdir = admin.join(text.trim_end_matches('\n'));
+        if gitdir.file_name().is_some_and(|n| n == ".git") && gitdir.parent().is_some_and(same) {
+            found.push(admin);
+        }
+    }
+    Ok(match found.len() {
+        1 => found.pop(),
+        _ => None,
+    })
+}
+
+/// `path` with symlinks resolved as far as it exists: a path that is gone
+/// is its parent's real path plus its name (`/tmp` and `/private/tmp` are
+/// one place on macOS).
+fn comparable(path: &Path) -> PathBuf {
+    if let Ok(p) = path.canonicalize() {
+        return p;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => comparable(parent).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// Whether `git` in `dir` exits 0, with its output discarded.
 pub fn succeeds(dir: &Path, args: &[&str]) -> bool {
     command(dir)
@@ -226,17 +276,57 @@ pub fn branch_exists(dir: &Path, branch: &str) -> bool {
     )
 }
 
-/// `git fetch -q origin <branch>` that never waits for a password or a
-/// passphrase: without a terminal prompt, it fails instead. With `limit`,
-/// a fetch still running after that long is stopped and counts as failed.
+/// The ssh command for a fetch that must not wait for a password, a
+/// passphrase or a host key confirmation: the one git would use
+/// (`GIT_SSH_COMMAND`, else `core.sshCommand`, else `ssh`) with `-o
+/// BatchMode=yes` added. `None` when only `GIT_SSH` names the program: it
+/// takes no options, so it is left as it is.
+pub fn batch_ssh_command(
+    env_command: Option<&str>,
+    config_command: Option<&str>,
+    git_ssh: bool,
+) -> Option<String> {
+    fn nonempty(s: Option<&str>) -> Option<&str> {
+        s.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let base = match (nonempty(env_command), nonempty(config_command)) {
+        (Some(c), _) | (None, Some(c)) => c.to_string(),
+        (None, None) if git_ssh => return None,
+        (None, None) => "ssh".to_string(),
+    };
+    Some(format!("{base} -o BatchMode=yes"))
+}
+
+/// The environment for a fetch that never prompts: `GIT_TERMINAL_PROMPT=0`
+/// and [`batch_ssh_command`].
+fn batch_env(dir: &Path) -> Vec<(&'static str, String)> {
+    let var = |k: &str| std::env::var(k).ok();
+    let config = output(dir, &["config", "--get", "core.sshCommand"]).ok();
+    let mut env = vec![("GIT_TERMINAL_PROMPT", "0".to_string())];
+    if let Some(c) = batch_ssh_command(
+        var("GIT_SSH_COMMAND").as_deref(),
+        config.as_deref(),
+        var("GIT_SSH").is_some_and(|s| !s.is_empty()),
+    ) {
+        env.push(("GIT_SSH_COMMAND", c));
+    }
+    env
+}
+
+/// `git fetch -q origin <branch>` that never waits for a password, a
+/// passphrase or a host key confirmation ([`batch_env`]): it fails
+/// instead. With `limit`, a fetch still running after that long is stopped
+/// and counts as failed.
 pub fn fetch_quietly(dir: &Path, branch: &str, limit: Option<Duration>) -> Result<()> {
     let args = ["fetch", "-q", "origin", branch];
+    let env = batch_env(dir);
     let Some(limit) = limit else {
-        return output_with_env(dir, &args, &[("GIT_TERMINAL_PROMPT", "0")]).map(|_| ());
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        return output_with_env(dir, &args, &env).map(|_| ());
     };
     let mut child = command(dir)
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -288,6 +378,38 @@ pub fn origin_default_branch(dir: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetches_use_the_users_ssh_command_in_batch_mode() {
+        let b = |e, c, s| batch_ssh_command(e, c, s);
+        assert_eq!(
+            b(None, None, false).as_deref(),
+            Some("ssh -o BatchMode=yes")
+        );
+        assert_eq!(
+            b(None, Some("ssh -i k\n"), false).as_deref(),
+            Some("ssh -i k -o BatchMode=yes")
+        );
+        assert_eq!(
+            b(Some("ssh -p 2"), Some("ssh -i k"), true).as_deref(),
+            Some("ssh -p 2 -o BatchMode=yes"),
+            "the environment wins, as in git"
+        );
+        assert_eq!(
+            b(None, Some("ssh -i k"), true).as_deref(),
+            Some("ssh -i k -o BatchMode=yes"),
+            "core.sshCommand wins over GIT_SSH, as in git"
+        );
+        assert_eq!(b(Some(" "), None, true), None, "GIT_SSH takes no options");
+    }
+
+    #[test]
+    fn a_missing_path_compares_by_its_real_parent() {
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().canonicalize().unwrap();
+        assert_eq!(comparable(&t.path().join("gone/x")), real.join("gone/x"));
+        assert_eq!(comparable(t.path()), real);
+    }
 
     #[test]
     fn parses_worktree_porcelain() {

@@ -10,18 +10,25 @@
 //! (`<repo>/.git/worktrees/<name>/`), not in the worktree: a file there
 //! would show up in `git status` and make the worktree look changed. Finding
 //! that directory reads the worktree's `.git` file; no git process runs.
+//!
+//! The background process holds an exclusive `flock` on a lock file there
+//! while it runs, and leads a session and process group of its own, so that
+//! `hook remove` can tell that it is still running and stop it together
+//! with everything it started ([`stop`]).
 
 use crate::error::Result;
 use std::fs;
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MARKER: &str = "fast-worktree-installing";
 const LOG: &str = "fast-worktree-install.log";
 const RESULT: &str = "fast-worktree-install.result";
+const LOCK: &str = "fast-worktree-install.lock";
 /// A marker without a pid (the background process has not started yet) is
 /// taken for a running install for this long.
 const START_GRACE_SECS: u64 = 60;
@@ -120,8 +127,8 @@ pub fn spawn(root: &Path, dirs: &[String]) -> io::Result<()> {
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .process_group(0);
+        .stderr(log);
+    detach(&mut c);
     for v in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX"] {
         c.env_remove(v);
     }
@@ -134,10 +141,45 @@ pub fn spawn(root: &Path, dirs: &[String]) -> io::Result<()> {
     }
 }
 
-/// Run the background install: put this process in the marker, run `f`,
-/// record how it went and remove the marker. Returns `f`'s exit code.
+/// Start the child in a session of its own (`setsid`): it leads a new
+/// process group, so that a signal to the group reaches everything it
+/// starts, and it has no controlling terminal, so that nothing it runs
+/// stops on reading one (`SIGTTIN`) or waits at a prompt.
+pub fn detach(c: &mut Command) {
+    // SAFETY: setsid is async-signal-safe; nothing else runs between fork
+    // and exec.
+    unsafe {
+        c.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// An exclusive `flock` on `path`, without waiting. `None` when another
+/// process holds it (or it cannot be taken).
+fn try_flock(path: &Path) -> Option<fs::File> {
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .ok()?;
+    // SAFETY: a valid open descriptor; the lock goes when it is closed.
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    (rc == 0).then_some(f)
+}
+
+/// Run the background install: hold the lock, put this process in the
+/// marker, run `f`, record how it went and remove the marker. Returns `f`'s
+/// exit code.
 pub fn run_deferred(root: &Path, f: impl FnOnce() -> Result<i32>) -> i32 {
     let dir = git_dir(root);
+    // Taken before the pid goes into the marker: whoever finds a pid there
+    // also finds the lock held for as long as this process lives.
+    let _lock = dir.as_ref().and_then(|d| try_flock(&d.join(LOCK)));
     if let Some(d) = &dir {
         let _ = fs::write(
             d.join(MARKER),
@@ -156,6 +198,74 @@ pub fn run_deferred(root: &Path, f: impl FnOnce() -> Result<i32>) -> i32 {
         let _ = fs::remove_file(d.join(MARKER));
     }
     code
+}
+
+/// How long [`stop`] waits for a background install that was started but
+/// has not written its pid yet.
+const PID_WAIT: Duration = Duration::from_secs(5);
+
+/// Stop the background install of `root`, if one is running, together with
+/// everything it started: `SIGTERM` to its process group, then `SIGKILL`
+/// to what is left after `grace`. Returns, once the group is gone, whether
+/// one was running.
+pub fn stop(root: &Path, grace: Duration) -> bool {
+    let Some(dir) = git_dir(root) else {
+        return false;
+    };
+    let start = Instant::now();
+    let pid = loop {
+        let Ok(text) = fs::read_to_string(dir.join(MARKER)) else {
+            return false;
+        };
+        if let Some(pid) = marker_pid(&text) {
+            break pid;
+        }
+        if marker_state(&text, now_secs()) != State::Running || start.elapsed() > PID_WAIT {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // The pid is trusted only while the lock is held: the marker of an
+    // install that was killed may name a pid that is someone else's now.
+    if try_flock(&dir.join(LOCK)).is_some() {
+        return false;
+    }
+    signal_group(pid, libc::SIGTERM);
+    if !group_gone_within(pid, grace) {
+        signal_group(pid, libc::SIGKILL);
+        group_gone_within(pid, Duration::from_secs(2));
+    }
+    true
+}
+
+/// The pid in a marker, `<unix seconds> <pid>`.
+fn marker_pid(text: &str) -> Option<i32> {
+    text.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|p| *p > 1)
+}
+
+fn signal_group(pgid: i32, sig: i32) {
+    // SAFETY: sends a signal; no memory is involved.
+    unsafe {
+        libc::kill(-pgid, sig);
+    }
+}
+
+fn group_gone_within(pgid: i32, limit: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        // SAFETY: signal 0 only checks that the group has members.
+        let rc = unsafe { libc::kill(-pgid, 0) };
+        if rc != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        if start.elapsed() >= limit {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +297,43 @@ mod tests {
             State::Interrupted
         );
         assert_eq!(marker_state("", 0), State::Interrupted);
+    }
+
+    #[test]
+    fn a_detached_child_leads_its_own_session() {
+        let mut c = Command::new("sleep");
+        c.arg("5");
+        detach(&mut c);
+        let mut child = c.spawn().unwrap();
+        let pid = child.id() as i32;
+        // SAFETY: plain queries about processes.
+        let (theirs, ours) = unsafe { (libc::getsid(pid), libc::getsid(0)) };
+        let err = io::Error::last_os_error().raw_os_error();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_ne!(theirs, ours, "still in our session");
+        // Some systems do not tell the session of a process in another one
+        // (EPERM): that, too, says it is not ours.
+        assert!(theirs == pid || err == Some(libc::EPERM), "{theirs} {pid}");
+    }
+
+    #[test]
+    fn stop_trusts_a_pid_only_while_the_lock_is_held() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let dir = root.join(".git");
+        fs::create_dir(&dir).unwrap();
+        assert!(!stop(root, Duration::from_secs(1)), "no marker");
+        // A live process that is not ours, named by a stale marker.
+        let mut other = Command::new("sleep").arg("5").spawn().unwrap();
+        fs::write(dir.join(MARKER), format!("1 {}\n", other.id())).unwrap();
+        assert!(!stop(root, Duration::from_secs(1)));
+        assert!(other.try_wait().unwrap().is_none(), "left alone");
+        let _ = other.kill();
+        let _ = other.wait();
+        assert_eq!(marker_pid("1 42\n"), Some(42));
+        assert_eq!(marker_pid("1\n"), None);
+        assert_eq!(marker_pid("1 1\n"), None);
     }
 
     #[test]

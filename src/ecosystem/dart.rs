@@ -9,6 +9,11 @@
 //! `--offline` if that fails) when `flutter` is installed, else with `dart
 //! pub get`. With neither, the project is skipped with a note. Packages
 //! live in pub's own shared cache, so there is nothing to clone.
+//!
+//! `flutter pub get` also writes absolute paths of the project
+//! (`ios/Flutter/Generated.xcconfig`, `.flutter-plugins-dependencies`), so
+//! in a spare from the pool, moved to where it is used, a Flutter project
+//! runs `flutter pub get --offline` again.
 
 use super::{Ctx, Ecosystem, Mode, Report};
 use crate::paths::hex;
@@ -46,6 +51,41 @@ impl Ecosystem for Dart {
             &Tools::find(),
         )
     }
+
+    fn rerun_own_scripts(
+        &self,
+        root: &Path,
+        dir: &str,
+        _rules: &[crate::hooks::SkipLifecycle],
+    ) -> Result<Vec<String>, String> {
+        let project = super::project_path(root, dir);
+        let Some(flutter) = Tools::find().flutter else {
+            return Ok(Vec::new());
+        };
+        if !is_flutter(&project) || !project.join(PACKAGE_CONFIG).is_file() {
+            return Ok(Vec::new());
+        }
+        let start = Instant::now();
+        match pub_get(&flutter, &project, true) {
+            Ok(()) => Ok(vec![format!(
+                "rerun  {dir}: flutter pub get --offline ({})",
+                util::elapsed(start)
+            )]),
+            Err(log) => {
+                // Not current here: the next `install` gets it again.
+                let _ = fs::remove_file(project.join(PACKAGE_CONFIG));
+                Err(log)
+            }
+        }
+    }
+}
+
+/// Whether the project's `pubspec.yaml` depends on the Flutter SDK.
+fn is_flutter(project: &Path) -> bool {
+    fs::read_to_string(project.join("pubspec.yaml")).is_ok_and(|y| {
+        y.lines()
+            .any(|l| l.trim().trim_matches(['"', '\'']).replace(' ', "") == "sdk:flutter")
+    })
 }
 
 /// The SDK commands available, found once per install.
@@ -133,6 +173,21 @@ fn pub_get(tool: &Path, project: &Path, offline: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flutter_project_depends_on_the_sdk() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path();
+        assert!(!is_flutter(p));
+        fs::write(p.join("pubspec.yaml"), "name: x\n").unwrap();
+        assert!(!is_flutter(p));
+        fs::write(
+            p.join("pubspec.yaml"),
+            "name: x\ndependencies:\n  flutter:\n    sdk: flutter\n",
+        )
+        .unwrap();
+        assert!(is_flutter(p));
+    }
 
     #[test]
     fn no_sdk_is_a_note_not_a_failure() {

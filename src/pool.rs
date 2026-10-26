@@ -17,16 +17,22 @@
 //!
 //! The pool is off unless `[pool] size` is set, in the main checkout's
 //! `.fast-worktree.toml` or in the user's `config.toml`.
+//!
+//! A spare is made in the pool and used somewhere else, so whatever its
+//! install recorded by absolute path points into the pool. A `node_modules`
+//! with a symlink whose target is absolute is therefore not kept in a spare
+//! (the `add` that takes it installs that project again), and after the
+//! move the projects' own install steps run again where the worktree now is
+//! ([`crate::ecosystem::Ecosystem::rerun_own_scripts`]).
 
 use crate::cmd::install;
-use crate::ecosystem::Mode;
+use crate::ecosystem::{self, Mode};
 use crate::error::{bail, Error, Result};
 use crate::hooks::{self, Config};
-use crate::{cache, git, paths, trash, util};
+use crate::{cache, clone, git, paths, pending, trash, util};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +51,8 @@ const LOG_LIMIT: u64 = 1 << 20;
 /// Hidden entries left by a run that was killed are cleared by `pool
 /// clear` once they are this old.
 const LEFTOVER_SECS: u64 = 3_600;
+/// How long `pool fill` lets the fetch of the default branch take.
+const FETCH_LIMIT: Duration = Duration::from_secs(60);
 
 /// The pool directory of the repository whose main checkout is `main`.
 pub fn dir(main: &Path) -> PathBuf {
@@ -270,8 +278,8 @@ fn try_spawn_fill(main: &Path, pool: &Path) -> io::Result<()> {
         .current_dir(main)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .process_group(0);
+        .stderr(log);
+    pending::detach(&mut c);
     for v in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX"] {
         c.env_remove(v);
     }
@@ -317,7 +325,7 @@ fn stamp() -> String {
 /// fetch is reported and the ref as last fetched is used.
 fn fetched_base(main: &Path) -> Result<String> {
     let base = git::origin_default_branch(main)?;
-    if let Err(e) = git::fetch_quietly(main, &base, None) {
+    if let Err(e) = git::fetch_quietly(main, &base, Some(FETCH_LIMIT)) {
         println!("note   pool: fetch failed, using origin/{base} as last fetched: {e}");
     }
     Ok(format!("origin/{base}"))
@@ -379,6 +387,7 @@ fn make_spare(main: &Path, pool: &Path, base: &str) -> Result<()> {
             _ => bail!("installing into a new spare failed"),
         }
     }
+    drop_absolute_symlinks(&building);
     git::output(main, &["worktree", "lock", "--reason", LOCK_REASON, &b])?;
     let ready = pool.join(&id);
     fs::rename(&building, &ready)?;
@@ -393,15 +402,40 @@ fn make_spare(main: &Path, pool: &Path, base: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove a spare (or what is left of one) and unregister it.
+/// Move away the `node_modules` of the spare at `root` that have a symlink
+/// with an absolute target: it points into the pool, where the spare will
+/// not be. The `add` that takes the spare installs those projects again.
+fn drop_absolute_symlinks(root: &Path) {
+    for p in ecosystem::discover(root).unwrap_or_default() {
+        let nm = ecosystem::project_path(root, &p.dir).join("node_modules");
+        if nm.is_dir() && clone::has_absolute_symlink(&nm) {
+            let _ = trash::trash(&nm);
+            println!(
+                "{} note  {}: absolute symlink in node_modules, not kept in the spare",
+                stamp(),
+                p.dir
+            );
+        }
+    }
+}
+
+/// Remove a spare (or what is left of one) and unregister it, and only it.
 fn discard(main: &Path, path: &Path) {
-    let p = path.to_string_lossy();
     // It may have been renamed since git last saw it: tell git, so that
-    // the unlock finds it and the prune can drop it.
-    let _ = git::output(main, &["worktree", "repair", &p]);
-    let _ = git::output(main, &["worktree", "unlock", &p]);
-    let _ = trash::trash(path);
-    let _ = git::output(main, &["worktree", "prune"]);
+    // its entry can be found from where it is now.
+    let _ = git::output(main, &["worktree", "repair", &path.to_string_lossy()]);
+    let admin = git::admin_dir(path)
+        .ok()
+        .or_else(|| git::find_admin(main, path).ok().flatten());
+    if trash::trash(path).is_err() {
+        return;
+    }
+    match admin.map(|a| git::unregister(&a)) {
+        Some(Ok(())) => {}
+        Some(Err(e)) => println!("note   pool: {e}"),
+        // A spare whose `git worktree add` never finished has no entry.
+        None => {}
+    }
 }
 
 /// Claim a spare and discard it. False when another process took it first.
@@ -540,7 +574,6 @@ pub fn clear() -> Result<i32> {
             }
         }
     }
-    let _ = git::output(&main, &["worktree", "prune"]);
     println!("removed {n} spare(s) (deleting in background)");
     if matches!(try_lock(&pool), Ok(None)) {
         println!("note   a fill is running and may add spares again");

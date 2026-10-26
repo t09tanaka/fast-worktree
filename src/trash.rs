@@ -91,9 +91,11 @@ fn move_away(path: &Path, name: &str) -> io::Result<PathBuf> {
 }
 
 /// Rename `path` to a hidden sibling, and leave a note in the trash
-/// directory `dir` saying where it went, so that [`sweep`] finds it if its
-/// deleter is interrupted. (Without a trash directory there is nowhere to
-/// leave the note; the deleter is still started.)
+/// directory `dir` saying where it went, so that [`sweep`] finds it once
+/// its name says it is stale: when its deleter was interrupted, or, for
+/// [`keep`], when its time is up. (Without a trash directory there is
+/// nowhere to leave the note.) Whether a deleter starts at once is up to
+/// the caller: [`trash`] starts one, [`keep`] does not.
 fn beside(path: &Path, name: &str, dir: &Path) -> io::Result<PathBuf> {
     let parent = path.parent().unwrap_or(Path::new("."));
     let d = parent.join(format!("{BESIDE_PREFIX}{name}"));

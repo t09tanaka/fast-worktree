@@ -2,7 +2,7 @@
 //! `.worktreeinclude` files, then `install`, in one command.
 
 use super::install;
-use crate::ecosystem::{self, Mode, Project};
+use crate::ecosystem::{Mode, Project};
 use crate::error::Result;
 use crate::hooks::Config;
 use crate::{git, include, pending, pool, trash, util};
@@ -130,8 +130,12 @@ fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<String> {
     }
     // The worktree is gone again; `create` makes it the usual way.
     println!("note   pool: git switch failed in the spare, creating the worktree");
-    let _ = trash::trash(path);
-    let _ = git::output(main, &["worktree", "prune"]);
+    let admin = git::admin_dir(path);
+    if trash::trash(path).is_ok() {
+        if let Err(e) = admin.and_then(|a| git::unregister(&a)) {
+            println!("note   pool: {e}");
+        }
+    }
     None
 }
 
@@ -146,8 +150,8 @@ fn prepare(root: &Path, spare: Option<&str>, defer: bool) -> Result<bool> {
         (true, true) => Mode::ChangedCloneOnly,
     };
     let mut done = install::install_deps(root, &[], &cfg, mode)?;
-    if let Some(commit) = spare {
-        let failed = rerun_changed(root, commit, &done.kept, &cfg);
+    if spare.is_some() {
+        let failed = rerun_moved(root, &done.kept, &cfg);
         done.ok &= failed.is_empty();
         if defer {
             done.missing.extend(failed);
@@ -171,29 +175,13 @@ fn prepare(root: &Path, spare: Option<&str>, defer: bool) -> Result<bool> {
     Ok(done.ok && hooks_ok)
 }
 
-/// A spare's dependencies were installed at `commit`. Run the own install
-/// scripts again for the projects among `kept` whose tracked files changed
-/// since. Returns the projects where that failed.
-fn rerun_changed(root: &Path, commit: &str, kept: &[Project], cfg: &Config) -> Vec<Project> {
-    let changed = match git::output(root, &["diff", "--name-only", "-z", commit, "HEAD"]) {
-        Ok(s) => s,
-        Err(e) => {
-            println!("note   pool: cannot list the files changed since the spare: {e}");
-            return Vec::new();
-        }
-    };
-    let files: Vec<&str> = changed.split('\0').filter(|f| !f.is_empty()).collect();
-    // A file belongs to the deepest project of all, kept or not.
-    let all = ecosystem::discover(root).unwrap_or_default();
-    let dirs: Vec<&str> = all.iter().map(|p| p.dir.as_str()).collect();
+/// A spare's dependencies were installed where the pool made it, and
+/// whatever its projects' own install steps wrote by absolute path points
+/// there. Run those steps again for the projects among `kept`, here.
+/// Returns the projects where that failed.
+fn rerun_moved(root: &Path, kept: &[Project], cfg: &Config) -> Vec<Project> {
     let mut failed = Vec::new();
     for p in kept {
-        if !files
-            .iter()
-            .any(|f| owner(f, &dirs) == Some(p.dir.as_str()))
-        {
-            continue;
-        }
         match p
             .ecosystem
             .rerun_own_scripts(root, &p.dir, &cfg.skip_lifecycle)
@@ -210,15 +198,6 @@ fn rerun_changed(root: &Path, commit: &str, kept: &[Project], cfg: &Config) -> V
         }
     }
     failed
-}
-
-/// The project directory among `dirs` that `file` belongs to: the deepest
-/// one containing it, `.` for the rest.
-fn owner<'a>(file: &str, dirs: &[&'a str]) -> Option<&'a str> {
-    dirs.iter()
-        .copied()
-        .filter(|d| *d == "." || file.starts_with(&format!("{d}/")))
-        .max_by_key(|d| if *d == "." { 0 } else { d.len() + 1 })
 }
 
 /// Copy what the main checkout's `.worktreeinclude` selects. A failure is
@@ -241,21 +220,5 @@ fn copy_included(root: &Path) {
             }
         }
         Err(e) => println!("note   {e}"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_file_belongs_to_the_deepest_project() {
-        let dirs = [".", "web", "web/admin", "api"];
-        assert_eq!(owner("web/a.js", &dirs), Some("web"));
-        assert_eq!(owner("web/admin/x", &dirs), Some("web/admin"));
-        assert_eq!(owner("webby/x", &dirs), Some("."));
-        assert_eq!(owner("README.md", &dirs), Some("."));
-        assert_eq!(owner("README.md", &["api"]), None);
-        assert_eq!(owner("api/x", &["api"]), Some("api"));
     }
 }

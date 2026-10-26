@@ -100,10 +100,7 @@ impl Ecosystem for Npm {
         match run_own_lifecycle(&project, dir, rules) {
             Ok((mut notes, ran)) => {
                 if !ran.is_empty() {
-                    notes.push(format!(
-                        "rerun  {dir}: {} (its files changed)",
-                        ran.join(", ")
-                    ));
+                    notes.push(format!("rerun  {dir}: {}", ran.join(", ")));
                 }
                 Ok(notes)
             }

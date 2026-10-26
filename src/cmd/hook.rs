@@ -11,14 +11,20 @@
 //!
 //! `hook remove` reads `{"worktree_path": ...}` and always deletes the
 //! directory when it is a linked worktree of the repository: Claude Code
-//! asked the user first, or was told to discard the changes. A worktree with
-//! changes is kept in the trash for a day, and the branch `worktree-<name>`
-//! is deleted only when its commit is on another ref.
+//! asked the user first, or was told to discard the changes. It refuses,
+//! before anything changes, a worktree the user locked, one that cannot be
+//! moved, and one whose submodule git directories cannot go with it. A
+//! background install still running in it is stopped first. A worktree
+//! with changes, with submodules or with another worktree inside is kept in
+//! the trash for a day; a `HEAD` that would be lost is kept in
+//! `refs/fast-worktree/kept/`. Only its own entry is removed from git. The
+//! branch `worktree-<name>` is deleted only when its commit is on another
+//! ref.
 
-use super::{add, install};
+use super::{add, install, remove};
 use crate::error::{bail, Error, Result};
 use crate::hooks::{self, Config, Stage};
-use crate::{git, pending, pool, trash, util};
+use crate::{git, pending, pool, submodules, trash, util};
 use serde_json::Value;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -204,9 +210,11 @@ fn remove_worktree() -> Result<()> {
     let given = PathBuf::from(given);
     if given.symlink_metadata().is_err() {
         eprintln!("fast-worktree: {} is already gone", given.display());
-        if let Some(cwd) = field(&input, "cwd") {
-            let _ = git::output(Path::new(cwd), &["worktree", "prune"]);
-        }
+        let dir = match field(&input, "cwd") {
+            Some(c) => PathBuf::from(c),
+            None => std::env::current_dir()?,
+        };
+        forget(&dir, &given);
         return Ok(());
     }
     let path = given
@@ -232,10 +240,8 @@ fn remove_worktree() -> Result<()> {
     if path == main {
         bail!("{}: refusing to remove the main checkout", path.display());
     }
-    let Some(me) = worktrees
-        .iter()
-        .find(|w| w.path.canonicalize().is_ok_and(|p| p == path))
-    else {
+    let real = |w: &git::Worktree| w.path.canonicalize().unwrap_or_else(|_| w.path.clone());
+    let Some(me) = worktrees.iter().find(|w| real(w) == path) else {
         bail!(
             "{}: not a registered worktree; not removing it",
             path.display()
@@ -247,10 +253,49 @@ fn remove_worktree() -> Result<()> {
             path.display()
         );
     }
+
+    // Everything that can refuse comes before anything that changes a
+    // thing, the pre_remove hooks included. The entry is taken while the
+    // worktree is in place: after the move git can no longer tell which
+    // one it was.
+    let admin = git::admin_dir(&path)?;
+    if let Ok(reason) = std::fs::read_to_string(admin.join("locked")) {
+        let reason = reason.trim();
+        if reason != pool::LOCK_REASON {
+            let why = if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" ({reason})")
+            };
+            bail!(
+                "{} is locked{why}; nothing was removed. `git worktree unlock` it first",
+                path.display()
+            );
+        }
+    }
+    if let Err(why) = trash::can_move(&path) {
+        bail!(
+            "cannot move {} away: {why}; nothing was removed",
+            path.display()
+        );
+    }
+    let subs =
+        submodules::plan(&path, &admin).map_err(|e| Error(format!("{e}; nothing was removed")))?;
+    let inner: Vec<PathBuf> = worktrees
+        .iter()
+        .map(real)
+        .filter(|p| p != &path && p.starts_with(&path))
+        .collect();
+
+    // A background install still writing into it would bring it back.
+    if pending::stop(&path, STOP_GRACE) {
+        eprintln!("fast-worktree: stopped the background install");
+    }
     let head = git::output(&path, &["rev-parse", "HEAD"])
         .map(|s| s.trim().to_string())
         .ok();
-    let dirty = git::output(&path, &["status", "--porcelain"]).map_or(true, |s| !s.is_empty());
+    let dirty = remove::is_dirty(&git::output(&path, &remove::STATUS_ARGS));
+    let keep = dirty || !subs.is_empty() || !inner.is_empty();
 
     let cfg = Config::load(&path).unwrap_or_else(|e| {
         eprintln!("fast-worktree: {e}");
@@ -263,58 +308,182 @@ fn remove_worktree() -> Result<()> {
     if std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
         std::env::set_current_dir(&main)?;
     }
-    if me.locked {
-        let _ = git::output(&main, &["worktree", "unlock", &path.to_string_lossy()]);
-    }
-    trash::sweep();
-    let dest = if dirty {
-        trash::keep(&path, KEEP_SECS)?
-    } else {
-        trash::trash(&path)?
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // A commit only HEAD knows of would go with the entry (and to gc).
+    let detached_alone =
+        me.branch.is_none() && head.as_deref().is_some_and(|h| !on_any_ref(&main, h));
+    let kept_ref = match &head {
+        Some(h) if keep || detached_alone => keep_head(&main, &name, h),
+        _ => None,
     };
-    git::output(&main, &["worktree", "prune"])?;
+    submodules::embed(&subs).map_err(|e| {
+        Error(format!(
+            "{e}; the worktree is still there and still registered"
+        ))
+    })?;
+    trash::sweep();
+    let moved = if keep {
+        trash::keep(&path, KEEP_SECS)
+    } else {
+        trash::trash(&path)
+    };
+    let dest = moved.map_err(|e| {
+        Error(format!(
+            "the pre_remove hooks ran, but {} could not be moved away ({e}): \
+             the worktree is still there and still registered",
+            path.display()
+        ))
+    })?;
+    // Its lock, if the pool left one, goes with the entry.
+    let unregistered = git::unregister(&admin);
     eprintln!(
         "removed {} (moved to {})",
         util::tilde(&path),
         util::tilde(&dest)
     );
+    if let Err(e) = unregistered {
+        eprintln!("fast-worktree: git still lists it ({e})");
+    }
+    for i in &inner {
+        let now = dest.join(i.strip_prefix(&path).unwrap_or(i));
+        let _ = git::output(&main, &["worktree", "repair", &now.to_string_lossy()]);
+        eprintln!(
+            "fast-worktree: the worktree {} was inside it; it is in {} now, \
+             deleted with it after 24 hours unless moved: git worktree move {} <new path>",
+            util::tilde(i),
+            util::tilde(&now),
+            sh_path(&now)
+        );
+    }
 
-    let own = path
-        .file_name()
-        .map(|n| format!("worktree-{}", n.to_string_lossy()));
-    let kept_branch = match &own {
-        Some(b) if git::branch_exists(&main, b) => settle_branch(&main, b),
-        _ => None,
+    let own = format!("worktree-{name}");
+    let kept_branch = if git::branch_exists(&main, &own) {
+        settle_branch(&main, &own)
+    } else {
+        None
     };
-    if dirty {
+    if keep {
         let from = kept_branch
             .clone()
             .or_else(|| me.branch.clone().filter(|b| git::branch_exists(&main, b)))
+            .or(kept_ref.clone())
             .or(head.clone())
             .unwrap_or_else(|| "HEAD".into());
+        let why = if dirty {
+            "it had uncommitted changes"
+        } else if !subs.is_empty() {
+            "it has submodules"
+        } else {
+            "another worktree was inside it"
+        };
         eprintln!(
-            "fast-worktree: it had uncommitted changes; they are kept in {} for at least 24 hours",
+            "fast-worktree: {why}; it is kept in {} for at least 24 hours",
             util::tilde(&dest)
         );
-        eprintln!(
-            "to restore them: git -C {} worktree add {} {} && rsync -a --exclude=.git {}/ {}/",
-            sh_path(&main),
-            sh_path(&path),
-            sh(&from),
-            sh_path(&dest),
-            sh_path(&path)
-        );
-    } else if let Some(h) = &head {
-        if me.branch.is_none() && !on_any_ref(&main, h) {
+        if !subs.is_empty() {
             eprintln!(
-                "fast-worktree: its detached HEAD {h} is on no branch; `git branch <name> {h}` keeps it"
+                "fast-worktree: its submodules keep their git directories inside them \
+                 (`git submodule absorbgitdirs` moves them back after a restore)"
             );
         }
+        eprintln!(
+            "to restore them: {}",
+            restore_command(&main, &path, &from, &dest)
+        );
     }
-    if let Some(b) = me.branch.as_ref().filter(|b| Some(*b) != own.as_ref()) {
+    if let (Some(r), Some(h)) = (&kept_ref, &head) {
+        eprintln!(
+            "fast-worktree: its HEAD {} is kept as {r} (`git update-ref -d {r}` drops it)",
+            &h[..h.len().min(12)]
+        );
+    }
+    if let Some(b) = me.branch.as_ref().filter(|b| **b != own) {
         eprintln!("fast-worktree: kept branch {b} (not created by `hook create`)");
     }
     Ok(())
+}
+
+/// How long `hook remove` gives a background install to stop.
+const STOP_GRACE: Duration = Duration::from_secs(3);
+
+/// The registration of a worktree whose directory is already gone: drop
+/// that entry, and only that one, when it can be told apart.
+fn forget(dir: &Path, path: &Path) {
+    match git::find_admin(dir, path) {
+        Ok(Some(admin)) if admin.join("locked").exists() => {
+            eprintln!("fast-worktree: its entry is locked; left registered");
+        }
+        Ok(Some(admin)) => match git::unregister(&admin) {
+            Ok(()) => eprintln!("fast-worktree: unregistered it"),
+            Err(e) => eprintln!("fast-worktree: {e}"),
+        },
+        Ok(None) => eprintln!(
+            "fast-worktree: git lists no single worktree at {}; nothing unregistered",
+            path.display()
+        ),
+        Err(e) => eprintln!("fast-worktree: {e}; nothing unregistered"),
+    }
+}
+
+/// Keep `head` in `refs/fast-worktree/kept/<name>-<UTC date and time>`, so
+/// that neither gc nor the removal of the entry loses it. Returns the ref.
+fn keep_head(main: &Path, name: &str, head: &str) -> Option<String> {
+    let base = format!("{KEPT_REFS}{name}-{}", compact_now());
+    let base = if git::succeeds(main, &["check-ref-format", &base]) {
+        base
+    } else {
+        format!("{KEPT_REFS}worktree-{}", compact_now())
+    };
+    for n in 1..10 {
+        let r = if n == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{n}")
+        };
+        // The empty old value: only when the ref does not exist yet.
+        if git::succeeds(main, &["update-ref", &r, head, ""]) {
+            return Some(r);
+        }
+    }
+    eprintln!("fast-worktree: could not keep HEAD {head} in a ref");
+    None
+}
+
+const KEPT_REFS: &str = "refs/fast-worktree/kept/";
+
+/// `YYYYMMDD-HHMMSS` (UTC), for a ref name.
+fn compact_now() -> String {
+    let now = std::time::SystemTime::now();
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        % 86_400;
+    format!(
+        "{}-{:02}{:02}{:02}",
+        crate::cache::date(now).replace('-', ""),
+        secs / 3_600,
+        secs % 3_600 / 60,
+        secs % 60
+    )
+}
+
+/// The command that puts a kept worktree back: a worktree at `path` on
+/// `from` again, then the kept files over it. Only the top `.git` (the
+/// file pointing at the old entry) is left out: a submodule's `.git` is its
+/// git directory.
+fn restore_command(main: &Path, path: &Path, from: &str, kept: &Path) -> String {
+    format!(
+        "git -C {} worktree add {} {} && rsync -a --exclude=/.git {}/ {}/",
+        sh_path(main),
+        sh_path(path),
+        sh(from),
+        sh_path(kept),
+        sh_path(path)
+    )
 }
 
 /// Delete `branch` when its commit is on its upstream, a remote branch or
@@ -511,6 +680,33 @@ mod tests {
             sh_path(Path::new("/nonexistent-root/x")),
             "/nonexistent-root/x"
         );
+    }
+
+    #[test]
+    fn the_restore_command_leaves_out_only_the_top_git_file() {
+        let c = restore_command(
+            Path::new("/nonexistent-root/repo"),
+            Path::new("/nonexistent-root/repo/.claude/worktrees/a b"),
+            "refs/fast-worktree/kept/a-20261026-120000",
+            Path::new("/nonexistent-root/trash/keep-1-a"),
+        );
+        assert_eq!(
+            c,
+            "git -C /nonexistent-root/repo worktree add '/nonexistent-root/repo/.claude/worktrees/a b' \
+             refs/fast-worktree/kept/a-20261026-120000 && rsync -a --exclude=/.git \
+             /nonexistent-root/trash/keep-1-a/ '/nonexistent-root/repo/.claude/worktrees/a b'/"
+        );
+    }
+
+    #[test]
+    fn kept_refs_are_named_after_the_time() {
+        let t = compact_now();
+        assert_eq!(t.len(), "20261026-120000".len(), "{t}");
+        assert!(t.chars().enumerate().all(|(i, c)| if i == 8 {
+            c == '-'
+        } else {
+            c.is_ascii_digit()
+        }));
     }
 
     #[test]

@@ -104,11 +104,12 @@ pub trait Ecosystem: Sync {
     /// print, or on failure the log to show.
     fn install(&self, ctx: &Ctx, dir: &str, mode: Mode) -> std::result::Result<Report, String>;
 
-    /// Run the project's own install scripts again on dependencies that are
-    /// already present, because its tracked files changed (a spare from the
-    /// pool switched to another commit). Returns notes to print. On failure
-    /// the dependencies are moved away, so the next `install` installs
-    /// them again.
+    /// Run the project's own install steps again on dependencies that are
+    /// already present, because the worktree moved (a spare from the pool:
+    /// what those steps wrote by absolute path points into the pool) and
+    /// its tracked files may have changed. Returns notes to print. On
+    /// failure the dependencies are moved away, so the next `install`
+    /// installs them again.
     fn rerun_own_scripts(
         &self,
         _root: &Path,

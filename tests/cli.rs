@@ -14,10 +14,13 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 const FAKE_NPM: &str = r#"#!/bin/sh
-echo "$1 $2 $(pwd -P)" >> "$FAKE_NPM_LOG"
+P=$(pwd -P)
+echo "$1 $2 $P" >> "$FAKE_NPM_LOG"
 case "$1" in
   ci)
     if [ -n "$FAKE_NPM_SLEEP" ]; then sleep "$FAKE_NPM_SLEEP"; fi
+    # Like npm, which resolves its prefix once: write by absolute path.
+    if [ -n "$FAKE_NPM_ABS_WRITE" ]; then mkdir -p "$P/node_modules/late"; fi
     if [ -n "$FAKE_NPM_FAIL" ]; then echo "npm ERR! simulated failure" >&2; exit 1; fi
     # An install that exits 0 but leaves no record of the tree.
     if [ -n "$FAKE_NPM_PARTIAL" ]; then mkdir -p node_modules/dep; echo dep > node_modules/dep/index.js; exit 0; fi
@@ -2167,5 +2170,576 @@ fn wait_and_print_config() {
     assert_eq!(
         v["hooks"]["WorktreeRemove"][0]["hooks"][0]["command"],
         "fast-worktree hook remove"
+    );
+}
+
+// ---- v0.2: hook remove and the pool, after review ----
+
+impl World {
+    /// The `keep-` entries of the trash.
+    fn kept(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = fs::read_dir(self.cache.join("trash"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("keep-"))
+            .map(|e| e.path())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A worktree made by `hook create`, with its background install done.
+    fn hook_worktree(&self, name: &str) -> PathBuf {
+        let r = self.hook_create(name, &[]);
+        r.assert_ok();
+        let path = PathBuf::from(last_line(&r.out()));
+        self.fw(&path, &["wait"]).assert_ok();
+        path
+    }
+
+    /// `ext`, a worktree on a volume that is not mounted right now: `git
+    /// worktree prune` would drop it. Returns its path.
+    fn unmounted_worktree(&self) -> PathBuf {
+        fs::create_dir_all(self.base.join("vol")).unwrap();
+        let ext = with_worktree(self, "../vol/ext");
+        fs::rename(self.base.join("vol"), self.base.join("vol-unmounted")).unwrap();
+        assert!(
+            registered(self).contains("prunable"),
+            "{}",
+            registered(self)
+        );
+        ext
+    }
+
+    /// Run a command line the way a user would paste it.
+    fn sh(&self, line: &str) {
+        let mut c = Command::new("sh");
+        self.env(&mut c);
+        let out = c
+            .args(["-c", line])
+            .current_dir(&self.base)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{line}\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[track_caller]
+fn still_registered(w: &World, ext: &Path) {
+    let list = registered(w);
+    assert!(
+        list.contains(&format!("worktree {}\n", ext.display())),
+        "{list}"
+    );
+}
+
+/// What follows `prefix` on the line of `s` that starts with it.
+#[track_caller]
+fn after<'a>(s: &'a str, prefix: &str) -> &'a str {
+    s.lines()
+        .find_map(|l| l.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("no line starting with {prefix:?} in:\n{s}"))
+}
+
+/// The `refs/fast-worktree/kept/...` named in `s`.
+#[track_caller]
+fn kept_ref(s: &str) -> String {
+    let i = s
+        .find("refs/fast-worktree/kept/")
+        .unwrap_or_else(|| panic!("no kept ref in:\n{s}"));
+    s[i..]
+        .split(|c: char| c.is_whitespace() || "`),;".contains(c))
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+fn have_rsync() -> bool {
+    Command::new("rsync")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+#[test]
+fn hook_remove_keeps_untracked_files_whatever_the_status_config_says() {
+    let w = World::new();
+    let wt = w.hook_worktree("hidden");
+    w.git(&wt, &["config", "status.showUntrackedFiles", "no"]);
+    fs::write(wt.join("notes.txt"), "wip\n").unwrap();
+    assert_eq!(w.git(&wt, &["status", "--porcelain"]), "");
+    let r = w.hook_remove(&wt);
+    r.assert_ok();
+    assert!(!wt.exists());
+    assert!(r.err().contains("for at least 24 hours"), "{}", r.err());
+    let kept = w.kept();
+    assert_eq!(kept.len(), 1, "{}", r.err());
+    assert_eq!(
+        fs::read_to_string(kept[0].join("notes.txt")).unwrap(),
+        "wip\n"
+    );
+}
+
+#[test]
+fn hook_remove_keeps_a_detached_head_in_a_ref() {
+    let w = World::new();
+    let main = w.main();
+    // Clean, detached, with a commit on no branch.
+    let det = w.hook_worktree("det");
+    w.git(&det, &["checkout", "-q", "--detach"]);
+    w.commit(&det, &[("lonely.txt", "x")], "lonely");
+    let sha = w.git(&det, &["rev-parse", "HEAD"]).trim().to_string();
+    let r = w.hook_remove(&det);
+    r.assert_ok();
+    assert!(!det.exists());
+    let name = kept_ref(&r.err());
+    assert!(
+        name.starts_with("refs/fast-worktree/kept/det-"),
+        "{}",
+        r.err()
+    );
+    assert_eq!(w.git(&main, &["rev-parse", &name]).trim(), sha);
+
+    // Dirty and detached: kept, and the restore command uses the ref.
+    let det2 = w.hook_worktree("det2");
+    w.git(&det2, &["checkout", "-q", "--detach"]);
+    w.commit(&det2, &[("lonely2.txt", "y")], "lonely2");
+    let sha2 = w.git(&det2, &["rev-parse", "HEAD"]).trim().to_string();
+    fs::write(det2.join("notes.txt"), "wip\n").unwrap();
+    let r = w.hook_remove(&det2);
+    r.assert_ok();
+    let restore = after(&r.err(), "to restore them: ").to_string();
+    let name2 = kept_ref(&restore);
+    assert!(
+        name2.starts_with("refs/fast-worktree/kept/det2-"),
+        "{restore}"
+    );
+    assert_eq!(w.git(&main, &["rev-parse", &name2]).trim(), sha2);
+
+    // Nothing else holds those commits: gc keeps them for the refs.
+    w.git(&main, &["reflog", "expire", "--expire=now", "--all"]);
+    w.git(&main, &["gc", "-q", "--prune=now"]);
+    w.git(&main, &["cat-file", "-e", &sha]);
+    w.git(&main, &["cat-file", "-e", &sha2]);
+    if have_rsync() {
+        w.sh(&restore);
+        assert_eq!(w.git(&det2, &["rev-parse", "HEAD"]).trim(), sha2);
+        assert_eq!(fs::read_to_string(det2.join("notes.txt")).unwrap(), "wip\n");
+    }
+}
+
+#[test]
+fn hook_remove_saves_the_git_directories_of_submodules() {
+    let w = World::new();
+    let sub_up = w.base.join("subup");
+    fs::create_dir_all(&sub_up).unwrap();
+    w.git(&sub_up, &["init", "-q", "-b", "trunk"]);
+    w.commit(&sub_up, &[("s.txt", "s")], "s");
+    let add_sub = |wt: &Path| {
+        w.git(
+            wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &sub_up.to_string_lossy(),
+                "sub",
+            ],
+        );
+        w.git(wt, &["commit", "-qm", "add sub"]);
+    };
+    let wt = w.hook_worktree("subs");
+    add_sub(&wt);
+    // A commit in the submodule that is nowhere else, recorded in the
+    // superproject: `status` is clean.
+    w.commit(&wt.join("sub"), &[("mine.txt", "m")], "unpushed");
+    let unpushed = w.git(&wt.join("sub"), &["rev-parse", "HEAD"]);
+    w.git(&wt, &["commit", "-qam", "bump sub"]);
+    assert_eq!(w.git(&wt, &["status", "--porcelain"]), "");
+
+    let r = w.hook_remove(&wt);
+    r.assert_ok();
+    assert!(!wt.exists());
+    assert!(r.err().contains("submodule"), "{}", r.err());
+    let kept = w.kept();
+    assert_eq!(kept.len(), 1, "{}", r.err());
+    // The submodule's git directory went with it.
+    assert!(kept[0].join("sub/.git").is_dir(), "{}", r.err());
+    assert_eq!(
+        w.git(&kept[0].join("sub"), &["rev-parse", "HEAD"]),
+        unpushed
+    );
+    if have_rsync() {
+        w.sh(after(&r.err(), "to restore them: "));
+        assert_eq!(w.git(&wt.join("sub"), &["rev-parse", "HEAD"]), unpushed);
+        assert!(w
+            .git(&wt.join("sub"), &["log", "--oneline"])
+            .contains("unpushed"));
+        assert_eq!(w.git(&wt, &["status", "--porcelain"]), "");
+    }
+
+    // A submodule whose git directory has no working tree (deinit): it
+    // cannot be carried along, so nothing is removed.
+    let wt2 = w.hook_worktree("deinit");
+    add_sub(&wt2);
+    w.git(&wt2, &["submodule", "deinit", "-q", "-f", "sub"]);
+    let r = w.hook_remove(&wt2);
+    r.assert_fails();
+    assert!(r.err().contains("nothing was removed"), "{}", r.err());
+    assert!(
+        !w.hook_log()
+            .contains(&format!("pre_remove {}|", wt2.display())),
+        "{}",
+        w.hook_log()
+    );
+    assert!(wt2.join(".git").is_file());
+    assert!(registered(&w).contains(&wt2.display().to_string()));
+}
+
+#[test]
+fn hook_remove_unregisters_only_its_own_worktree() {
+    let w = World::new();
+    let ext = w.unmounted_worktree();
+    let clean = w.hook_worktree("clean");
+    w.hook_remove(&clean).assert_ok();
+    assert!(!registered(&w).contains(&clean.display().to_string()));
+    still_registered(&w, &ext);
+
+    let dirty = w.hook_worktree("dirty");
+    fs::write(dirty.join("notes.txt"), "x").unwrap();
+    w.hook_remove(&dirty).assert_ok();
+    assert!(!registered(&w).contains(&dirty.display().to_string()));
+    still_registered(&w, &ext);
+
+    // Already gone: only its own entry is dropped.
+    let gone = w.hook_worktree("gone");
+    fs::remove_dir_all(&gone).unwrap();
+    let r = w.hook_remove(&gone);
+    r.assert_ok();
+    assert!(
+        !registered(&w).contains(&gone.display().to_string()),
+        "{}",
+        r.err()
+    );
+    still_registered(&w, &ext);
+}
+
+#[test]
+fn the_pool_unregisters_only_its_own_worktrees() {
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(1);
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    let ext = w.unmounted_worktree();
+    let r = w.fw(&main, &["pool", "clear"]);
+    r.assert_ok();
+    assert!(r.out().contains("removed 1 spare(s)"), "{}", r.out());
+    assert!(!registered(&w).contains(&w.pool_dir().display().to_string()));
+    still_registered(&w, &ext);
+
+    // A spare that cannot be switched to the branch is thrown away.
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    let _lock = hold_fill_lock(&w.pool_dir());
+    w.git(&main, &["branch", "worktree-taken"]);
+    w.git(
+        &main,
+        &["worktree", "add", "-q", "../other", "worktree-taken"],
+    );
+    let r = w.hook_create("taken", &[]);
+    r.assert_fails();
+    assert!(r.err().contains("git switch failed"), "{}", r.err());
+    still_registered(&w, &ext);
+    let list = registered(&w);
+    assert!(
+        !list.contains(&main.join(".claude/worktrees/taken").display().to_string()),
+        "{list}"
+    );
+}
+
+#[test]
+fn hook_remove_keeps_a_worktree_with_another_one_inside() {
+    let w = World::new();
+    let main = w.main();
+    fs::write(main.join(".git/info/exclude"), ".claude/\n").unwrap();
+    let outer = w.hook_worktree("outer");
+    w.git(
+        &outer,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            ".claude/worktrees/inner",
+            "-b",
+            "inner",
+        ],
+    );
+    let inner = outer.join(".claude/worktrees/inner");
+    fs::write(inner.join("inner-notes.txt"), "keep me\n").unwrap();
+    assert_eq!(w.git(&outer, &["status", "--porcelain"]), "");
+
+    let r = w.hook_remove(&outer);
+    r.assert_ok();
+    assert!(!outer.exists());
+    assert!(
+        r.err().contains(&inner.display().to_string()),
+        "{}",
+        r.err()
+    );
+    let kept = w.kept();
+    assert_eq!(kept.len(), 1, "{}", r.err());
+    let moved = kept[0].join(".claude/worktrees/inner");
+    assert_eq!(
+        fs::read_to_string(moved.join("inner-notes.txt")).unwrap(),
+        "keep me\n"
+    );
+    // Still a worktree, registered where it is now.
+    let moved = moved.canonicalize().unwrap();
+    still_registered(&w, &moved);
+    assert_eq!(w.git(&moved, &["branch", "--show-current"]).trim(), "inner");
+}
+
+#[test]
+fn hook_remove_stops_the_background_install_first() {
+    let w = World::new();
+    let r = w.hook_create(
+        "race",
+        &[("FAKE_NPM_SLEEP", "3"), ("FAKE_NPM_ABS_WRITE", "1")],
+    );
+    r.assert_ok();
+    let path = PathBuf::from(last_line(&r.out()));
+    assert!(r.err().contains("later"), "{}", r.err());
+    wait_until("npm ci to start", || w.count("ci ") == 2);
+    w.hook_remove(&path).assert_ok();
+    assert!(!path.exists());
+    // Long after the install would have written into it.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    assert!(!path.exists(), "the background install brought it back");
+    let r = w.hook_create("race", &[]);
+    r.assert_ok();
+    assert_eq!(last_line(&r.out()), path.display().to_string());
+}
+
+#[test]
+fn fetches_never_wait_for_an_ssh_prompt() {
+    let w = World::new();
+    let main = w.main();
+    let log = w.base.join("ssh.log");
+    write_exe(
+        &w.base.join("bin/ssh"),
+        &format!(
+            "#!/bin/sh\necho \"$* prompt=$GIT_TERMINAL_PROMPT\" >> '{}'\nexit 255\n",
+            log.display()
+        ),
+    );
+    w.git(
+        &main,
+        &["remote", "set-url", "origin", "ssh://example.invalid/x.git"],
+    );
+    let ssh_log = || fs::read_to_string(&log).unwrap_or_default();
+
+    w.hook_create("one", &[]).assert_ok();
+    let l = ssh_log();
+    assert!(l.contains("-o BatchMode=yes"), "{l}");
+    assert!(l.contains("prompt=0"), "{l}");
+
+    // The user's own ssh command is kept, with BatchMode added.
+    w.git(&main, &["config", "core.sshCommand", "ssh -F /dev/null"]);
+    let _ = fs::remove_file(&log);
+    w.hook_create("two", &[]).assert_ok();
+    let l = ssh_log();
+    assert!(l.contains("-F /dev/null"), "{l}");
+    assert!(l.contains("-o BatchMode=yes"), "{l}");
+
+    let _ = fs::remove_file(&log);
+    w.pool_size(1);
+    let r = w.fw_with(
+        &main,
+        &["pool", "fill"],
+        &[("GIT_SSH_COMMAND", "ssh -p 2222")],
+    );
+    r.assert_ok();
+    let l = ssh_log();
+    assert!(l.contains("-p 2222"), "{l}");
+    assert!(!l.contains("-F /dev/null"), "the environment wins: {l}");
+    assert!(l.contains("-o BatchMode=yes"), "{l}");
+    assert!(l.contains("prompt=0"), "{l}");
+}
+
+#[test]
+fn a_spare_is_checked_for_absolute_symlinks_and_its_scripts_run_again_after_the_move() {
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(1);
+    let r = w.fw_with(&main, &["pool", "fill"], &[("FAKE_NPM_ABS_LINK", "1")]);
+    r.assert_ok();
+    assert!(r.out().contains("absolute symlink"), "{}", r.out());
+    let spare = w.spares().pop().unwrap();
+    assert!(spare
+        .join("app/node_modules/dep/abs")
+        .symlink_metadata()
+        .is_err());
+    let lock = hold_fill_lock(&w.pool_dir());
+    let r = w.fw(&main, &["add", "../wt", "-b", "feat"]);
+    r.assert_ok();
+    let wt = w.base.join("wt");
+    assert!(r.out().contains("worktree from the pool"), "{}", r.out());
+    assert!(wt.join("app/node_modules/.package-lock.json").is_file());
+    assert!(
+        wt.join("app/node_modules/dep/abs")
+            .symlink_metadata()
+            .is_err(),
+        "a link into where the spare was made"
+    );
+    drop(lock);
+
+    // Nothing changed since the spare was made: app's own postinstall
+    // runs again anyway, in the worktree where it now is.
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(1);
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    let _lock = hold_fill_lock(&w.pool_dir());
+    let r = w.fw(&main, &["add", "../wt", "-b", "feat"]);
+    r.assert_ok();
+    let wt = w.base.join("wt");
+    assert!(r.out().contains("skip   app (up to date)"), "{}", r.out());
+    assert!(
+        w.npm_log()
+            .contains(&format!("run postinstall {}", wt.join("app").display())),
+        "{}",
+        w.npm_log()
+    );
+}
+
+#[test]
+fn a_flutter_spare_runs_pub_get_again_after_the_move() {
+    let w = World::new();
+    let main = w.main();
+    let up = w.base.join("upstream");
+    w.commit(
+        &up,
+        &[
+            (".gitignore", "node_modules/\n.dart_tool/\n"),
+            (
+                "mobile/pubspec.yaml",
+                "name: mobile\ndependencies:\n  flutter:\n    sdk: flutter\n",
+            ),
+            ("mobile/pubspec.lock", "packages: {}\n"),
+        ],
+        "mobile",
+    );
+    w.git(&main, &["pull", "-q"]);
+    write_exe(&w.base.join("flutter-bin/flutter"), FAKE_PUB);
+    let path = w.path_with(&["flutter-bin"]);
+    w.pool_size(1);
+    w.fw_with(&main, &["pool", "fill"], &[("PATH", &path)])
+        .assert_ok();
+    let _lock = hold_fill_lock(&w.pool_dir());
+    let r = w.fw_with(&main, &["add", "../wt", "-b", "feat"], &[("PATH", &path)]);
+    r.assert_ok();
+    assert!(r.out().contains("worktree from the pool"), "{}", r.out());
+    let mobile = w.base.join("wt/mobile");
+    let log = fs::read_to_string(w.base.join("pub.log")).unwrap();
+    assert!(
+        log.contains(&format!("flutter pub get --offline {}\n", mobile.display())),
+        "{log}"
+    );
+}
+
+#[test]
+fn hook_remove_refuses_a_worktree_the_user_locked() {
+    let w = World::new();
+    let main = w.main();
+    let wt = w.hook_worktree("mine");
+    w.git(
+        &main,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "on a trip",
+            &wt.to_string_lossy(),
+        ],
+    );
+    let r = w.hook_remove(&wt);
+    r.assert_fails();
+    assert!(r.err().contains("on a trip"), "{}", r.err());
+    assert!(wt.join(".git").is_file());
+    assert!(!w.hook_log().contains("pre_remove"), "{}", w.hook_log());
+    assert!(registered(&w).contains("locked on a trip"));
+
+    // Locked by the pool (a spare that was not unlocked): removed.
+    let pooled = w.hook_worktree("pooled");
+    w.git(
+        &main,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "fast-worktree pool",
+            &pooled.to_string_lossy(),
+        ],
+    );
+    w.hook_remove(&pooled).assert_ok();
+    assert!(!pooled.exists());
+    assert!(!registered(&w).contains(&pooled.display().to_string()));
+}
+
+#[test]
+fn hook_remove_checks_that_the_worktree_can_be_moved_before_the_hooks() {
+    // SAFETY: no arguments.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root can rename anywhere
+    }
+    let w = World::new();
+    let wt = w.hook_worktree("stuck");
+    let parent = wt.parent().unwrap().to_path_buf();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+    let r = w.hook_remove(&wt);
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+    r.assert_fails();
+    assert!(r.err().contains("nothing was removed"), "{}", r.err());
+    assert!(!w.hook_log().contains("pre_remove"), "{}", w.hook_log());
+    assert!(wt.join(".git").is_file());
+}
+
+#[test]
+fn check_exits_0_when_its_stdout_is_closed_during_a_background_install() {
+    let w = World::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    fs::write(
+        w.main().join(".git/fast-worktree-installing"),
+        format!("{now} {}\n", std::process::id()),
+    )
+    .unwrap();
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_fast-worktree"));
+    w.env(&mut c);
+    let out = c
+        .arg("check")
+        .current_dir(w.main())
+        .stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }

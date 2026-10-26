@@ -33,7 +33,7 @@ pub fn run(quiet: bool) -> i32 {
         .map(|p| p.label())
         .collect();
     if pending::state(&root) == pending::State::Running {
-        print!("{}", report_pending(&missing));
+        util::say(&report_pending(&missing));
         return 0;
     }
     util::say(&report(&missing, projects.len(), quiet));
