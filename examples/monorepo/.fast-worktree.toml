@@ -1,0 +1,12 @@
+# Runs in the new worktree's root after `add` / `install`.
+[[post_add]]
+run = 'echo "ready: $(basename "$FAST_WORKTREE_PATH")"'
+
+# Runs before `remove` moves the worktree away. A typical use is stopping
+# the worktree's containers:
+#
+#   [[pre_remove]]
+#   run = 'docker compose -p "$(basename "$FAST_WORKTREE_PATH")" down -v --remove-orphans'
+#   requires = "docker"
+[[pre_remove]]
+run = 'echo "bye: $(basename "$FAST_WORKTREE_PATH")"'

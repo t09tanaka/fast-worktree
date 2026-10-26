@@ -1,0 +1,11 @@
+{
+  "name": "example-web",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "postinstall": "node generate.js"
+  },
+  "dependencies": {
+    "ms": "2.1.3"
+  }
+}

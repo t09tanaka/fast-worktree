@@ -1,11 +1,23 @@
 [package]
 name = "fast-worktree"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
-description = "Create git worktrees with their dependencies in seconds, and remove them in one"
+description = "Create a git worktree with its npm dependencies in seconds, and remove it in one"
 license = "MIT"
 repository = "https://github.com/t09tanaka/fast-worktree"
 readme = "README.md"
+keywords = ["git", "worktree", "npm", "node-modules", "dev-tools"]
+categories = ["command-line-utilities", "development-tools"]
+include = ["src/**/*", "tests/**/*", "examples/**/*", "README.md", "CHANGELOG.md", "LICENSE"]
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
