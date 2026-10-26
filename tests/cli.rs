@@ -1892,7 +1892,8 @@ fn a_spare_behind_its_start_reinstalls_only_what_changed() {
         "move on",
     );
     let ci_before = w.count("ci ");
-    let r = w.fw(&main, &["add", "../wt", "-b", "x"]);
+    // From a subdirectory: the path is relative to it.
+    let r = w.fw(&main.join("app"), &["add", "../../wt", "-b", "x"]);
     r.assert_ok();
     let wt = w.base.join("wt");
     assert!(r.out().contains("worktree from the pool"), "{}", r.out());

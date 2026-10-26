@@ -2,7 +2,7 @@
 //! `.worktreeinclude` files, then `install`, in one command.
 
 use super::install;
-use crate::ecosystem::{Mode, Project};
+use crate::ecosystem::{self, Mode, Project};
 use crate::error::Result;
 use crate::hooks::Config;
 use crate::{git, include, pending, pool, trash, util};
@@ -55,6 +55,9 @@ pub enum Branch {
 pub fn create(here: &Path, path: &Path, branch: &Branch, defer: bool) -> Result<bool> {
     let start = Instant::now();
     let main = install::main_checkout(here)?;
+    // Relative to the current directory, also for the git commands the
+    // pool runs in the main checkout.
+    let path = &std::env::current_dir()?.join(path);
     let spare = from_pool(&main, path, branch);
     if spare.is_none() {
         let p = path.to_string_lossy().into_owned();
@@ -180,7 +183,9 @@ fn rerun_changed(root: &Path, commit: &str, kept: &[Project], cfg: &Config) -> V
         }
     };
     let files: Vec<&str> = changed.split('\0').filter(|f| !f.is_empty()).collect();
-    let dirs: Vec<&str> = kept.iter().map(|p| p.dir.as_str()).collect();
+    // A file belongs to the deepest project of all, kept or not.
+    let all = ecosystem::discover(root).unwrap_or_default();
+    let dirs: Vec<&str> = all.iter().map(|p| p.dir.as_str()).collect();
     let mut failed = Vec::new();
     for p in kept {
         if !files
