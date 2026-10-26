@@ -659,6 +659,8 @@ mod tests {
     #[test]
     fn the_records_of_an_entry_stored_twice_at_once_are_the_winners() {
         let t = tempfile::tempdir().unwrap();
+        // The runs that come second move their copies into the trash.
+        std::env::set_var("FAST_WORKTREE_CACHE", t.path().join("cache"));
         for round in 0..40 {
             let base = t.path().join(format!("r{round}"));
             let wts = contenders(&base, 4);
