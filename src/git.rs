@@ -14,8 +14,14 @@ fn command(dir: &Path) -> Command {
 /// Run git in `dir` and return stdout. A non-zero exit becomes an error
 /// carrying git's stderr.
 pub fn output(dir: &Path, args: &[&str]) -> Result<String> {
+    output_with_env(dir, args, &[])
+}
+
+/// [`output`] with extra environment variables for git and its hooks.
+pub fn output_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
     let out = command(dir)
         .args(args)
+        .envs(env.iter().copied())
         .output()
         .map_err(|e| Error(format!("cannot run git: {e}")))?;
     if !out.status.success() {
@@ -194,6 +200,40 @@ pub fn unmerged_into(dir: &Path, branch: &str) -> Option<String> {
         .unwrap_or(&reference)
         .to_string();
     (status.code() == Some(1)).then_some(short)
+}
+
+/// Whether `git` in `dir` exits 0, with its output discarded.
+pub fn succeeds(dir: &Path, args: &[&str]) -> bool {
+    command(dir)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Whether the local branch exists.
+pub fn branch_exists(dir: &Path, branch: &str) -> bool {
+    succeeds(
+        dir,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+}
+
+/// `git fetch -q origin <branch>` that never waits for a password or a
+/// passphrase: without a terminal prompt, it fails instead.
+pub fn fetch_quietly(dir: &Path, branch: &str) -> Result<()> {
+    output_with_env(
+        dir,
+        &["fetch", "-q", "origin", branch],
+        &[("GIT_TERMINAL_PROMPT", "0")],
+    )
+    .map(|_| ())
 }
 
 /// The remote's default branch, from `refs/remotes/origin/HEAD`. When that

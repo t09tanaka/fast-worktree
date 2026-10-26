@@ -17,6 +17,7 @@ const FAKE_NPM: &str = r#"#!/bin/sh
 echo "$1 $2 $(pwd -P)" >> "$FAKE_NPM_LOG"
 case "$1" in
   ci)
+    if [ -n "$FAKE_NPM_SLEEP" ]; then sleep "$FAKE_NPM_SLEEP"; fi
     if [ -n "$FAKE_NPM_FAIL" ]; then echo "npm ERR! simulated failure" >&2; exit 1; fi
     # An install that exits 0 but leaves no record of the tree.
     if [ -n "$FAKE_NPM_PARTIAL" ]; then mkdir -p node_modules/dep; echo dep > node_modules/dep/index.js; exit 0; fi
@@ -1594,4 +1595,576 @@ mod macos_v02 {
         r.assert_ok();
         assert!(r.out().contains("clone  app from "), "{}", r.out());
     }
+}
+
+// ---- v0.2: the pool and the Claude Code hooks ----
+
+impl World {
+    /// Turn the pool on in the user-wide config.
+    fn pool_size(&self, n: u32) {
+        let p = self.home().join(".config/fast-worktree/config.toml");
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, format!("[pool]\nsize = {n}\n")).unwrap();
+    }
+
+    /// `<cache>/<repo>/pool`.
+    fn pool_dir(&self) -> PathBuf {
+        let repo = fs::read_dir(&self.cache)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name() != "trash" && e.path().join("pool").is_dir())
+            .expect("a pool directory")
+            .path();
+        repo.join("pool")
+    }
+
+    /// The ready spares.
+    fn spares(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = fs::read_dir(self.pool_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("wt-"))
+            .map(|e| e.path())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Run fast-worktree with `input` on stdin.
+    fn fw_stdin(&self, dir: &Path, args: &[&str], input: &str, extra: &[(&str, &str)]) -> Run {
+        use std::io::Write;
+        let mut c = Command::new(env!("CARGO_BIN_EXE_fast-worktree"));
+        self.env(&mut c);
+        for (k, v) in extra {
+            c.env(k, v);
+        }
+        let mut child = c
+            .args(args)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        Run(child.wait_with_output().unwrap())
+    }
+
+    fn hook_create(&self, name: &str, extra: &[(&str, &str)]) -> Run {
+        let input = format!(
+            r#"{{"session_id":"s","cwd":"{}","hook_event_name":"WorktreeCreate","name":"{name}"}}"#,
+            self.main().display()
+        );
+        self.fw_stdin(&self.main(), &["hook", "create"], &input, extra)
+    }
+
+    fn hook_remove(&self, path: &Path) -> Run {
+        let input = format!(
+            r#"{{"session_id":"s","cwd":"{}","hook_event_name":"WorktreeRemove","worktree_path":"{}"}}"#,
+            self.main().display(),
+            path.display()
+        );
+        self.fw_stdin(&self.main(), &["hook", "remove"], &input, &[])
+    }
+}
+
+/// Wait up to 30 seconds for `cond`.
+#[track_caller]
+fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    let start = std::time::Instant::now();
+    while !cond() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Hold the pool's fill lock, so that the fills `add` starts exit at once.
+struct HeldFillLock(#[allow(dead_code)] fs::File);
+
+fn hold_fill_lock(pool: &Path) -> HeldFillLock {
+    use std::os::unix::io::AsRawFd;
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(pool.join("fill.lock"))
+        .unwrap();
+    // SAFETY: a valid descriptor, unlocked when the file is closed.
+    assert_eq!(
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    HeldFillLock(f)
+}
+
+/// The last non-empty line of `s`.
+fn last_line(s: &str) -> &str {
+    s.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("")
+}
+
+#[test]
+fn the_pool_is_off_by_default() {
+    let w = World::new();
+    let main = w.main();
+    let r = w.fw(&main, &["pool", "status"]);
+    r.assert_ok();
+    assert!(r.out().starts_with("pool   off"), "{}", r.out());
+    let r = w.fw(&main, &["pool", "fill"]);
+    r.assert_ok();
+    assert!(r.out().contains("the pool is off"), "{}", r.out());
+    let r = w.fw(&main, &["add", "../wt", "-b", "x"]);
+    r.assert_ok();
+    assert!(!r.out().contains("pool"), "{}", r.out());
+}
+
+#[test]
+fn add_takes_a_spare_and_starts_a_refill() {
+    let w = World::new();
+    let main = w.main();
+    // The post-checkout hook stays out of the way while spares are made.
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_fast-worktree"),
+        w.base.join("bin/fast-worktree"),
+    )
+    .unwrap();
+    write_exe(
+        &main.join(".git/hooks/post-checkout"),
+        "#!/bin/sh\nfast-worktree check --post-checkout \"$@\" || true\n",
+    );
+    w.pool_size(1);
+    let r = w.fw(&main, &["pool", "fill"]);
+    r.assert_ok();
+    assert!(r.out().contains("fill  done: 1 of 1 ready"), "{}", r.all());
+    assert!(!r.all().contains("missing deps"), "{}", r.all());
+    assert_eq!(w.count("ci "), 2, "{}", w.npm_log());
+    let spare = w.spares().pop().unwrap();
+    assert!(spare.join("app/node_modules/.package-lock.json").is_file());
+    let list = w.git(&main, &["worktree", "list", "--porcelain"]);
+    assert!(list.contains("locked fast-worktree pool"), "{list}");
+
+    let r = w.fw(&main, &["pool", "status"]);
+    r.assert_ok();
+    assert!(r.out().contains("pool   1 of 1 ready"), "{}", r.out());
+    assert!(r.out().contains("BEHIND origin/trunk"), "{}", r.out());
+    assert!(r.out().contains("misses 0"), "{}", r.out());
+
+    // The spare is moved into place; nothing is installed again.
+    let r = w.fw(&main, &["add", "../wt", "-b", "feat"]);
+    r.assert_ok();
+    let wt = w.base.join("wt");
+    assert!(
+        r.out().contains("worktree from the pool in "),
+        "{}",
+        r.out()
+    );
+    assert!(r.out().contains("skip   app (up to date)"), "{}", r.out());
+    assert!(!spare.exists());
+    assert!(wt.join("app/node_modules/.package-lock.json").is_file());
+    assert_eq!(w.git(&wt, &["branch", "--show-current"]).trim(), "feat");
+    assert_eq!(
+        w.git(&wt, &["rev-parse", "HEAD"]),
+        w.git(&main, &["rev-parse", "origin/trunk"])
+    );
+    assert_eq!(
+        w.git(&wt, &["rev-parse", "--abbrev-ref", "feat@{upstream}"])
+            .trim(),
+        "origin/trunk"
+    );
+    let list = w.git(&main, &["worktree", "list", "--porcelain"]);
+    let entry = list
+        .split("\n\n")
+        .find(|e| e.contains(&format!("worktree {}", wt.display())))
+        .unwrap_or_else(|| panic!("{list}"));
+    assert!(!entry.contains("locked"), "{entry}");
+    assert!(w
+        .hook_log()
+        .contains(&format!("post_add {}|{}", wt.display(), main.display())));
+    assert!(!r.all().contains("missing deps"), "{}", r.all());
+    status_is_clean(&w, &wt);
+
+    // A refill started in the background.
+    wait_until("the refill", || {
+        fs::read_to_string(w.pool_dir().join("fill.log"))
+            .is_ok_and(|l| l.contains("fill  done: 1 of 1 ready"))
+    });
+    let spare = w.spares().pop().unwrap();
+    assert!(spare.join("lib/node_modules/.package-lock.json").is_file());
+    if cfg!(target_os = "macos") {
+        assert_eq!(w.count("ci "), 2, "cloned from the cache: {}", w.npm_log());
+    }
+
+    // `remove` refuses a spare; `pool clear` removes them.
+    let r = w.fw(&main, &["remove", spare.to_str().unwrap()]);
+    r.assert_fails();
+    assert!(r.err().contains("worktree is locked"), "{}", r.err());
+    assert!(r.err().contains("fast-worktree pool clear"), "{}", r.err());
+    assert!(spare.is_dir());
+    let r = w.fw(&main, &["pool", "clear"]);
+    r.assert_ok();
+    assert!(r.out().contains("removed 1 spare(s)"), "{}", r.out());
+    assert!(w.spares().is_empty());
+    assert!(!w
+        .git(&main, &["worktree", "list"])
+        .contains(&w.pool_dir().display().to_string()));
+    // The cache commands do not take spares for entries.
+    let r = w.fw(&main, &["cache", "ls"]);
+    assert!(!r.out().contains("wt-"), "{}", r.out());
+}
+
+#[test]
+fn two_adds_at_once_take_one_spare() {
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(1);
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    let _lock = hold_fill_lock(&w.pool_dir());
+    let start = |name: &str| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_fast-worktree"));
+        w.env(&mut c);
+        c.args(["add", &format!("../{name}"), "-b", name])
+            .current_dir(&main)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let (a, b) = (start("a"), start("b"));
+    let runs = [
+        Run(a.wait_with_output().unwrap()),
+        Run(b.wait_with_output().unwrap()),
+    ];
+    for r in &runs {
+        r.assert_ok();
+    }
+    let pooled = runs
+        .iter()
+        .filter(|r| r.out().contains("worktree from the pool"))
+        .count();
+    let missed = runs
+        .iter()
+        .filter(|r| {
+            r.out()
+                .contains("note   pool: no spare ready, creating the worktree")
+        })
+        .count();
+    assert_eq!(
+        (pooled, missed),
+        (1, 1),
+        "{}\n---\n{}",
+        runs[0].all(),
+        runs[1].all()
+    );
+    for n in ["a", "b"] {
+        let wt = w.base.join(n);
+        assert!(wt.join("app/node_modules/.package-lock.json").is_file());
+        assert_eq!(w.git(&wt, &["branch", "--show-current"]).trim(), n);
+    }
+    let r = w.fw(&main, &["pool", "status"]);
+    assert!(r.out().contains("pool   0 of 1 ready"), "{}", r.out());
+    assert!(r.out().contains("misses 1 "), "{}", r.out());
+    assert!(r.out().contains("fill   running"), "{}", r.out());
+}
+
+#[test]
+fn a_spare_behind_its_start_reinstalls_only_what_changed() {
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(1);
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    let _lock = hold_fill_lock(&w.pool_dir());
+    // Upstream moves on: lib's lockfile changes, and a file of app.
+    let up = w.base.join("upstream");
+    w.commit(
+        &up,
+        &[
+            ("lib/package-lock.json", &lockfile_v("lib", "1.1.0")),
+            ("app/src.txt", "new\n"),
+        ],
+        "move on",
+    );
+    let ci_before = w.count("ci ");
+    let r = w.fw(&main, &["add", "../wt", "-b", "x"]);
+    r.assert_ok();
+    let wt = w.base.join("wt");
+    assert!(r.out().contains("worktree from the pool"), "{}", r.out());
+    assert_eq!(
+        w.git(&wt, &["rev-parse", "HEAD"]),
+        w.git(&up, &["rev-parse", "HEAD"])
+    );
+    assert!(r.out().contains("skip   app (up to date)"), "{}", r.out());
+    assert!(
+        r.out()
+            .contains("note   lib: lockfile or Node version changed, installing again"),
+        "{}",
+        r.out()
+    );
+    assert_eq!(
+        fs::read_to_string(wt.join("lib/node_modules/.package-lock.json")).unwrap(),
+        lockfile_v("lib", "1.1.0")
+    );
+    if cfg!(target_os = "macos") {
+        assert!(r.out().contains("delta  lib from "), "{}", r.out());
+        assert_eq!(w.count("ci "), ci_before);
+    } else {
+        assert!(r.out().contains("npm ci lib ("), "{}", r.out());
+        assert_eq!(w.count("ci "), ci_before + 1);
+    }
+    // app's dependencies stayed, and its own postinstall ran again because
+    // its files changed.
+    assert!(
+        w.npm_log()
+            .contains(&format!("run postinstall {}", wt.join("app").display())),
+        "{}",
+        w.npm_log()
+    );
+    assert!(r.out().contains("rerun  app: postinstall"), "{}", r.out());
+    status_is_clean(&w, &wt);
+}
+
+#[test]
+fn hook_create_prints_the_worktree_path_last() {
+    let w = World::new();
+    let main = w.main();
+    w.commit(
+        &w.base.join("upstream"),
+        &[
+            (".gitignore", "node_modules/\n.env\n.claude/worktrees/\n"),
+            (".worktreeinclude", ".env\n"),
+        ],
+        "include",
+    );
+    w.git(&main, &["pull", "-q"]);
+    fs::write(main.join(".env"), "SECRET=1\n").unwrap();
+
+    let r = w.hook_create("feat", &[("FAKE_NPM_SLEEP", "1")]);
+    r.assert_ok();
+    let path = PathBuf::from(last_line(&r.out()));
+    assert_eq!(
+        r.out().trim(),
+        path.display().to_string(),
+        "only the path on stdout"
+    );
+    assert!(path.is_absolute() && path.is_dir(), "{}", path.display());
+    assert_eq!(path, main.join(".claude/worktrees/feat"));
+    assert_eq!(path.canonicalize().unwrap(), path, "no symlink, no ..");
+    assert!(r.err().contains("worktree added in "), "{}", r.err());
+    assert_eq!(
+        w.git(&path, &["branch", "--show-current"]).trim(),
+        "worktree-feat"
+    );
+    assert_eq!(
+        w.git(&path, &["rev-parse", "HEAD"]),
+        w.git(&main, &["rev-parse", "origin/trunk"])
+    );
+    assert_eq!(fs::read_to_string(path.join(".env")).unwrap(), "SECRET=1\n");
+
+    // npm ci was left to the background: `check` says so, `wait` waits.
+    let r = w.fw(&path, &["check", "--quiet"]);
+    r.assert_ok();
+    assert!(
+        r.out().contains("installing deps in the background"),
+        "{}",
+        r.out()
+    );
+    let r = w.fw(&main, &["wait", path.to_str().unwrap()]);
+    r.assert_ok();
+    assert!(r.out().contains("background install done"), "{}", r.out());
+    assert!(path.join("app/node_modules/.package-lock.json").is_file());
+    assert!(path.join("lib/node_modules/.package-lock.json").is_file());
+    assert_eq!(w.fw(&path, &["check", "--quiet"]).out(), "");
+    // The post_add hooks ran after the background install.
+    assert!(w
+        .hook_log()
+        .contains(&format!("post_add {}|{}", path.display(), main.display())));
+    status_is_clean(&w, &path);
+
+    // The same name again: the existing worktree.
+    let r = w.hook_create("feat", &[]);
+    r.assert_ok();
+    assert_eq!(last_line(&r.out()), path.display().to_string());
+
+    // On macOS the next one clones everything and needs no background.
+    let r = w.hook_create("second", &[]);
+    r.assert_ok();
+    let second = PathBuf::from(last_line(&r.out()));
+    if cfg!(target_os = "macos") {
+        assert!(r.err().contains("clone  app from "), "{}", r.err());
+        assert!(!r.err().contains("later"), "{}", r.err());
+        assert!(second.join("app/node_modules").is_dir());
+    }
+    w.fw(&second, &["wait"]).assert_ok();
+    assert!(second.join("app/node_modules/.package-lock.json").is_file());
+
+    // An invalid name or no repository fails.
+    w.hook_create("../escape", &[]).assert_fails();
+    let r = w.fw_stdin(
+        &w.base,
+        &["hook", "create"],
+        &format!(r#"{{"cwd":"{}","name":"x"}}"#, w.base.display()),
+        &[],
+    );
+    r.assert_fails();
+    assert_eq!(r.out(), "");
+}
+
+#[test]
+fn hook_create_succeeds_when_the_dependencies_fail() {
+    let w = World::new();
+    let r = w.hook_create("broken", &[("FAKE_NPM_FAIL", "1")]);
+    r.assert_ok();
+    let path = PathBuf::from(last_line(&r.out()));
+    assert!(path.is_dir());
+    let r = w.fw(&path, &["wait"]);
+    r.assert_fails();
+    assert!(r.out().contains("background install failed"), "{}", r.out());
+    assert!(
+        r.out().contains("npm ERR! simulated failure"),
+        "{}",
+        r.out()
+    );
+    // Nothing waits any more, and `install` can finish the job.
+    let r = w.fw(&path, &["install"]);
+    r.assert_ok();
+    assert!(path.join("app/node_modules/.package-lock.json").is_file());
+
+    // Only git failing fails the hook: a branch that is checked out
+    // elsewhere cannot be checked out again.
+    w.git(&w.main(), &["branch", "worktree-taken"]);
+    w.git(
+        &w.main(),
+        &["worktree", "add", "-q", "../other", "worktree-taken"],
+    );
+    let r = w.hook_create("taken", &[]);
+    r.assert_fails();
+    assert_eq!(r.out(), "");
+}
+
+#[test]
+fn hook_create_uses_a_spare() {
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(1);
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    let _lock = hold_fill_lock(&w.pool_dir());
+    let r = w.hook_create("pooled", &[]);
+    r.assert_ok();
+    let path = PathBuf::from(last_line(&r.out()));
+    assert!(r.err().contains("worktree from the pool"), "{}", r.err());
+    assert!(
+        !r.err().contains("later"),
+        "nothing to do later: {}",
+        r.err()
+    );
+    assert_eq!(
+        w.git(&path, &["branch", "--show-current"]).trim(),
+        "worktree-pooled"
+    );
+    assert!(path.join("app/node_modules/.package-lock.json").is_file());
+    assert!(w.spares().is_empty());
+}
+
+#[test]
+fn hook_remove_deletes_changed_worktrees_and_keeps_unmerged_branches() {
+    let w = World::new();
+    let main = w.main();
+    let r = w.hook_create("dirty", &[]);
+    r.assert_ok();
+    let dirty = PathBuf::from(last_line(&r.out()));
+    w.fw(&dirty, &["wait"]).assert_ok();
+    fs::write(dirty.join("notes.txt"), "unsaved\n").unwrap();
+    fs::write(dirty.join("app/package.json"), "{}\n").unwrap();
+
+    let r = w.hook_remove(&dirty);
+    r.assert_ok();
+    assert_eq!(r.out(), "");
+    assert!(!dirty.exists());
+    assert!(!w.git(&main, &["worktree", "list"]).contains("dirty"));
+    assert!(r.err().contains("for at least 24 hours"), "{}", r.err());
+    assert!(r.err().contains("to restore them: git -C "), "{}", r.err());
+    // The changes are in the trash, kept; the branch had nothing of its own.
+    let kept = fs::read_dir(w.cache.join("trash"))
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().starts_with("keep-"))
+        .expect("a kept trash entry")
+        .path();
+    assert_eq!(
+        fs::read_to_string(kept.join("notes.txt")).unwrap(),
+        "unsaved\n"
+    );
+    assert!(
+        r.err().contains("deleted branch worktree-dirty"),
+        "{}",
+        r.err()
+    );
+    assert!(!w
+        .git_run(&main, &["rev-parse", "--verify", "worktree-dirty"], &[])
+        .ok());
+    assert!(w.hook_log().contains("pre_remove"), "{}", w.hook_log());
+
+    // A commit that is on no other ref keeps its branch.
+    let r = w.hook_create("work", &[]);
+    let work = PathBuf::from(last_line(&r.out()));
+    w.fw(&work, &["wait"]).assert_ok();
+    w.commit(&work, &[("new.txt", "x")], "work");
+    let r = w.hook_remove(&work);
+    r.assert_ok();
+    assert!(!work.exists());
+    assert!(
+        r.err().contains("kept branch worktree-work: commit "),
+        "{}",
+        r.err()
+    );
+    assert!(w
+        .git_run(&main, &["rev-parse", "--verify", "worktree-work"], &[])
+        .ok());
+    // ...and the next `claude --worktree work` checks it out again.
+    let r = w.hook_create("work", &[]);
+    r.assert_ok();
+    let again = PathBuf::from(last_line(&r.out()));
+    assert!(again.join("new.txt").is_file());
+    w.fw(&again, &["wait"]).assert_ok();
+
+    // Already gone: fine. The main checkout, or a directory that is not a
+    // worktree: refused, and nothing is deleted.
+    w.hook_remove(&w.base.join("nowhere")).assert_ok();
+    let r = w.hook_remove(&main);
+    r.assert_fails();
+    assert!(main.join(".git").exists());
+    let plain = w.base.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    w.hook_remove(&plain).assert_fails();
+    assert!(plain.is_dir());
+}
+
+#[test]
+fn wait_and_print_config() {
+    let w = World::new();
+    let r = w.fw(&w.main(), &["wait"]);
+    r.assert_ok();
+    assert!(
+        r.out().contains("nothing is being installed"),
+        "{}",
+        r.out()
+    );
+    let r = w.fw(&w.main(), &["hook", "print-config"]);
+    r.assert_ok();
+    let v: serde_json::Value = serde_json::from_str(&r.out()).unwrap();
+    assert_eq!(
+        v["hooks"]["WorktreeCreate"][0]["hooks"][0]["command"],
+        "fast-worktree hook create"
+    );
+    assert_eq!(
+        v["hooks"]["WorktreeRemove"][0]["hooks"][0]["command"],
+        "fast-worktree hook remove"
+    );
 }

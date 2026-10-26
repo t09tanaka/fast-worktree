@@ -33,6 +33,22 @@ pub enum Mode {
     /// Only what a clone (cache or another worktree) can provide: nothing
     /// that downloads or builds. For the `post-checkout` hook.
     CloneOnly,
+    /// `Changed` limited to what `CloneOnly` may do: an outdated tree is
+    /// moved away and replaced by a clone when there is one, else reported
+    /// missing. For `hook create` with a spare from the pool.
+    ChangedCloneOnly,
+}
+
+impl Mode {
+    /// Whether present dependencies are checked against the lockfile.
+    pub fn reinstalls_changed(self) -> bool {
+        matches!(self, Mode::Changed | Mode::ChangedCloneOnly)
+    }
+
+    /// Whether only clones are allowed: nothing that downloads or builds.
+    pub fn clone_only(self) -> bool {
+        matches!(self, Mode::CloneOnly | Mode::ChangedCloneOnly)
+    }
 }
 
 /// The result of one project's install.
@@ -43,6 +59,8 @@ pub struct Report {
     /// `CloneOnly` found nothing to clone: the dependencies are still
     /// missing.
     pub missing: bool,
+    /// The dependencies already there were left as they were.
+    pub kept: bool,
 }
 
 impl Report {
@@ -50,6 +68,23 @@ impl Report {
         Report {
             lines: lines.into(),
             missing: false,
+            kept: false,
+        }
+    }
+
+    /// Nothing was installed: what was there is still current.
+    pub fn kept(lines: impl Into<String>) -> Report {
+        Report {
+            kept: true,
+            ..Report::done(lines)
+        }
+    }
+
+    /// A clone-only install could not make the dependencies present.
+    pub fn missing(lines: impl Into<String>) -> Report {
+        Report {
+            missing: true,
+            ..Report::done(lines)
         }
     }
 }
@@ -68,6 +103,20 @@ pub trait Ecosystem: Sync {
     /// Make the dependencies of `ctx.root/<dir>` present. Returns what to
     /// print, or on failure the log to show.
     fn install(&self, ctx: &Ctx, dir: &str, mode: Mode) -> std::result::Result<Report, String>;
+
+    /// Run the project's own install scripts again on dependencies that are
+    /// already present, because its tracked files changed (a spare from the
+    /// pool switched to another commit). Returns notes to print. On failure
+    /// the dependencies are moved away, so the next `install` installs
+    /// them again.
+    fn rerun_own_scripts(
+        &self,
+        _root: &Path,
+        _dir: &str,
+        _rules: &[SkipLifecycle],
+    ) -> std::result::Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
 }
 
 pub fn all() -> Vec<&'static dyn Ecosystem> {

@@ -39,9 +39,14 @@ pub fn mark_checked(entry: &Path) {
     let _ = fs::write(marker(entry), b"");
 }
 
-/// A directory name that is an entry, not a marker or a half-made entry.
+/// A directory name that is an entry, not a marker, a half-made entry, or
+/// a spare of the pool (which lives in `<repo>/pool`, where a project
+/// directory named `pool` would keep its entries too).
 fn is_entry_name(name: &str) -> bool {
-    !name.ends_with(MARKER_SUFFIX) && !name.contains(TMP_INFIX) && !name.starts_with('.')
+    !name.ends_with(MARKER_SUFFIX)
+        && !name.contains(TMP_INFIX)
+        && !name.starts_with('.')
+        && !name.starts_with(crate::pool::SPARE_PREFIX)
 }
 
 /// Clone `node_modules` into the cache at `entry`, unless it is there
@@ -110,6 +115,9 @@ pub fn prune(project_dir: &Path, ttl: Duration) -> Vec<PathBuf> {
             if e.file_name().to_string_lossy().ends_with(MARKER_SUFFIX) {
                 markers.push(e.path());
             }
+            continue;
+        }
+        if !is_entry_name(&e.file_name().to_string_lossy()) {
             continue;
         }
         let age = meta
@@ -208,6 +216,16 @@ pub fn prune_all(root: &Path, ttl: Duration) -> Vec<PathBuf> {
     removed
 }
 
+/// `YYYY-MM-DD HH:MM` (UTC) of a time.
+pub fn datetime(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let s = secs % 86_400;
+    format!("{} {:02}:{:02}", date(t), s / 3_600, s % 3_600 / 60)
+}
+
 /// `YYYY-MM-DD` (UTC) of a time.
 pub fn date(t: SystemTime) -> String {
     let days = t
@@ -240,6 +258,7 @@ mod tests {
         assert!(is_entry_name("0123456789abcdef-v20.13.1"));
         assert!(!is_entry_name("0123456789abcdef-v20.13.1.ok"));
         assert!(!is_entry_name("0123456789abcdef-v20.13.1.tmp-12-0"));
+        assert!(!is_entry_name("wt-1793012885-1-0"), "a spare of the pool");
     }
 
     #[test]
@@ -274,6 +293,7 @@ mod tests {
         let proj = cache.join("repo/app");
         fs::create_dir_all(proj.join("old-v20.1")).unwrap();
         fs::create_dir_all(proj.join("new-v20.1")).unwrap();
+        fs::create_dir_all(proj.join("wt-1-1-0")).unwrap();
         mark_checked(&proj.join("old-v20.1"));
         mark_checked(&proj.join("new-v20.1"));
         fs::write(proj.join("gone-v20.1.ok"), "").unwrap();
@@ -285,6 +305,7 @@ mod tests {
         assert!(!proj.join("old-v20.1.ok").exists());
         assert!(!proj.join("gone-v20.1.ok").exists(), "orphan marker");
         assert!(proj.join("new-v20.1").exists());
+        assert!(proj.join("wt-1-1-0").exists(), "spares are not entries");
         assert!(is_checked(&proj.join("new-v20.1")));
     }
 
@@ -325,5 +346,8 @@ mod tests {
         assert_eq!(at(951_782_400), "2000-02-29");
         assert_eq!(at(1_793_010_441), "2026-10-26");
         assert_eq!(at(1_709_251_199), "2024-02-29");
+        let dt = |s: u64| datetime(UNIX_EPOCH + Duration::from_secs(s));
+        assert_eq!(dt(1_709_251_199), "2024-02-29 23:59");
+        assert_eq!(dt(0), "1970-01-01 00:00");
     }
 }

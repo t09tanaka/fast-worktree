@@ -72,20 +72,17 @@ fn install(project: &Path, dir: &str, mode: Mode, tools: &Tools) -> Result<Repor
     let lockfile = fs::read(project.join(LOCKFILE)).map_err(|e| format!("{LOCKFILE}: {e}"))?;
     let key = key(&lockfile);
     if project.join(PACKAGE_CONFIG).is_file() {
-        if mode != Mode::Changed {
-            return Ok(Report::done(format!(
+        if !mode.reinstalls_changed() {
+            return Ok(Report::kept(format!(
                 "skip   {dir} (.dart_tool already present)"
             )));
         }
         if fs::read_to_string(project.join(KEY_FILE)).is_ok_and(|k| k.trim() == key) {
-            return Ok(Report::done(format!("skip   {dir} (up to date)")));
+            return Ok(Report::kept(format!("skip   {dir} (up to date)")));
         }
     }
-    if mode == Mode::CloneOnly {
-        return Ok(Report {
-            lines: String::new(),
-            missing: true,
-        });
+    if mode.clone_only() {
+        return Ok(Report::missing(""));
     }
     let how = if let Some(flutter) = &tools.flutter {
         match pub_get(flutter, project, true) {

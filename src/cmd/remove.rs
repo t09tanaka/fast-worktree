@@ -11,7 +11,7 @@
 
 use crate::error::{bail, Error, Result};
 use crate::hooks::{self, Stage};
-use crate::{git, trash, util};
+use crate::{git, pool, trash, util};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -124,6 +124,12 @@ pub fn run(opts: Opts) -> Result<i32> {
             .unwrap_or(false),
     };
     if let Some(r) = refusal(&facts) {
+        if r == Refusal::Locked && pool::is_pool_path(&path) {
+            bail!(
+                "{r}: {} is a spare of the pool; `fast-worktree pool clear` removes the spares",
+                path.display()
+            );
+        }
         match (r, &inner) {
             (Refusal::ContainsWorktree, Some(i)) => {
                 bail!("{r}: {} is inside {}", i.display(), path.display())

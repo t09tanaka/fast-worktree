@@ -17,7 +17,7 @@
 use super::install;
 use crate::ecosystem::{self, Mode, Project};
 use crate::hooks::Config;
-use crate::{git, util};
+use crate::{git, paths, pending, util};
 use std::env;
 use std::path::Path;
 
@@ -32,8 +32,29 @@ pub fn run(quiet: bool) -> i32 {
         .iter()
         .map(|p| p.label())
         .collect();
+    if pending::state(&root) == pending::State::Running {
+        print!("{}", report_pending(&missing));
+        return 0;
+    }
     util::say(&report(&missing, projects.len(), quiet));
     0
+}
+
+/// While `hook create`'s background install runs.
+pub fn report_pending(missing: &[String]) -> String {
+    let mut s = String::new();
+    for m in missing {
+        s.push_str(&format!("missing deps: {m}\n"));
+    }
+    s.push_str("installing deps in the background; `fast-worktree wait` waits for it\n");
+    s
+}
+
+/// Whether `dir` is in the cache: a spare of the pool being made.
+fn in_cache(dir: &std::path::Path) -> bool {
+    let root = paths::cache_root();
+    let root = root.canonicalize().unwrap_or(root);
+    dir.canonicalize().is_ok_and(|d| d.starts_with(&root))
 }
 
 fn missing(root: &Path, projects: &[Project]) -> Vec<Project> {
@@ -78,6 +99,10 @@ pub fn post_checkout(prev: &str, _new: &str, flag: &str) -> i32 {
     // exports the new worktree's GIT_DIR); the working directory says it.
     for v in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX"] {
         env::remove_var(v);
+    }
+    // A spare of the pool is installed by `pool fill` itself.
+    if env::current_dir().is_ok_and(|d| in_cache(&d)) {
+        return 0;
     }
     match action {
         HookAction::Nothing => 0,
@@ -168,6 +193,11 @@ mod tests {
         let r = report(&m(&["api (npm)", ". (pub)"]), 3, true);
         assert!(r.starts_with("missing deps: api (npm)\nmissing deps: . (pub)\n"));
         assert_eq!(r, report(&m(&["api (npm)", ". (pub)"]), 3, false));
+        let p = report_pending(&m(&["api (npm)"]));
+        assert_eq!(
+            p,
+            "missing deps: api (npm)\ninstalling deps in the background; `fast-worktree wait` waits for it\n"
+        );
     }
 
     #[test]

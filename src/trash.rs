@@ -47,15 +47,34 @@ fn unique_name(path: &Path) -> String {
     format!("{}-{}-{n}{nanos}-{base}", now_secs(), std::process::id())
 }
 
+/// Name prefix of trash entries that are kept for a while instead of being
+/// deleted at once: `keep-<unix seconds until>-...`.
+const KEEP_PREFIX: &str = "keep-";
+
 /// Move `path` out of the way and delete it in the background. Returns
 /// where it went. Falls back to a hidden sibling when the trash directory
 /// is on another volume, so the rename stays cheap.
 pub fn trash(path: &Path) -> io::Result<PathBuf> {
-    let name = unique_name(path);
+    let dest = move_away(path, &unique_name(path))?;
+    spawn_rm(&dest);
+    Ok(dest)
+}
+
+/// Move `path` into the trash and leave it there for at least `secs`
+/// seconds: a later run deletes it once that time has passed. Returns where
+/// it went.
+pub fn keep(path: &Path, secs: u64) -> io::Result<PathBuf> {
+    let name = format!("{KEEP_PREFIX}{}-{}", now_secs() + secs, unique_name(path));
+    move_away(path, &name)
+}
+
+/// Rename `path` into the trash as `name` (or next to itself when the trash
+/// is on another volume).
+fn move_away(path: &Path, name: &str) -> io::Result<PathBuf> {
     let dir = paths::trash_dir();
     let dest = match fs::create_dir_all(&dir) {
         Ok(()) => {
-            let d = dir.join(&name);
+            let d = dir.join(name);
             match fs::rename(path, &d) {
                 Ok(()) => Some(d),
                 Err(e) if e.raw_os_error() == Some(libc::EXDEV) => None,
@@ -66,9 +85,8 @@ pub fn trash(path: &Path) -> io::Result<PathBuf> {
     };
     let dest = match dest {
         Some(d) => d,
-        None => beside(path, &name, &dir)?,
+        None => beside(path, name, &dir)?,
     };
-    spawn_rm(&dest);
     Ok(dest)
 }
 
@@ -172,6 +190,12 @@ fn stale(dir: &Path, now: u64) -> Vec<PathBuf> {
 }
 
 fn is_stale(name: &str, now: u64) -> bool {
+    if let Some(rest) = name.strip_prefix(KEEP_PREFIX) {
+        return match rest.split('-').next().and_then(|s| s.parse::<u64>().ok()) {
+            Some(until) => until < now,
+            None => false,
+        };
+    }
     match name.split('-').next().and_then(|s| s.parse::<u64>().ok()) {
         Some(t) => t + SWEEP_AFTER_SECS < now,
         // Not ours, or not named by us: leave it.
@@ -188,6 +212,10 @@ mod tests {
         assert!(is_stale("100-1-1-wt", 100 + SWEEP_AFTER_SECS + 1));
         assert!(!is_stale("100-1-1-wt", 100 + SWEEP_AFTER_SECS));
         assert!(!is_stale("readme", 1_000_000));
+        assert!(!is_stale("keep-5000-100-1-1-wt", 4_999));
+        assert!(!is_stale("keep-5000-100-1-1-wt", 5_000));
+        assert!(is_stale("keep-5000-100-1-1-wt", 5_001));
+        assert!(!is_stale("keep-x", 1_000_000));
     }
 
     #[test]

@@ -13,6 +13,9 @@
 //! dir = "api"           # every pair of files is byte-identical
 //! script = "postinstall"
 //! if_equal = [["schema.json", "node_modules/.codegen/schema.json"]]
+//!
+//! [pool]                # keep this many ready worktrees (read from the
+//! size = 2              # main checkout; default: the user config, else 0)
 //! ```
 //!
 //! fast-worktree itself knows nothing about the tools a repository uses;
@@ -35,6 +38,14 @@ pub struct Config {
     pub pre_remove: Vec<Hook>,
     #[serde(default)]
     pub skip_lifecycle: Vec<SkipLifecycle>,
+    #[serde(default)]
+    pub pool: Option<PoolConfig>,
+}
+
+/// `[pool]`: how many ready worktrees to keep.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct PoolConfig {
+    pub size: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -138,12 +149,48 @@ fn allowed_keys(section: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// The keys each plain table accepts.
+fn allowed_table_keys(section: &str) -> Option<&'static [&'static str]> {
+    match section {
+        "pool" => Some(&["size"]),
+        _ => None,
+    }
+}
+
+/// Keep the keys of the plain table `k` that `allowed` lists, warning about
+/// the rest.
+fn known_table(
+    k: &str,
+    v: toml::Value,
+    allowed: &[&str],
+    warnings: &mut Vec<String>,
+) -> std::result::Result<toml::Value, String> {
+    let toml::Value::Table(mut t) = v else {
+        return Err(format!("`{k}` must be a table ([{k}])"));
+    };
+    let unknown: Vec<String> = t
+        .keys()
+        .filter(|x| !allowed.contains(&x.as_str()))
+        .cloned()
+        .collect();
+    for u in unknown {
+        warnings.push(format!("unknown key `{u}` in [{k}], ignored"));
+        t.remove(&u);
+    }
+    Ok(toml::Value::Table(t))
+}
+
 /// Parse the config, returning it with warnings about unknown keys.
 pub fn parse(text: &str) -> std::result::Result<(Config, Vec<String>), String> {
     let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
     let mut warnings = Vec::new();
     let mut known = toml::Table::new();
     for (k, v) in table {
+        if let Some(allowed) = allowed_table_keys(&k) {
+            let t = known_table(&k, v, allowed, &mut warnings)?;
+            known.insert(k, t);
+            continue;
+        }
         let Some(allowed) = allowed_keys(&k) else {
             warnings.push(format!("unknown key `{k}`, ignored"));
             continue;
@@ -181,6 +228,49 @@ pub fn parse(text: &str) -> std::result::Result<(Config, Vec<String>), String> {
         ));
     }
     Ok((cfg, warnings))
+}
+
+/// The user-wide settings file: `$XDG_CONFIG_HOME/fast-worktree/config.toml`,
+/// else `~/.config/fast-worktree/config.toml` (on macOS too).
+pub fn user_config_path() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| util::home().join(".config"))
+        .join("fast-worktree/config.toml")
+}
+
+/// `[pool] size` from the user-wide settings file. Only `[pool]` is read
+/// there; anything else is warned about and ignored.
+pub fn user_pool_size() -> Result<Option<u32>> {
+    let path = user_config_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error(format!("{}: {e}", path.display()))),
+    };
+    let (size, warnings) =
+        parse_user(&text).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+    for w in warnings {
+        eprintln!("fast-worktree: {}: {w}", path.display());
+    }
+    Ok(size)
+}
+
+/// Parse the user-wide settings: the pool size, and warnings.
+pub fn parse_user(text: &str) -> std::result::Result<(Option<u32>, Vec<String>), String> {
+    let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
+    let mut warnings = Vec::new();
+    let mut size = None;
+    for (k, v) in table {
+        if k == "pool" {
+            let t = known_table(&k, v, &["size"], &mut warnings)?;
+            size = PoolConfig::deserialize(t).map_err(|e| e.to_string())?.size;
+        } else {
+            warnings.push(format!("unknown key `{k}`, ignored"));
+        }
+    }
+    Ok((size, warnings))
 }
 
 /// Run the hooks of `stage` in `worktree`. Prints a line per hook and lets
@@ -367,6 +457,26 @@ when = "never"
             "absent files are not equal"
         );
         assert!(!rule(&[]).inputs_unchanged(p));
+    }
+
+    #[test]
+    fn parses_the_pool_size() {
+        let (c, w) = parse("[pool]\nsize = 2\nlater = 1\n").unwrap();
+        assert_eq!(c.pool, Some(PoolConfig { size: Some(2) }));
+        assert_eq!(w, vec!["unknown key `later` in [pool], ignored"]);
+        assert_eq!(parse("").unwrap().0.pool, None);
+        assert!(parse("[pool]\nsize = -1\n").is_err());
+        assert!(parse("pool = 3\n").is_err());
+        assert!(parse("[[pool]]\nsize = 1\n").is_err());
+    }
+
+    #[test]
+    fn user_config_reads_only_the_pool() {
+        let (s, w) = parse_user("[pool]\nsize = 3\n[[post_add]]\nrun = \"x\"\n").unwrap();
+        assert_eq!(s, Some(3));
+        assert_eq!(w, vec!["unknown key `post_add`, ignored"]);
+        assert_eq!(parse_user("").unwrap().0, None);
+        assert!(parse_user("[pool]\nsize = \"two\"\n").is_err());
     }
 
     #[test]

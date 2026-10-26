@@ -10,6 +10,8 @@ mod git;
 mod hooks;
 mod include;
 mod paths;
+mod pending;
+mod pool;
 mod trash;
 mod util;
 
@@ -50,6 +52,9 @@ enum Cmd {
         changed: bool,
         /// Only these project directories
         projects: Vec<String>,
+        /// Run as the background install of `hook create`
+        #[arg(long, hide = true)]
+        deferred: bool,
     },
     /// List projects whose dependencies are missing (always exits 0)
     Check {
@@ -77,6 +82,43 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CacheCmd,
     },
+    /// Ready worktrees that `add` takes instead of creating one
+    Pool {
+        #[command(subcommand)]
+        cmd: PoolCmd,
+    },
+    /// Entry points for Claude Code's WorktreeCreate / WorktreeRemove hooks
+    Hook {
+        #[command(subcommand)]
+        cmd: HookCmd,
+    },
+    /// Wait for the background install that `hook create` started
+    Wait {
+        /// The worktree (default: the current one)
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PoolCmd {
+    /// List the spares: commit, how far behind origin, when made, misses
+    Status,
+    /// Make spares until the pool has its size
+    Fill,
+    /// Drop the spares behind origin's default branch and fill again
+    Refresh,
+    /// Remove every spare
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// WorktreeCreate: read {"name", "cwd"} on stdin, print the worktree path
+    Create,
+    /// WorktreeRemove: read {"worktree_path"} on stdin, delete the worktree
+    Remove,
+    /// Print the hooks to paste into a Claude Code settings file
+    PrintConfig,
 }
 
 #[derive(Subcommand)]
@@ -107,10 +149,12 @@ fn main() {
             root,
             changed,
             projects,
+            deferred,
         } => cmd::install::run(cmd::install::Opts {
             root,
             projects,
             changed,
+            deferred,
         }),
         Cmd::Check {
             quiet,
@@ -130,6 +174,18 @@ fn main() {
             CacheCmd::Ls => cmd::cache::ls(),
             CacheCmd::Prune { older_than } => cmd::cache::prune(older_than),
         }),
+        Cmd::Pool { cmd } => match cmd {
+            PoolCmd::Status => pool::status(),
+            PoolCmd::Fill => pool::fill(),
+            PoolCmd::Refresh => pool::refresh(),
+            PoolCmd::Clear => pool::clear(),
+        },
+        Cmd::Hook { cmd } => Ok(match cmd {
+            HookCmd::Create => cmd::hook::create(),
+            HookCmd::Remove => cmd::hook::remove(),
+            HookCmd::PrintConfig => cmd::hook::print_config(),
+        }),
+        Cmd::Wait { path } => cmd::hook::wait(path.as_deref()),
     };
     let code = match result {
         Ok(c) => c,

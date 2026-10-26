@@ -86,6 +86,33 @@ impl Ecosystem for Npm {
     fn install(&self, ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
         install(ctx, dir, mode)
     }
+
+    fn rerun_own_scripts(
+        &self,
+        root: &Path,
+        dir: &str,
+        rules: &[SkipLifecycle],
+    ) -> Result<Vec<String>, String> {
+        let project = super::project_path(root, dir);
+        if !project.join("node_modules").is_dir() {
+            return Ok(Vec::new());
+        }
+        match run_own_lifecycle(&project, dir, rules) {
+            Ok((mut notes, ran)) => {
+                if !ran.is_empty() {
+                    notes.push(format!(
+                        "rerun  {dir}: {} (its files changed)",
+                        ran.join(", ")
+                    ));
+                }
+                Ok(notes)
+            }
+            Err(e) => {
+                discard(&project.join("node_modules"));
+                Err(e)
+            }
+        }
+    }
 }
 
 /// The cache key of a lockfile under a Node version.
@@ -195,20 +222,17 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
     let node_modules = target.join("node_modules");
     let mut lines = Vec::new();
     let mut present = node_modules.symlink_metadata().is_ok();
-    if present && mode != Mode::Changed {
+    if present && !mode.reinstalls_changed() {
         if Npm.is_installed(&target) {
-            return Ok(Report::done(format!(
+            return Ok(Report::kept(format!(
                 "skip   {dir} (node_modules already present)"
             )));
         }
         // Left by an install that did not finish, or made by hand: npm
         // writes `.package-lock.json` last.
         let note = format!("note   {dir}: node_modules has no .package-lock.json");
-        if mode == Mode::CloneOnly {
-            return Ok(Report {
-                lines: note,
-                missing: true,
-            });
+        if mode.clone_only() {
+            return Ok(Report::missing(note));
         }
         trash::trash(&node_modules).map_err(|e| format!("cannot move node_modules away: {e}"))?;
         lines.push(format!("{note}, installing again"));
@@ -216,25 +240,25 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
     }
     let lockfile = fs::read(target.join(LOCKFILE)).map_err(|e| format!("{LOCKFILE}: {e}"))?;
     if !has_dependencies(&lockfile) {
-        return Ok(Report::done(format!("skip   {dir} (no dependencies)")));
+        return Ok(Report::kept(format!("skip   {dir} (no dependencies)")));
     }
-    if mode == Mode::CloneOnly && !clone::SUPPORTED {
-        return Ok(Report {
-            lines: String::new(),
-            missing: true,
-        });
+    if mode.clone_only() && !clone::SUPPORTED && !present {
+        return Ok(Report::missing(""));
     }
     let nodev = node_version(&target)?;
     let key = cache_key(&lockfile, &nodev);
     if present {
         if is_current(&target, &lockfile, &key) {
             write_key(&target, &key);
-            return Ok(Report::done(format!("skip   {dir} (up to date)")));
+            return Ok(Report::kept(format!("skip   {dir} (up to date)")));
         }
         trash::trash(&node_modules).map_err(|e| format!("cannot move node_modules away: {e}"))?;
         lines.push(format!(
             "note   {dir}: lockfile or Node version changed, installing again"
         ));
+        if mode.clone_only() && !clone::SUPPORTED {
+            return Ok(Report::missing(lines.join("\n")));
+        }
     }
     let project_cache = ctx.cache_repo.join(project_slug(dir));
     let entry = project_cache.join(&key);
@@ -285,11 +309,8 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
         }
     }
 
-    if mode == Mode::CloneOnly {
-        return Ok(Report {
-            lines: lines.join("\n"),
-            missing: true,
-        });
+    if mode.clone_only() {
+        return Ok(Report::missing(lines.join("\n")));
     }
 
     if clone::SUPPORTED {
@@ -384,7 +405,7 @@ fn discard(node_modules: &Path) {
 /// The project's own lifecycle, then the key. A failure discards the clone.
 fn after_clone(ctx: &Ctx, target: &Path, dir: &str, key: &str) -> Result<Vec<String>, String> {
     match run_own_lifecycle(target, dir, &ctx.skip_lifecycle) {
-        Ok(notes) => {
+        Ok((notes, _)) => {
             write_key(target, key);
             Ok(notes)
         }
@@ -464,16 +485,17 @@ pub fn own_lifecycle_scripts(package_json: &[u8]) -> Vec<&'static str> {
 }
 
 /// Run the project's own lifecycle scripts, except those a rule skips.
-/// Returns a note per skipped script.
+/// Returns a note per skipped script, and the scripts that ran.
 fn run_own_lifecycle(
     project: &Path,
     dir: &str,
     rules: &[SkipLifecycle],
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Vec<&'static str>), String> {
     let Ok(pkg) = fs::read(project.join("package.json")) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     let mut notes = Vec::new();
+    let mut ran = Vec::new();
     for script in own_lifecycle_scripts(&pkg) {
         if rules
             .iter()
@@ -496,8 +518,9 @@ fn run_own_lifecycle(
                 util::tail(&String::from_utf8_lossy(&out.stderr), 30)
             ));
         }
+        ran.push(script);
     }
-    Ok(notes)
+    Ok((notes, ran))
 }
 
 /// `npm ci`. Its output is shown only when it fails.
@@ -587,7 +610,8 @@ mod tests {
             if_equal: vec![["in".into(), "out".into()]],
         };
         // No npm is spawned: the only script is skipped.
-        let notes = run_own_lifecycle(p, "app", std::slice::from_ref(&rule)).unwrap();
+        let (notes, ran) = run_own_lifecycle(p, "app", std::slice::from_ref(&rule)).unwrap();
+        assert!(ran.is_empty());
         assert_eq!(
             notes,
             vec!["note   app: postinstall skipped, inputs unchanged"]

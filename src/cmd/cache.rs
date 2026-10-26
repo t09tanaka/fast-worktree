@@ -52,7 +52,7 @@ fn count(n: usize) -> String {
 }
 
 /// Left-aligned columns separated by two spaces.
-fn table<const N: usize>(head: &[&str; N], rows: &[[String; N]]) -> String {
+pub fn table<const N: usize>(head: &[&str; N], rows: &[[String; N]]) -> String {
     let mut width = head.map(str::len);
     for r in rows {
         for (w, c) in width.iter_mut().zip(r) {
