@@ -2605,6 +2605,58 @@ fn fetches_never_wait_for_an_ssh_prompt() {
 }
 
 #[test]
+fn add_stops_a_fetch_that_hangs_and_starts_from_origin_as_last_fetched() {
+    let w = World::new();
+    let main = w.main();
+    let log = w.base.join("ssh.log");
+    // An ssh that never answers (for longer than the test waits).
+    write_exe(
+        &w.base.join("bin/ssh"),
+        &format!(
+            "#!/bin/sh\necho \"$* prompt=$GIT_TERMINAL_PROMPT\" >> '{}'\nsleep 20\nexit 255\n",
+            log.display()
+        ),
+    );
+    w.git(
+        &main,
+        &["remote", "set-url", "origin", "ssh://example.invalid/x.git"],
+    );
+    let start = std::time::Instant::now();
+    let r = w.fw(&main, &["add", "../wt", "-b", "x", "--fetch-timeout", "1"]);
+    r.assert_ok();
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(15),
+        "waited for the fetch: {:?}",
+        start.elapsed()
+    );
+    assert!(
+        r.err()
+            .contains("took longer than 1s; starting from origin/trunk as last fetched"),
+        "{}",
+        r.err()
+    );
+    let l = fs::read_to_string(&log).unwrap_or_default();
+    assert!(l.contains("-o BatchMode=yes"), "{l}");
+    assert!(l.contains("prompt=0"), "{l}");
+    assert_eq!(
+        w.git(&w.base.join("wt"), &["rev-parse", "HEAD"]),
+        w.git(&main, &["rev-parse", "origin/trunk"])
+    );
+
+    // Nothing fetched before either: nothing to start from.
+    w.git(&main, &["update-ref", "-d", "refs/remotes/origin/trunk"]);
+    let r = w.fw(&main, &["add", "../wt2", "-b", "y", "--fetch-timeout", "1"]);
+    r.assert_fails();
+    assert!(
+        r.err()
+            .contains("and there is no origin/trunk to start from"),
+        "{}",
+        r.err()
+    );
+    assert!(!w.base.join("wt2").exists());
+}
+
+#[test]
 fn a_spare_is_checked_for_absolute_symlinks_and_its_scripts_run_again_after_the_move() {
     let w = World::new();
     let main = w.main();

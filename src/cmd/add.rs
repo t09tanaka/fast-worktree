@@ -3,29 +3,25 @@
 
 use super::install;
 use crate::ecosystem::{self, dart, Mode, Project};
-use crate::error::Result;
+use crate::error::{bail, Result};
 use crate::hooks::Config;
 use crate::{git, include, paths, pending, pool, trash, util};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub struct Opts {
     pub path: PathBuf,
     pub branch: String,
     pub start_point: Option<String>,
+    /// How long the fetch of origin's default branch may take.
+    pub fetch_limit: Duration,
 }
 
 pub fn run(opts: Opts) -> Result<i32> {
     let here = Path::new(".");
     let start = match opts.start_point {
         Some(s) => s,
-        None => {
-            // Start from the remote's default branch as it is now, not from
-            // whatever local branch happens to be checked out.
-            let base = git::origin_default_branch(here)?;
-            git::run(here, &["fetch", "-q", "origin", &base])?;
-            format!("origin/{base}")
-        }
+        None => fetched_start(here, opts.fetch_limit)?,
     };
     let branch = Branch::New {
         name: opts.branch,
@@ -33,6 +29,27 @@ pub fn run(opts: Opts) -> Result<i32> {
     };
     let ok = create(here, &opts.path, &branch, false)?;
     Ok(if ok { 0 } else { 1 })
+}
+
+/// Where a new branch starts without `<start-point>`: the remote's default
+/// branch as it is now, not whatever local branch happens to be checked
+/// out. The fetch never prompts and is stopped after `limit`, as in `hook
+/// create` and `pool fill`; when it fails, the branch starts from
+/// `origin/<default>` as last fetched, and only when there is none is that
+/// an error.
+fn fetched_start(here: &Path, limit: Duration) -> Result<String> {
+    let base = git::origin_default_branch(here)?;
+    let start = format!("origin/{base}");
+    if let Err(e) = git::fetch_quietly(here, &base, Some(limit)) {
+        let r = format!("refs/remotes/{start}");
+        if !git::succeeds(here, &["rev-parse", "--verify", "--quiet", &r]) {
+            bail!("{e}, and there is no {start} to start from");
+        }
+        util::warn(&format!(
+            "fast-worktree: {e}; starting from {start} as last fetched\n"
+        ));
+    }
+    Ok(start)
 }
 
 /// The branch the new worktree is on.

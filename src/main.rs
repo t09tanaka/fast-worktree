@@ -41,6 +41,15 @@ enum Cmd {
         branch: String,
         /// Commit to start from (default: origin's default branch, fetched)
         start_point: Option<String>,
+        /// Seconds the fetch of origin's default branch may take; after
+        /// that, or when it fails, the branch starts from it as last fetched
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 30,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        fetch_timeout: u64,
     },
     /// Install dependencies into an existing worktree
     Install {
@@ -163,10 +172,12 @@ fn main() {
             path,
             branch,
             start_point,
+            fetch_timeout,
         } => cmd::add::run(cmd::add::Opts {
             path,
             branch,
             start_point,
+            fetch_limit: std::time::Duration::from_secs(fetch_timeout),
         }),
         Cmd::Install {
             root,
