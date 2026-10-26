@@ -37,6 +37,29 @@ change bumps the minor version).
   version changed since the last install (recorded in
   `node_modules/.fast-worktree-key` and `.dart_tool/fast-worktree-key`).
 - `cache ls` and `cache prune [--older-than <days>]`.
+- A pool of ready worktrees, off unless `[pool] size` is set in the main
+  checkout's `.fast-worktree.toml` or in
+  `$XDG_CONFIG_HOME/fast-worktree/config.toml` (default
+  `~/.config/fast-worktree/config.toml`). Spares are made under
+  `<cache>/<repo>/pool` with `git worktree add --detach` of origin's default
+  branch, `install` and `git worktree lock`. `add` takes one by renaming
+  it, moves it into place with `git worktree move`, switches to the new
+  branch, installs only the projects whose lockfile changed, runs a
+  project's own install scripts again where its tracked files changed, and
+  starts `pool fill` in the background. Without a spare, or when the move
+  fails, `add` creates the worktree as before and counts a miss.
+- `pool status`, `pool fill`, `pool refresh` and `pool clear`.
+- `hook create` and `hook remove` for Claude Code's `WorktreeCreate` and
+  `WorktreeRemove` hooks, and `hook print-config` to print them for a
+  settings file. `hook create` makes `<main>/.claude/worktrees/<name>` on
+  branch `worktree-<name>` from origin's default branch, prints only the
+  path on stdout, installs what can be cloned and leaves the rest to a
+  background `install --changed`; it fails only when git does. `hook
+  remove` deletes the worktree even with changes (kept in the trash for at
+  least 24 hours, with the command to restore them) and deletes
+  `worktree-<name>` only when its commit is on another ref.
+- `wait [<path>]`: wait for the background install of `hook create`;
+  `check` says when one is running.
 
 ### Changed
 
@@ -44,6 +67,8 @@ change bumps the minor version).
   marked with `<entry>.ok`; clones from the cache no longer walk the tree.
   An install result with an absolute symlink is not cached.
 - `check` names the ecosystem: `missing deps: api (npm)`.
+- `remove` points to `pool clear` when asked to remove a spare.
+- `cache ls` and `cache prune` leave the pool's spares alone.
 
 ### Fixed
 

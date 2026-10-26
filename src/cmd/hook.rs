@@ -290,15 +290,15 @@ fn remove_worktree() -> Result<()> {
             .unwrap_or_else(|| "HEAD".into());
         eprintln!(
             "fast-worktree: it had uncommitted changes; they are kept in {} for at least 24 hours",
-            dest.display()
+            util::tilde(&dest)
         );
         eprintln!(
             "to restore them: git -C {} worktree add {} {} && rsync -a --exclude=.git {}/ {}/",
-            sh(&main),
-            sh(&path),
+            sh_path(&main),
+            sh_path(&path),
             sh(&from),
-            sh(&dest),
-            sh(&path)
+            sh_path(&dest),
+            sh_path(&path)
         );
     } else if let Some(h) = &head {
         if me.branch.is_none() && !on_any_ref(&main, h) {
@@ -386,7 +386,7 @@ fn sh(p: impl AsRef<std::ffi::OsStr>) -> String {
     let s = p.as_ref().to_string_lossy();
     if !s.is_empty()
         && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "/._-+@:~".contains(c))
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+@:".contains(c))
     {
         s.into_owned()
     } else {
@@ -394,22 +394,33 @@ fn sh(p: impl AsRef<std::ffi::OsStr>) -> String {
     }
 }
 
-/// The hooks to paste into a Claude Code settings file.
-pub fn config_json() -> String {
-    let entry =
-        |cmd: &str| serde_json::json!([{ "hooks": [{ "type": "command", "command": cmd }] }]);
-    let v = serde_json::json!({
-        "hooks": {
-            "WorktreeCreate": entry("fast-worktree hook create"),
-            "WorktreeRemove": entry("fast-worktree hook remove"),
+/// [`sh`] with the home directory written as `~/`, outside the quotes so
+/// that the shell still expands it.
+fn sh_path(p: &Path) -> String {
+    let home = util::home();
+    match p.strip_prefix(&home) {
+        Ok(rest) if home != Path::new("/") && !rest.as_os_str().is_empty() => {
+            format!("~/{}", sh(rest))
         }
-    });
-    serde_json::to_string_pretty(&v).unwrap_or_default()
+        _ => sh(p),
+    }
 }
+
+/// The hooks to paste into a Claude Code settings file.
+pub const CONFIG_JSON: &str = r#"{
+  "hooks": {
+    "WorktreeCreate": [
+      { "hooks": [{ "type": "command", "command": "fast-worktree hook create" }] }
+    ],
+    "WorktreeRemove": [
+      { "hooks": [{ "type": "command", "command": "fast-worktree hook remove" }] }
+    ]
+  }
+}"#;
 
 /// `hook print-config`.
 pub fn print_config() -> i32 {
-    println!("{}", config_json());
+    println!("{CONFIG_JSON}");
     0
 }
 
@@ -486,11 +497,21 @@ mod tests {
         assert_eq!(sh("/a/b-c_d.e"), "/a/b-c_d.e");
         assert_eq!(sh("/a b"), "'/a b'");
         assert_eq!(sh("it's"), "'it'\\''s'");
+        assert_eq!(sh("~x"), "'~x'");
+        let home = util::home();
+        if home != Path::new("/") {
+            assert_eq!(sh_path(&home.join("a b")), "~/'a b'");
+            assert_eq!(sh_path(&home.join("a/b")), "~/a/b");
+        }
+        assert_eq!(
+            sh_path(Path::new("/nonexistent-root/x")),
+            "/nonexistent-root/x"
+        );
     }
 
     #[test]
     fn the_config_has_both_events() {
-        let v: Value = serde_json::from_str(&config_json()).unwrap();
+        let v: Value = serde_json::from_str(CONFIG_JSON).unwrap();
         assert_eq!(
             v["hooks"]["WorktreeCreate"][0]["hooks"][0]["command"],
             "fast-worktree hook create"
