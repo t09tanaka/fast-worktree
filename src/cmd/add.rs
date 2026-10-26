@@ -5,6 +5,7 @@ use super::install;
 use crate::ecosystem::{self, dart, Mode, Project};
 use crate::error::{bail, Result};
 use crate::hooks::Config;
+use crate::util::{errln, outln};
 use crate::{git, include, paths, pending, pool, trash, util};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -100,15 +101,15 @@ pub fn create(here: &Path, path: &Path, branch: &Branch, defer: bool) -> Result<
             }
             return Err(e);
         }
-        println!("worktree added in {}", util::elapsed(start));
+        outln!("worktree added in {}", util::elapsed(start));
     } else {
-        println!("worktree from the pool in {}", util::elapsed(start));
+        outln!("worktree from the pool in {}", util::elapsed(start));
     }
     let root = path.canonicalize()?;
     let ok = match prepare(&root, spare.as_ref(), defer) {
         Ok(ok) => ok,
         Err(e) => {
-            eprintln!("fast-worktree: {e}");
+            errln!("fast-worktree: {e}");
             false
         }
     };
@@ -128,7 +129,7 @@ struct Spare {
 /// `branch`; `None` when the worktree is still to be made.
 fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<Spare> {
     if path.symlink_metadata().is_ok() {
-        println!(
+        outln!(
             "note   pool: {} exists, so no spare is moved there",
             path.display()
         );
@@ -138,11 +139,11 @@ fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<Spare> {
         pool::Taken::Spare { made_at } => made_at,
         pool::Taken::Empty => {
             pool::record_miss(main);
-            println!("note   pool: no spare ready, creating the worktree");
+            outln!("note   pool: no spare ready, creating the worktree");
             return None;
         }
         pool::Taken::Failed(why) => {
-            println!("note   pool: a spare could not be moved ({why}), creating the worktree");
+            outln!("note   pool: a spare could not be moved ({why}), creating the worktree");
             return None;
         }
     };
@@ -162,11 +163,11 @@ fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<Spare> {
         return Some(Spare { made_at });
     }
     // The worktree is gone again; `create` makes it the usual way.
-    println!("note   pool: git switch failed in the spare, creating the worktree");
+    outln!("note   pool: git switch failed in the spare, creating the worktree");
     let admin = git::admin_dir(path);
     if trash::trash(path).is_ok() {
         if let Err(e) = admin.and_then(|a| git::unregister(&a)) {
-            println!("note   pool: {e}");
+            outln!("note   pool: {e}");
         }
     }
     None
@@ -198,11 +199,11 @@ fn prepare(root: &Path, spare: Option<&Spare>, defer: bool) -> Result<bool> {
         // The background install runs the post_add hooks when it is done.
         return match pending::spawn(root, &dirs) {
             Ok(()) => {
-                println!("later  started; `fast-worktree wait` waits for it");
+                outln!("later  started; `fast-worktree wait` waits for it");
                 Ok(done.ok)
             }
             Err(e) => {
-                eprintln!("fast-worktree: cannot start the background install: {e}");
+                errln!("fast-worktree: cannot start the background install: {e}");
                 Ok(false)
             }
         };
@@ -221,7 +222,7 @@ fn rewrite_moved(root: &Path, made_at: &[PathBuf]) {
         let project = ecosystem::project_path(root, &p.dir);
         let n = dart::rewrite_moved_paths(&project, made_at, root);
         if n > 0 {
-            println!(
+            outln!(
                 "paths  {}: {n} generated file(s) pointed to where the spare was made, rewritten",
                 p.dir
             );
@@ -237,7 +238,7 @@ fn rerun_moved(root: &Path, kept: &[Project], cfg: &Config) -> Vec<Project> {
     let cache_repo = match install::main_checkout(root) {
         Ok(main) => paths::cache_root().join(paths::repo_key(&main)),
         Err(e) => {
-            println!("note   {e}");
+            outln!("note   {e}");
             return kept.to_vec();
         }
     };
@@ -249,7 +250,7 @@ fn rerun_moved(root: &Path, kept: &[Project], cfg: &Config) -> Vec<Project> {
         {
             Ok(notes) => {
                 for n in notes {
-                    println!("{n}");
+                    outln!("{n}");
                 }
             }
             Err(log) => {
@@ -267,19 +268,19 @@ fn copy_included(root: &Path) {
     let main = match install::main_checkout(root) {
         Ok(m) => m,
         Err(e) => {
-            println!("note   {}: {e}", include::FILE);
+            outln!("note   {}: {e}", include::FILE);
             return;
         }
     };
     match include::copy(&main, root) {
         Ok(c) => {
             for p in c.copied {
-                println!("copy   {p}");
+                outln!("copy   {p}");
             }
             for p in c.kept {
-                println!("keep   {p} (already in the worktree)");
+                outln!("keep   {p} (already in the worktree)");
             }
         }
-        Err(e) => println!("note   {e}"),
+        Err(e) => outln!("note   {e}"),
     }
 }

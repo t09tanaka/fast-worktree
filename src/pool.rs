@@ -40,6 +40,7 @@ use crate::cmd::install;
 use crate::ecosystem::{self, Mode};
 use crate::error::{bail, Error, Result};
 use crate::hooks::{self, Config};
+use crate::util::{errln, out, outln};
 use crate::{cache, clone, git, paths, pending, trash, util};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -109,7 +110,7 @@ impl Source {
 /// that cannot be read is reported and counts as unset.
 pub fn size(main: &Path) -> (u32, Source) {
     let repo = Config::load(main)
-        .map_err(|e| eprintln!("fast-worktree: {e}"))
+        .map_err(|e| errln!("fast-worktree: {e}"))
         .ok()
         .and_then(|c| c.pool)
         .and_then(|p| p.size);
@@ -120,7 +121,7 @@ pub fn size(main: &Path) -> (u32, Source) {
         Ok(Some(n)) => (n, Source::User),
         Ok(None) => (0, Source::Default),
         Err(e) => {
-            eprintln!("fast-worktree: {e}");
+            errln!("fast-worktree: {e}");
             (0, Source::Default)
         }
     }
@@ -289,7 +290,7 @@ pub fn misses(pool: &Path) -> usize {
 pub fn spawn_fill(main: &Path, after: Option<&Path>) {
     let pool = dir(main);
     if let Err(e) = try_spawn_fill(main, &pool, after) {
-        println!("note   pool: cannot start `pool fill`: {e}");
+        outln!("note   pool: cannot start `pool fill`: {e}");
     }
 }
 
@@ -360,7 +361,7 @@ fn stamp() -> String {
 fn fetched_base(main: &Path) -> Result<String> {
     let base = git::origin_default_branch(main)?;
     if let Err(e) = git::fetch_quietly(main, &base, Some(FETCH_LIMIT)) {
-        println!("note   pool: fetch failed, using origin/{base} as last fetched: {e}");
+        outln!("note   pool: fetch failed, using origin/{base} as last fetched: {e}");
     }
     Ok(format!("origin/{base}"))
 }
@@ -372,18 +373,18 @@ pub fn fill(after: Option<&Path>) -> Result<i32> {
     let main = main_here()?;
     let (size, _) = size(&main);
     if size == 0 {
-        println!("the pool is off: set [pool] size in {}", hooks::FILE);
+        outln!("the pool is off: set [pool] size in {}", hooks::FILE);
         return Ok(0);
     }
     let pool = dir(&main);
     let Some(_lock) = try_lock(&pool)? else {
-        println!("{} fill  another fill is running", stamp());
+        outln!("{} fill  another fill is running", stamp());
         return Ok(0);
     };
     if let Some(a) = after {
         wait_for_install(a);
     }
-    println!("{} fill  started", stamp());
+    outln!("{} fill  started", stamp());
     let base = fetched_base(&main)?;
     fill_locked(&main, &pool, size, &base)
 }
@@ -394,7 +395,7 @@ fn wait_for_install(root: &Path) {
     if pending::state(root) != pending::State::Running {
         return;
     }
-    println!(
+    outln!(
         "{} fill  waiting for the background install in {}",
         stamp(),
         util::tilde(root)
@@ -402,7 +403,7 @@ fn wait_for_install(root: &Path) {
     let start = Instant::now();
     while pending::state(root) == pending::State::Running {
         if start.elapsed() > AFTER_LIMIT {
-            println!(
+            outln!(
                 "{} fill  still running after {}, filling anyway",
                 stamp(),
                 util::elapsed(start)
@@ -416,11 +417,11 @@ fn wait_for_install(root: &Path) {
 fn fill_locked(main: &Path, pool: &Path, size: u32, base: &str) -> Result<i32> {
     while spares(pool).len() < size as usize {
         if let Err(e) = make_spare(main, pool, base) {
-            println!("{} fill  failed: {e}", stamp());
+            outln!("{} fill  failed: {e}", stamp());
             return Ok(1);
         }
     }
-    println!(
+    outln!(
         "{} fill  done: {} of {size} ready",
         stamp(),
         spares(pool).len()
@@ -472,7 +473,7 @@ fn make_spare(main: &Path, pool: &Path, base: &str) -> Result<()> {
     fs::rename(&building, &ready)?;
     git::output(main, &["worktree", "repair", &ready.to_string_lossy()])?;
     let short = git::output(&ready, &["rev-parse", "--short", "HEAD"])?;
-    println!(
+    outln!(
         "{} spare {id} at {} ready ({})",
         stamp(),
         short.trim(),
@@ -489,7 +490,7 @@ fn drop_absolute_symlinks(root: &Path) {
         let nm = ecosystem::project_path(root, &p.dir).join("node_modules");
         if nm.is_dir() && clone::has_absolute_symlink(&nm) {
             let _ = trash::trash(&nm);
-            println!(
+            outln!(
                 "{} note  {}: absolute symlink in node_modules, not kept in the spare",
                 stamp(),
                 p.dir
@@ -511,7 +512,7 @@ fn discard(main: &Path, path: &Path) {
     }
     match admin.map(|a| git::unregister(&a)) {
         Some(Ok(())) => {}
-        Some(Err(e)) => println!("note   pool: {e}"),
+        Some(Err(e)) => outln!("note   pool: {e}"),
         // A spare whose `git worktree add` never finished has no entry.
         None => {}
     }
@@ -549,9 +550,9 @@ pub fn status() -> Result<i32> {
     let pool = dir(&main);
     let ready = spares(&pool);
     if size == 0 {
-        println!("pool   off (size {})", source.describe());
+        outln!("pool   off (size {})", source.describe());
     } else {
-        println!(
+        outln!(
             "pool   {} of {size} ready (size from {})",
             ready.len(),
             source.describe()
@@ -583,15 +584,15 @@ pub fn status() -> Result<i32> {
             Some(b) => format!("BEHIND {b}"),
             None => "BEHIND".to_string(),
         };
-        print!(
+        out!(
             "{}",
             crate::cmd::cache::table(&["ID", "COMMIT", &behind_head, "CREATED"], &rows)
         );
     }
     let fill_running = matches!(try_lock(&pool), Ok(None));
-    println!("misses {} (an add found no spare ready)", misses(&pool));
+    outln!("misses {} (an add found no spare ready)", misses(&pool));
     if fill_running {
-        println!(
+        outln!(
             "fill   running (log: {})",
             util::tilde(&pool.join(FILL_LOG))
         );
@@ -616,13 +617,13 @@ pub fn refresh() -> Result<i32> {
             None => true,
         };
         if stale && claim_and_discard(&main, &pool, &s) {
-            println!("drop   {} (behind {base})", s.id);
+            outln!("drop   {} (behind {base})", s.id);
             discarded += 1;
         }
     }
-    println!("dropped {discarded} spare(s) behind {base}");
+    outln!("dropped {discarded} spare(s) behind {base}");
     if size == 0 {
-        println!("the pool is off: set [pool] size in {}", hooks::FILE);
+        outln!("the pool is off: set [pool] size in {}", hooks::FILE);
         return Ok(0);
     }
     fill_locked(&main, &pool, size, &base)
@@ -660,9 +661,9 @@ pub fn clear() -> Result<i32> {
             }
         }
     }
-    println!("removed {n} spare(s) (deleting in background)");
+    outln!("removed {n} spare(s) (deleting in background)");
     if matches!(try_lock(&pool), Ok(None)) {
-        println!("note   a fill is running and may add spares again");
+        outln!("note   a fill is running and may add spares again");
     }
     Ok(0)
 }

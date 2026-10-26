@@ -17,6 +17,7 @@
 //! with everything it started ([`stop`]).
 
 use crate::error::Result;
+use crate::util::{errln, outln};
 use std::fs;
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -230,7 +231,7 @@ pub fn run_deferred(root: &Path, f: impl FnOnce() -> Result<i32>) -> i32 {
     let code = match f() {
         Ok(c) => c,
         Err(e) => {
-            println!("fast-worktree: {e}");
+            outln!("fast-worktree: {e}");
             1
         }
     };
@@ -316,8 +317,8 @@ pub fn stop(root: &Path, grace: Duration) -> Stop {
 pub fn report_stop(s: &Stop) {
     match s {
         Stop::NotRunning => {}
-        Stop::Stopped => eprintln!("fast-worktree: stopped the background install"),
-        Stop::Unknown(why) => eprintln!("fast-worktree: warning: {why}"),
+        Stop::Stopped => errln!("fast-worktree: stopped the background install"),
+        Stop::Unknown(why) => errln!("fast-worktree: warning: {why}"),
     }
 }
 

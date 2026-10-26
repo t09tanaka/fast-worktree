@@ -11,6 +11,7 @@
 
 use crate::error::{bail, Error, Result};
 use crate::hooks::{self, Stage};
+use crate::util::{errln, outln};
 use crate::{git, pending, pool, trash, util};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -166,7 +167,7 @@ pub fn run(opts: Opts) -> Result<i32> {
     pending::report_stop(&pending::stop(&path, pending::STOP_GRACE));
     let failed = hooks::run(&cfg, Stage::PreRemove, &path, &main);
     if failed > 0 {
-        eprintln!("fast-worktree: {failed} pre_remove hook(s) failed; removing anyway");
+        errln!("fast-worktree: {failed} pre_remove hook(s) failed; removing anyway");
     }
 
     if std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
@@ -182,13 +183,13 @@ pub fn run(opts: Opts) -> Result<i32> {
         ),
     };
     let registered = git::unregister(&admin);
-    println!(
+    outln!(
         "removed {} (moved to {}, deleting in background)",
         util::tilde(&path),
         util::tilde(&dest)
     );
     if let Err(e) = registered {
-        eprintln!(
+        errln!(
             "fast-worktree: the worktree is gone but git still lists it ({e}); \
              `git worktree prune` removes the entry"
         );
@@ -204,16 +205,16 @@ pub fn run(opts: Opts) -> Result<i32> {
 /// `git branch -d`: a branch with commits that are not merged is kept.
 fn delete_branch(main: &Path, branch: Option<&str>) -> i32 {
     let Some(b) = branch else {
-        eprintln!("fast-worktree: the worktree had a detached HEAD; no branch to delete");
+        errln!("fast-worktree: the worktree had a detached HEAD; no branch to delete");
         return 0;
     };
     match git::output(main, &["branch", "-d", b]) {
         Ok(_) => {
-            println!("deleted branch {b}");
+            outln!("deleted branch {b}");
             0
         }
         Err(e) => {
-            eprintln!("fast-worktree: kept branch {b}: {e}");
+            errln!("fast-worktree: kept branch {b}: {e}");
             1
         }
     }

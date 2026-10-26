@@ -774,6 +774,57 @@ fn check_exits_0_when_its_stdout_is_closed() {
     }
 }
 
+/// Run `fast-worktree` with stdout, and with `close_stderr` stderr too, a
+/// pipe whose reader is gone: what `fast-worktree pool status | head -1`
+/// does once `head` has its line.
+fn fw_closed(w: &World, dir: &Path, args: &[&str], close_stderr: bool) -> Output {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_fast-worktree"));
+    w.env(&mut c);
+    c.args(args).current_dir(dir);
+    if close_stderr {
+        c.stderr(writer.try_clone().unwrap());
+    } else {
+        c.stderr(std::process::Stdio::piped());
+    }
+    c.stdout(writer)
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap()
+}
+
+#[test]
+fn commands_do_not_panic_when_their_output_is_closed() {
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(1);
+    // A spare and a cache entry, and no refill running in the background.
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    for args in [
+        vec!["pool", "status"],
+        vec!["cache", "ls"],
+        vec!["kept", "ls"],
+        vec!["hook", "print-config"],
+        vec!["wait"],
+        vec!["cache", "prune"],
+        vec!["kept", "prune"],
+    ] {
+        let out = fw_closed(&w, &main, &args, false);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!err.contains("panicked"), "{args:?}: {err}");
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {err}");
+    }
+    // An error on a closed stderr is an exit code, not a panic (101).
+    let out = fw_closed(&w, &main, &["remove", "../no-such-worktree"], true);
+    assert_eq!(out.status.code(), Some(1));
+    let out = fw_closed(&w, &main, &["pool", "clear"], true);
+    assert_eq!(out.status.code(), Some(0));
+    let r = w.fw(&main, &["pool", "status"]);
+    assert!(r.out().starts_with("pool   0 of 1 ready"), "{}", r.out());
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;

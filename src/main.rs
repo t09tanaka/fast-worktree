@@ -16,6 +16,7 @@ mod submodules;
 mod trash;
 mod util;
 
+use crate::util::errln;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -228,7 +229,7 @@ fn main() {
     let code = match result {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("fast-worktree: {e}");
+            errln!("fast-worktree: {e}");
             1
         }
     };

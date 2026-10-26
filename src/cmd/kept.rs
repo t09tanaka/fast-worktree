@@ -10,6 +10,7 @@
 use super::cache::table;
 use crate::error::Result;
 use crate::git;
+use crate::util::{errln, out, outln};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -219,7 +220,7 @@ fn count(n: usize) -> String {
 pub fn ls() -> Result<i32> {
     let refs = kept_refs()?;
     if refs.is_empty() {
-        println!("no refs under {KEPT_REFS}");
+        outln!("no refs under {KEPT_REFS}");
         return Ok(0);
     }
     let now = now_secs();
@@ -240,8 +241,8 @@ pub fn ls() -> Result<i32> {
             [r.clone(), o[..o.len().min(12)].to_string(), when]
         })
         .collect();
-    print!("{}", table(&["REF", "COMMIT", "KEPT (UTC)"], &rows));
-    println!(
+    out!("{}", table(&["REF", "COMMIT", "KEPT (UTC)"], &rows));
+    outln!(
         "{}; `git push --mirror` pushes them too. `fast-worktree kept prune` drops those older than {PRUNE_DAYS} days",
         count(refs.len())
     );
@@ -264,16 +265,16 @@ pub fn prune(older_than_days: Option<u64>) -> Result<i32> {
         }
         match git::output(Path::new("."), &["update-ref", "-d", &r, &o]) {
             Ok(_) => {
-                println!("pruned {r}");
+                outln!("pruned {r}");
                 pruned += 1;
             }
             Err(e) => {
-                eprintln!("fast-worktree: {e}");
+                errln!("fast-worktree: {e}");
                 failed += 1;
             }
         }
     }
-    println!("pruned {} kept for {days} days or more", count(pruned));
+    outln!("pruned {} kept for {days} days or more", count(pruned));
     Ok(i32::from(failed > 0))
 }
 

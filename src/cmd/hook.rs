@@ -25,6 +25,7 @@
 use super::{add, install, kept, remove};
 use crate::error::{bail, Error, Result};
 use crate::hooks::{self, Config, Stage};
+use crate::util::{errln, outln};
 use crate::{git, pending, pool, submodules, trash, util};
 use serde_json::Value;
 use std::fs::File;
@@ -82,7 +83,7 @@ pub fn create() -> i32 {
     let mut out = match stdout_to_stderr() {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("fast-worktree: {e}");
+            errln!("fast-worktree: {e}");
             return 1;
         }
     };
@@ -95,7 +96,7 @@ pub fn create() -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("fast-worktree: {e}");
+            errln!("fast-worktree: {e}");
             1
         }
     }
@@ -131,7 +132,7 @@ fn create_worktree() -> Result<PathBuf> {
     if path.symlink_metadata().is_ok() {
         // `claude --worktree <name>` with a name in use opens that worktree.
         if is_linked_worktree(&main, &path) {
-            eprintln!("fast-worktree: {} exists, using it", util::tilde(&path));
+            errln!("fast-worktree: {} exists, using it", util::tilde(&path));
             return Ok(path);
         }
         bail!(
@@ -142,7 +143,7 @@ fn create_worktree() -> Result<PathBuf> {
     std::fs::create_dir_all(&parent)?;
     let branch_name = format!("worktree-{name}");
     let branch = if git::branch_exists(&main, &branch_name) {
-        eprintln!("fast-worktree: branch {branch_name} exists, checking it out");
+        errln!("fast-worktree: branch {branch_name} exists, checking it out");
         add::Branch::Existing(branch_name)
     } else {
         add::Branch::New {
@@ -151,7 +152,7 @@ fn create_worktree() -> Result<PathBuf> {
         }
     };
     if !add::create(&main, &path, &branch, true)? {
-        eprintln!(
+        errln!(
             "fast-worktree: warning: the worktree was created, but setting it up failed (see above); \
              `fast-worktree install` in it tries again"
         );
@@ -166,12 +167,12 @@ fn fresh_start(main: &Path) -> String {
     match git::origin_default_branch(main) {
         Ok(base) => {
             if let Err(e) = git::fetch_quietly(main, &base, Some(FETCH_LIMIT)) {
-                eprintln!("fast-worktree: fetch failed, using origin/{base} as last fetched: {e}");
+                errln!("fast-worktree: fetch failed, using origin/{base} as last fetched: {e}");
             }
             format!("origin/{base}")
         }
         Err(_) => {
-            eprintln!("fast-worktree: no origin default branch, starting from HEAD");
+            errln!("fast-worktree: no origin default branch, starting from HEAD");
             "HEAD".to_string()
         }
     }
@@ -191,13 +192,13 @@ fn is_linked_worktree(main: &Path, path: &Path) -> bool {
 /// `hook remove`.
 pub fn remove() -> i32 {
     if let Err(e) = stdout_to_stderr() {
-        eprintln!("fast-worktree: {e}");
+        errln!("fast-worktree: {e}");
         return 1;
     }
     match remove_worktree() {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("fast-worktree: {e}");
+            errln!("fast-worktree: {e}");
             1
         }
     }
@@ -210,7 +211,7 @@ fn remove_worktree() -> Result<()> {
     };
     let given = PathBuf::from(given);
     if given.symlink_metadata().is_err() {
-        eprintln!("fast-worktree: {} is already gone", given.display());
+        errln!("fast-worktree: {} is already gone", given.display());
         let dir = match field(&input, "cwd") {
             Some(c) => PathBuf::from(c),
             None => std::env::current_dir()?,
@@ -286,7 +287,7 @@ fn remove_worktree() -> Result<()> {
     // inside it is deleted with the worktree as much as one in the entry).
     // When they cannot be listed, the worktree is kept all the same.
     let checked_out = submodules::checked_out(&path).map_err(|e| {
-        eprintln!("fast-worktree: cannot list the submodules: {e}");
+        errln!("fast-worktree: cannot list the submodules: {e}");
     });
     let has_subs = !matches!(&checked_out, Ok(v) if v.is_empty());
     let head_of = |p: &Path| {
@@ -313,12 +314,12 @@ fn remove_worktree() -> Result<()> {
     let keep = dirty || has_subs || !inner.is_empty();
 
     let cfg = Config::load(&path).unwrap_or_else(|e| {
-        eprintln!("fast-worktree: {e}");
+        errln!("fast-worktree: {e}");
         Config::default()
     });
     let failed = hooks::run(&cfg, Stage::PreRemove, &path, &main);
     if failed > 0 {
-        eprintln!("fast-worktree: {failed} pre_remove hook(s) failed; removing anyway");
+        errln!("fast-worktree: {failed} pre_remove hook(s) failed; removing anyway");
     }
     if std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
         std::env::set_current_dir(&main)?;
@@ -339,7 +340,7 @@ fn remove_worktree() -> Result<()> {
             };
             match group.fetch(&format!("sub/{}", s.rel), &s.git_dir, &sha) {
                 Ok(r) => sub_refs.push((s.rel.clone(), sha, r)),
-                Err(e) => eprintln!(
+                Err(e) => errln!(
                     "fast-worktree: could not keep the HEAD {} of the submodule {} in a ref: {e}",
                     &sha[..sha.len().min(12)],
                     s.rel
@@ -370,18 +371,18 @@ fn remove_worktree() -> Result<()> {
     })?;
     // Its lock, if the pool left one, goes with the entry.
     let unregistered = git::unregister(&admin);
-    eprintln!(
+    errln!(
         "removed {} (moved to {})",
         util::tilde(&path),
         util::tilde(&dest)
     );
     if let Err(e) = unregistered {
-        eprintln!("fast-worktree: git still lists it ({e})");
+        errln!("fast-worktree: git still lists it ({e})");
     }
     for (i, branch, h) in &inner {
         let now = dest.join(i.strip_prefix(&path).unwrap_or(i));
         let _ = git::output(&main, &["worktree", "repair", &now.to_string_lossy()]);
-        eprintln!(
+        errln!(
             "fast-worktree: the worktree {} was inside it; it is in {} now, \
              deleted with it after 24 hours unless moved: git worktree move {} <new path>",
             util::tilde(i),
@@ -399,11 +400,11 @@ fn remove_worktree() -> Result<()> {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             match kept::Group::new(&main, &inner_name).keep("head", h) {
-                Ok(r) => eprintln!(
+                Ok(r) => errln!(
                     "fast-worktree: its HEAD {} is kept as {r}",
                     &h[..h.len().min(12)]
                 ),
-                Err(e) => eprintln!("fast-worktree: could not keep its HEAD {h} in a ref: {e}"),
+                Err(e) => errln!("fast-worktree: could not keep its HEAD {h} in a ref: {e}"),
             }
         }
     }
@@ -423,7 +424,7 @@ fn remove_worktree() -> Result<()> {
         Some(h) if (keep && !on_branch) || detached_alone => match group.keep("head", h) {
             Ok(r) => Some(r),
             Err(e) => {
-                eprintln!("fast-worktree: could not keep HEAD {h} in a ref: {e}");
+                errln!("fast-worktree: could not keep HEAD {h} in a ref: {e}");
                 None
             }
         },
@@ -443,42 +444,42 @@ fn remove_worktree() -> Result<()> {
         } else {
             "another worktree was inside it"
         };
-        eprintln!(
+        errln!(
             "fast-worktree: {why}; it is kept in {} for at least 24 hours",
             util::tilde(&dest)
         );
         if !subs.is_empty() {
-            eprintln!(
+            errln!(
                 "fast-worktree: its submodules keep their git directories inside them \
                  (`git submodule absorbgitdirs` moves them back after a restore)"
             );
         }
-        eprintln!(
+        errln!(
             "to restore them: {}",
             restore_command(&main, &path, &from, &dest)
         );
     }
     if let (Some(r), Some(h)) = (&kept_ref, &head) {
-        eprintln!(
+        errln!(
             "fast-worktree: its HEAD {} is kept as {r}",
             &h[..h.len().min(12)]
         );
     }
     for (rel, sha, r) in &sub_refs {
-        eprintln!(
+        errln!(
             "fast-worktree: the HEAD {} of its submodule {rel} is kept as {r}",
             &sha[..sha.len().min(12)]
         );
     }
     if kept_ref.is_some() || !sub_refs.is_empty() {
-        eprintln!(
+        errln!(
             "fast-worktree: `fast-worktree kept ls` lists such refs, \
              `fast-worktree kept prune` drops those older than {} days",
             kept::PRUNE_DAYS
         );
     }
     if let Some(b) = me.branch.as_ref().filter(|b| **b != own) {
-        eprintln!("fast-worktree: kept branch {b} (not created by `hook create`)");
+        errln!("fast-worktree: kept branch {b} (not created by `hook create`)");
     }
     Ok(())
 }
@@ -488,17 +489,17 @@ fn remove_worktree() -> Result<()> {
 fn forget(dir: &Path, path: &Path) {
     match git::find_admin(dir, path) {
         Ok(Some(admin)) if admin.join("locked").exists() => {
-            eprintln!("fast-worktree: its entry is locked; left registered");
+            errln!("fast-worktree: its entry is locked; left registered");
         }
         Ok(Some(admin)) => match git::unregister(&admin) {
-            Ok(()) => eprintln!("fast-worktree: unregistered it"),
-            Err(e) => eprintln!("fast-worktree: {e}"),
+            Ok(()) => errln!("fast-worktree: unregistered it"),
+            Err(e) => errln!("fast-worktree: {e}"),
         },
-        Ok(None) => eprintln!(
+        Ok(None) => errln!(
             "fast-worktree: git lists no single worktree at {}; nothing unregistered",
             path.display()
         ),
-        Err(e) => eprintln!("fast-worktree: {e}; nothing unregistered"),
+        Err(e) => errln!("fast-worktree: {e}; nothing unregistered"),
     }
 }
 
@@ -527,16 +528,16 @@ fn settle_branch(main: &Path, branch: &str) -> Option<String> {
     if reachable_elsewhere(main, branch, sha) {
         match git::output(main, &["branch", "-D", branch]) {
             Ok(_) => {
-                eprintln!("deleted branch {branch}");
+                errln!("deleted branch {branch}");
                 None
             }
             Err(e) => {
-                eprintln!("fast-worktree: kept branch {branch}: {e}");
+                errln!("fast-worktree: kept branch {branch}: {e}");
                 Some(branch.to_string())
             }
         }
     } else {
-        eprintln!(
+        errln!(
             "fast-worktree: kept branch {branch}: commit {} is not on its upstream, a remote branch or the default branch",
             &sha[..sha.len().min(12)]
         );
@@ -624,7 +625,7 @@ pub const CONFIG_JSON: &str = r#"{
 
 /// `hook print-config`.
 pub fn print_config() -> i32 {
-    println!("{CONFIG_JSON}");
+    outln!("{CONFIG_JSON}");
     0
 }
 
@@ -635,12 +636,12 @@ pub fn wait(path: Option<&Path>) -> Result<i32> {
     loop {
         match pending::state(&root) {
             pending::State::None => {
-                println!("nothing is being installed in the background");
+                outln!("nothing is being installed in the background");
                 return Ok(0);
             }
             pending::State::Running => {
                 if !told {
-                    eprintln!(
+                    errln!(
                         "waiting for the background install in {}",
                         util::tilde(&root)
                     );
@@ -649,17 +650,17 @@ pub fn wait(path: Option<&Path>) -> Result<i32> {
                 std::thread::sleep(Duration::from_millis(100));
             }
             pending::State::Done(true) => {
-                println!("background install done");
+                outln!("background install done");
                 return Ok(0);
             }
             pending::State::Done(false) => {
-                println!("background install failed:");
+                outln!("background install failed:");
                 print_log(&root);
                 return Ok(1);
             }
             pending::State::Interrupted => {
                 pending::clear_marker(&root);
-                println!(
+                outln!(
                     "the background install stopped before it finished; \
                      `fast-worktree install --changed` finishes it"
                 );
@@ -676,10 +677,10 @@ fn print_log(root: &Path) {
     };
     if let Ok(log) = std::fs::read_to_string(&p) {
         for l in util::tail(&log, 30).lines() {
-            println!("  {l}");
+            outln!("  {l}");
         }
     }
-    println!("(log: {})", util::tilde(&p));
+    outln!("(log: {})", util::tilde(&p));
 }
 
 #[cfg(test)]

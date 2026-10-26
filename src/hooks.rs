@@ -22,7 +22,7 @@
 //! anything repository-specific goes here.
 
 use crate::error::{Error, Result};
-use crate::util;
+use crate::util::{self, errln, outln};
 use serde::Deserialize;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -127,7 +127,7 @@ impl Config {
         };
         let (cfg, warnings) = parse(&text).map_err(|e| Error(format!("{FILE}: {e}")))?;
         for w in warnings {
-            eprintln!("fast-worktree: {FILE}: {w}");
+            errln!("fast-worktree: {FILE}: {w}");
         }
         Ok(cfg)
     }
@@ -252,7 +252,7 @@ pub fn user_pool_size() -> Result<Option<u32>> {
     let (size, warnings) =
         parse_user(&text).map_err(|e| Error(format!("{}: {e}", path.display())))?;
     for w in warnings {
-        eprintln!("fast-worktree: {}: {w}", path.display());
+        errln!("fast-worktree: {}: {w}", path.display());
     }
     Ok(size)
 }
@@ -285,7 +285,7 @@ pub fn run(cfg: &Config, stage: Stage, worktree: &Path, main_checkout: &Path) ->
                 Some(found) => found.parent().map(Path::to_path_buf),
             },
         };
-        println!("hook   {}: {}", stage.name(), hook.run);
+        outln!("hook   {}: {}", stage.name(), hook.run);
         let mut c = Command::new("sh");
         c.arg("-c")
             .arg(&hook.run)
@@ -299,11 +299,11 @@ pub fn run(cfg: &Config, stage: Stage, worktree: &Path, main_checkout: &Path) ->
         let ok = match c.status() {
             Ok(s) if s.success() => true,
             Ok(s) => {
-                eprintln!("FAILED hook {}: {} ({s})", stage.name(), hook.run);
+                errln!("FAILED hook {}: {} ({s})", stage.name(), hook.run);
                 false
             }
             Err(e) => {
-                eprintln!("FAILED hook {}: {} ({e})", stage.name(), hook.run);
+                errln!("FAILED hook {}: {} ({e})", stage.name(), hook.run);
                 false
             }
         };

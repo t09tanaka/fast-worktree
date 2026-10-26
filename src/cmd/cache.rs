@@ -1,5 +1,6 @@
 //! `fast-worktree cache ls` / `cache prune`.
 
+use crate::util::{out, outln};
 use crate::{cache, paths, util};
 use std::time::{Duration, SystemTime};
 
@@ -7,7 +8,7 @@ pub fn ls() -> i32 {
     let root = paths::cache_root();
     let entries = cache::list(&root);
     if entries.is_empty() {
-        println!("cache is empty ({})", util::tilde(&root));
+        outln!("cache is empty ({})", util::tilde(&root));
         return 0;
     }
     let now = SystemTime::now();
@@ -26,8 +27,8 @@ pub fn ls() -> i32 {
             ]
         })
         .collect();
-    print!("{}", table(&["REPO", "DIR", "KEY", "LAST USED"], &rows));
-    println!("{} in {}", count(entries.len()), util::tilde(&root));
+    out!("{}", table(&["REPO", "DIR", "KEY", "LAST USED"], &rows));
+    outln!("{} in {}", count(entries.len()), util::tilde(&root));
     0
 }
 
@@ -37,9 +38,9 @@ pub fn prune(older_than_days: Option<u64>) -> i32 {
     let removed = cache::prune_all(&root, Duration::from_secs(days * 86_400));
     for p in &removed {
         let rel = p.strip_prefix(&root).unwrap_or(p);
-        println!("pruned {}", rel.display());
+        outln!("pruned {}", rel.display());
     }
-    println!(
+    outln!(
         "pruned {} unused for more than {days} days (deleting in background)",
         count(removed.len())
     );

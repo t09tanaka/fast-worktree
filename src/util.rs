@@ -26,6 +26,35 @@ pub fn warn(s: &str) {
     let _ = std::io::stderr().lock().write_all(s.as_bytes());
 }
 
+/// `print!` through [`say`]: a reader that has gone (`fast-worktree pool
+/// status | head -1`) ends the output, not the command.
+macro_rules! out {
+    ($($arg:tt)*) => {
+        $crate::util::say(&format!($($arg)*))
+    };
+}
+
+/// `println!` through [`say`].
+macro_rules! outln {
+    () => {
+        $crate::util::say("\n")
+    };
+    ($($arg:tt)*) => {
+        $crate::util::say(&format!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+/// `eprintln!` through [`warn`].
+macro_rules! errln {
+    () => {
+        $crate::util::warn("\n")
+    };
+    ($($arg:tt)*) => {
+        $crate::util::warn(&format!("{}\n", format_args!($($arg)*)))
+    };
+}
+pub(crate) use {errln, out, outln};
+
 /// `1.2s`, the format every timing line uses.
 pub fn elapsed(start: Instant) -> String {
     format!("{:.1}s", start.elapsed().as_secs_f64())

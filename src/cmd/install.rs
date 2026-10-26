@@ -3,6 +3,7 @@
 use crate::ecosystem::{self, Ctx, Mode, Project, Report};
 use crate::error::{bail, Result};
 use crate::hooks::{self, Config, Stage};
+use crate::util::outln;
 use crate::{git, paths, pending, trash, util};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -78,7 +79,7 @@ pub fn install_deps(root: &Path, only: &[String], cfg: &Config, mode: Mode) -> R
         projects.retain(|p| wanted.contains(&p.dir));
     }
     if projects.is_empty() {
-        println!("no lockfile tracked");
+        outln!("no lockfile tracked");
         return Ok(Installed {
             ok: true,
             ..Installed::default()
@@ -93,14 +94,14 @@ pub fn install_deps(root: &Path, only: &[String], cfg: &Config, mode: Mode) -> R
         out.ok &= print_result(p, &r);
         match &r {
             Ok(rep) if rep.missing => {
-                println!("later  {} (installed in the background)", p.dir);
+                outln!("later  {} (installed in the background)", p.dir);
                 out.missing.push(p.clone());
             }
             Ok(rep) if rep.kept => out.kept.push(p.clone()),
             _ => {}
         }
     }
-    println!("deps done in {}", util::elapsed(start));
+    outln!("deps done in {}", util::elapsed(start));
     Ok(out)
 }
 
