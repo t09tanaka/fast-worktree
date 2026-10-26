@@ -93,12 +93,32 @@ pub fn state(root: &Path) -> State {
     let Some(dir) = git_dir(root) else {
         return State::None;
     };
-    if let Ok(text) = fs::read_to_string(dir.join(MARKER)) {
-        return marker_state(&text, now_secs());
+    decide(
+        || fs::read_to_string(dir.join(MARKER)).ok(),
+        || fs::read_to_string(dir.join(RESULT)).ok(),
+        now_secs(),
+    )
+}
+
+/// The state from the marker and the result file, each read when asked.
+/// The background process writes its result and then removes the marker
+/// before it exits, so a marker whose process is gone may only mean that it
+/// finished after the marker was read: the marker is read again, and when it
+/// is gone, the result decides.
+fn decide(
+    mut marker: impl FnMut() -> Option<String>,
+    result: impl FnOnce() -> Option<String>,
+    now: u64,
+) -> State {
+    if let Some(text) = marker() {
+        let s = marker_state(&text, now);
+        if s != State::Interrupted || marker().is_some() {
+            return s;
+        }
     }
-    match fs::read_to_string(dir.join(RESULT)) {
-        Ok(r) => State::Done(r.trim() == "ok"),
-        Err(_) => State::None,
+    match result() {
+        Some(r) => State::Done(r.trim() == "ok"),
+        None => State::None,
     }
 }
 
@@ -424,6 +444,27 @@ mod tests {
         let _ = other.kill();
         let _ = other.wait();
         assert!(alive, "killed a process the lock did not vouch for");
+    }
+
+    #[test]
+    fn a_marker_that_goes_away_while_its_pid_is_checked_is_a_finished_install() {
+        // The process wrote its result, removed the marker and exited
+        // between the read of the marker and the check of its pid.
+        let dead = {
+            let mut c = Command::new("true").spawn().unwrap();
+            c.wait().unwrap();
+            c.id()
+        };
+        let mut reads = vec![None, Some(format!("1 {dead}\n"))];
+        let s = decide(|| reads.pop().flatten(), || Some("ok\n".into()), 2);
+        assert_eq!(s, State::Done(true));
+        // Still there on the second read: it was interrupted.
+        let marker = format!("1 {dead}\n");
+        let s = decide(|| Some(marker.clone()), || Some("ok\n".into()), 2);
+        assert_eq!(s, State::Interrupted);
+        // Gone, and no result either: nothing to wait for.
+        let mut reads = vec![None, Some(marker.clone())];
+        assert_eq!(decide(|| reads.pop().flatten(), || None, 2), State::None);
     }
 
     #[test]
