@@ -61,7 +61,8 @@ enum Cmd {
         /// since the last install
         #[arg(long)]
         changed: bool,
-        /// Only these project directories
+        /// Only these projects: a directory, `root` for the one at the
+        /// root, or the last part of a directory when only one ends so
         projects: Vec<String>,
         /// Run as the background install of `hook create`
         #[arg(long, hide = true)]
@@ -84,7 +85,8 @@ enum Cmd {
     /// Remove a clean worktree, deleting its files in the background
     Remove {
         path: PathBuf,
-        /// Also delete its branch with `git branch -d`
+        /// Also delete its branch, when it is merged into its upstream,
+        /// origin's default branch or the local default branch
         #[arg(long)]
         delete_branch: bool,
     },
@@ -163,6 +165,10 @@ enum CacheCmd {
         /// Days without use (default: 7)
         #[arg(long, value_name = "DAYS")]
         older_than: Option<u64>,
+        /// Instead, remove the directories of an older layout that `ls`
+        /// lists under LEGACY
+        #[arg(long, conflicts_with = "older_than")]
+        legacy: bool,
     },
 }
 
@@ -207,7 +213,8 @@ fn main() {
         }),
         Cmd::Cache { cmd } => Ok(match cmd {
             CacheCmd::Ls => cmd::cache::ls(),
-            CacheCmd::Prune { older_than } => cmd::cache::prune(older_than),
+            CacheCmd::Prune { legacy: true, .. } => cmd::cache::prune_legacy(),
+            CacheCmd::Prune { older_than, .. } => cmd::cache::prune(older_than),
         }),
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::Status => pool::status(),

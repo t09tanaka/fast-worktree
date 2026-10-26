@@ -67,15 +67,11 @@ pub fn install_deps(root: &Path, only: &[String], cfg: &Config, mode: Mode) -> R
     let root = root.canonicalize()?;
     let mut projects = ecosystem::discover(&root)?;
     if !only.is_empty() {
+        let dirs: Vec<&str> = projects.iter().map(|p| p.dir.as_str()).collect();
         let wanted: Vec<String> = only
             .iter()
-            .map(|p| relative_project(&root, p))
+            .map(|p| resolve_project(&relative_project(&root, p)?, p, &dirs))
             .collect::<Result<_>>()?;
-        for w in &wanted {
-            if !projects.iter().any(|p| &p.dir == w) {
-                bail!("no tracked lockfile in {w}");
-            }
-        }
         projects.retain(|p| wanted.contains(&p.dir));
     }
     if projects.is_empty() {
@@ -190,6 +186,44 @@ fn relative_project(root: &Path, arg: &str) -> Result<String> {
     Ok(if rel.is_empty() { ".".into() } else { rel })
 }
 
+/// The project directory a project argument names, among `dirs` (the
+/// tracked projects). `rel` is the argument as a path relative to the root
+/// ([`relative_project`]); when no project is there, `root` names the
+/// project at the repository root (`.`), and a bare name names the one
+/// project whose last directory has that name. Several such projects, or
+/// none, are an error that lists them.
+pub fn resolve_project(rel: &str, arg: &str, dirs: &[&str]) -> Result<String> {
+    if dirs.contains(&rel) {
+        return Ok(rel.to_string());
+    }
+    if arg == "root" && dirs.contains(&".") {
+        return Ok(".".to_string());
+    }
+    let bare = !arg.is_empty() && !arg.contains('/') && arg != "." && arg != "..";
+    if bare {
+        let by_name: Vec<&str> = dirs
+            .iter()
+            .copied()
+            .filter(|d| d.rsplit('/').next() == Some(arg))
+            .collect();
+        match by_name.as_slice() {
+            [one] => return Ok((*one).to_string()),
+            [] => {}
+            several => bail!(
+                "{arg} matches several projects: {}; name one by its path",
+                several.join(", ")
+            ),
+        }
+    }
+    if dirs.is_empty() {
+        bail!("no tracked lockfile in {rel}");
+    }
+    bail!(
+        "no tracked lockfile in {rel}; the projects are: {}",
+        dirs.join(", ")
+    )
+}
+
 /// Run the `post_add` hooks of `root`. Returns whether all succeeded.
 pub fn run_post_add(root: &Path, cfg: &Config) -> Result<bool> {
     if cfg.post_add.is_empty() {
@@ -198,4 +232,35 @@ pub fn run_post_add(root: &Path, cfg: &Config) -> Result<bool> {
     let root = root.canonicalize()?;
     let main = main_checkout(&root)?;
     Ok(hooks::run(cfg, Stage::PostAdd, &root, &main) == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projects_are_named_by_path_root_or_a_unique_last_name() {
+        let dirs = [".", "api", "provision/lambda", "web", "a/web"];
+        let r = |rel: &str, arg: &str| resolve_project(rel, arg, &dirs).map_err(|e| e.0);
+        assert_eq!(r(".", ".").unwrap(), ".");
+        assert_eq!(r("api", "api").unwrap(), "api");
+        assert_eq!(r("root", "root").unwrap(), ".");
+        assert_eq!(r("lambda", "lambda").unwrap(), "provision/lambda");
+        assert_eq!(r("web", "web").unwrap(), "web", "the exact path wins");
+        let e = r("x/web", "x/web").unwrap_err();
+        assert!(e.contains("no tracked lockfile in x/web"), "{e}");
+        assert!(e.contains("api, provision/lambda"), "{e}");
+        // `root` is a real project when there is one.
+        let with_root = ["root", "api"];
+        assert_eq!(resolve_project("root", "root", &with_root).unwrap(), "root");
+        // Without a root project, `root` is nothing.
+        let no_root = ["api"];
+        assert!(resolve_project("root", "root", &no_root).is_err());
+        let two = ["a/lambda", "b/lambda"];
+        let e = resolve_project("lambda", "lambda", &two).unwrap_err().0;
+        assert!(
+            e.contains("lambda matches several projects: a/lambda, b/lambda"),
+            "{e}"
+        );
+    }
 }

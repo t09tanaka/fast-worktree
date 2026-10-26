@@ -163,26 +163,47 @@ pub struct Entry {
     pub last_used: SystemTime,
 }
 
+/// The directories in `p`, by name.
+fn dirs(p: &Path) -> Vec<(String, PathBuf)> {
+    fs::read_dir(p)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+        .collect()
+}
+
+/// Whether a directory in the cache root is a repository's, as
+/// [`paths::repo_key`] names them: `<name>-<8 hex digits>`.
+pub fn is_repo_name(name: &str) -> bool {
+    name.rsplit_once('-').is_some_and(|(n, h)| {
+        !n.is_empty() && h.len() == 8 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// Whether an entry's name is a key, as [`crate::ecosystem::npm::cache_key`]
+/// makes them: `<16 hex digits>-<node -v>`.
+fn is_key_name(name: &str) -> bool {
+    is_entry_name(name)
+        && name.split_once('-').is_some_and(|(h, v)| {
+            h.len() == 16
+                && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                && !v.is_empty()
+        })
+}
+
 /// Every entry under the cache root `root`, sorted by repository, project
-/// and key.
+/// and key. Directories of an older layout ([`legacy`]) are left out.
 pub fn list(root: &Path) -> Vec<Entry> {
     let mut out = Vec::new();
-    let dirs = |p: &Path| -> Vec<(String, PathBuf)> {
-        fs::read_dir(p)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
-            .collect()
-    };
     for (repo, repo_path) in dirs(root) {
-        if repo == "trash" {
+        if !is_repo_name(&repo) {
             continue;
         }
         for (slug, project_path) in dirs(&repo_path) {
             for (key, path) in dirs(&project_path) {
-                if !is_entry_name(&key) {
+                if !is_key_name(&key) {
                     continue;
                 }
                 let last_used = fs::metadata(&path)
@@ -202,18 +223,59 @@ pub fn list(root: &Path) -> Vec<Entry> {
     out
 }
 
-/// Remove every entry under `root` not used for longer than `ttl`.
-pub fn prune_all(root: &Path, ttl: Duration) -> Vec<PathBuf> {
-    let mut removed = Vec::new();
-    let mut projects: Vec<PathBuf> = list(root)
+/// A directory in the cache root that no version since 0.2.0 reads: one
+/// that a repository's cache had before its name got the hash of the main
+/// checkout's path (and whose entries for the root project sat right in
+/// it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Legacy {
+    pub name: String,
+    pub path: PathBuf,
+    pub last_used: SystemTime,
+}
+
+/// The [`Legacy`] directories under the cache root `root`, by name.
+pub fn legacy(root: &Path) -> Vec<Legacy> {
+    let mut out: Vec<Legacy> = dirs(root)
         .into_iter()
+        .filter(|(n, _)| n != "trash" && !n.starts_with('.') && !is_repo_name(n))
+        .map(|(name, path)| Legacy {
+            last_used: fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH),
+            name,
+            path,
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Move every [`legacy`] directory under `root` to the trash. Returns the
+/// ones moved.
+pub fn prune_legacy(root: &Path) -> Vec<Legacy> {
+    legacy(root)
+        .into_iter()
+        .filter(|l| trash::trash(&l.path).is_ok())
+        .collect()
+}
+
+/// Remove every entry under `root` not used for longer than `ttl`.
+pub fn prune_all(root: &Path, ttl: Duration) -> Vec<Entry> {
+    let entries = list(root);
+    let mut projects: Vec<PathBuf> = entries
+        .iter()
         .filter_map(|e| e.path.parent().map(Path::to_path_buf))
         .collect();
     projects.dedup();
+    let mut removed = Vec::new();
     for p in projects {
         removed.extend(prune(&p, ttl));
     }
-    removed
+    entries
+        .into_iter()
+        .filter(|e| removed.contains(&e.path))
+        .collect()
 }
 
 /// `YYYY-MM-DD HH:MM` (UTC) of a time.
@@ -313,15 +375,22 @@ mod tests {
     fn list_reads_repo_project_and_key() {
         let t = tempfile::tempdir().unwrap();
         let root = t.path();
+        let k1 = "0123456789abcdef-v20";
+        let k2 = "fedcba9876543210-v20";
         for p in [
-            "app-1234abcd/_root/k1-v20",
-            "app-1234abcd/packages__web/k2-v20",
-            "app-1234abcd/packages__web/k3-v20.tmp-1-0",
-            "trash/123-1-1-wt",
+            format!("app-1234abcd/_root/{k1}"),
+            format!("app-1234abcd/packages__web/{k2}"),
+            format!("app-1234abcd/packages__web/{k2}.tmp-1-0"),
+            "app-1234abcd/pool/wt-1-1-0".to_string(),
+            "trash/123-1-1-wt".to_string(),
+            // An older layout: no hash in the repository's name, the root
+            // project's entries right in it.
+            format!("app/{k1}/some-package"),
+            format!("app/web/{k2}"),
         ] {
             fs::create_dir_all(root.join(p)).unwrap();
         }
-        mark_checked(&root.join("app-1234abcd/_root/k1-v20"));
+        mark_checked(&root.join("app-1234abcd/_root").join(k1));
         let got: Vec<(String, String, String)> = list(root)
             .into_iter()
             .map(|e| (e.repo, e.dir, e.key))
@@ -329,14 +398,29 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("app-1234abcd".into(), ".".into(), "k1-v20".into()),
-                (
-                    "app-1234abcd".into(),
-                    "packages/web".into(),
-                    "k2-v20".into()
-                ),
+                ("app-1234abcd".into(), ".".into(), k1.into()),
+                ("app-1234abcd".into(), "packages/web".into(), k2.into()),
             ]
         );
+        let old: Vec<String> = legacy(root).into_iter().map(|l| l.name).collect();
+        assert_eq!(old, vec!["app".to_string()]);
+        assert_eq!(prune_legacy(root).len(), 1);
+        assert!(!root.join("app").exists());
+        assert!(root.join("app-1234abcd").exists());
+    }
+
+    #[test]
+    fn repository_and_key_names() {
+        assert!(is_repo_name("app-1234abcd"));
+        assert!(is_repo_name("my-app-0000ffff"));
+        assert!(!is_repo_name("app"));
+        assert!(!is_repo_name("my-app"));
+        assert!(!is_repo_name("app-1234ABCD"));
+        assert!(!is_repo_name("-1234abcd"));
+        assert!(is_key_name("0123456789abcdef-v20.13.1"));
+        assert!(!is_key_name("0123456789abcdef-v20.13.1.ok"));
+        assert!(!is_key_name("ansi-colors"));
+        assert!(!is_key_name("0123456789abcdef"));
     }
 
     #[test]

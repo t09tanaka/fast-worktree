@@ -5,7 +5,58 @@ based on [Keep a Changelog](https://keepachangelog.com/), and this project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking
 change bumps the minor version).
 
-## [Unreleased]
+## [0.2.1] - 2026-10-27
+
+### Changed
+
+- `npm ci` no longer holds the repository's lifecycle lock, so the
+  projects of a first install download at once instead of one after
+  another. It runs with `--ignore-scripts`; then, holding the lock, `npm
+  rebuild <names>` runs the install scripts of the dependencies that have
+  one and `npm run <script>` the project's own `preinstall`, `install`,
+  `postinstall` and `prepare`, in npm's order. The tree is the one `npm
+  ci` makes, `node_modules/.package-lock.json` and build output included.
+  The incremental install does the same with `npm install
+  --ignore-scripts`, rebuilding only the dependencies that are new or
+  changed. Until the scripts are done, the tree carries
+  `node_modules/.fast-worktree-scripts-pending` and does not count as
+  installed. A lockfile with a git dependency or a link (workspaces), and
+  a project whose `npm rebuild` fails, are installed with their scripts
+  under the lock as before; with npm's `ignore-scripts` set, no script
+  runs.
+- The time a step waited for the lifecycle lock is printed apart from the
+  time it took: `clone  . from … (0.3s, waited 4.1s for lifecycle lock)`.
+  Before, a clone of a few kilobytes could show the minute it waited for
+  other projects' `npm ci`.
+- `add` runs `git worktree add` with `--quiet`: git's `Updating files: N%`
+  progress and its "Preparing worktree" lines no longer fill the output.
+  Its errors are still printed.
+- `remove --delete-branch` counts a branch as merged when its commit is
+  reachable from its upstream, `origin/<default>` or the local
+  `<default>` branch, and deletes it with `git branch -D` if it has not
+  moved since. Before, a branch without an upstream was compared with the
+  main checkout's `HEAD`, so a merged branch was kept when the main
+  checkout was behind or on another branch. An unmerged branch still stops
+  `remove` before anything is removed.
+- `cache prune` prints each entry as `cache ls` names it (`.` for the root
+  project, not `_root`).
+
+### Added
+
+- `install root` installs the project at the repository root, and a
+  project can be named by the last part of its directory (`lambda` for
+  `provision/lambda`) when no other project's ends the same way; otherwise
+  the error lists them. An unknown project's error lists the projects.
+- `cache ls` lists the directories of the layout before 0.2.0 (a
+  repository's name without the hash) apart, under `LEGACY`, instead of
+  as entries with shifted columns, and `cache prune --legacy` moves them to
+  the trash.
+
+### Fixed
+
+- The project's own `install` script, after a clone, no longer runs its
+  `preinstall` and `postinstall` a second time (`npm run` is called with
+  `--ignore-scripts`, which runs the named script alone).
 
 ## [0.2.0] - 2026-10-27
 
