@@ -3778,6 +3778,7 @@ fn the_wait_for_the_lifecycle_lock_is_shown_apart() {
     let lock = hold_lock(&lock_file);
     let mut c = Command::new(env!("CARGO_BIN_EXE_fast-worktree"));
     w.env(&mut c);
+    let start = std::time::Instant::now();
     let child = c
         .args(["install", "app"])
         .current_dir(&main)
@@ -3785,16 +3786,30 @@ fn the_wait_for_the_lifecycle_lock_is_shown_apart() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    // The tree is there (cloned, or made by `npm ci --ignore-scripts`) right
+    // before its postinstall takes the lock. Held from then on, not from
+    // the spawn: a loaded machine can take longer than any fixed sleep to
+    // get the child that far.
+    wait_until("the tree before its scripts", || {
+        main.join("app/node_modules/.package-lock.json").is_file()
+    });
     std::thread::sleep(std::time::Duration::from_millis(1500));
     drop(lock);
     let r = Run(child.wait_with_output().unwrap());
+    let wall = start.elapsed().as_secs_f64();
     r.assert_ok();
     // npm ci, or on macOS a clone from the cache, whose postinstall waits.
     let (took, waited) = took_and_waited(&r.out(), "npm ci app (")
         .or_else(|| took_and_waited(&r.out(), "clone  app from "))
         .unwrap_or_else(|| panic!("{}", r.out()));
     assert!(waited >= 1.0, "{}", r.out());
-    assert!(took < waited, "the wait is not in the time: {}", r.out());
+    // The time it took and the wait add up to no more than the run (each
+    // is rounded to 0.1s): the wait is not counted in the time as well.
+    assert!(
+        took + waited <= wall + 0.15,
+        "the wait is in the time ({wall:.2}s in all): {}",
+        r.out()
+    );
 }
 
 #[test]
