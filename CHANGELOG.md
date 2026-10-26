@@ -16,39 +16,63 @@ change bumps the minor version).
   `verify`, `rewrite_paths` and `after` replaces a preset's default. A
   `[[clone]]` without a preset names a directory (`path`) and the files
   whose contents decide whether a copy can be reused (`key`), and is made
-  present from the cache, else from a registered worktree whose key files
-  are byte-identical, whose `key_commands` print the same and where
-  `verify` passes, else by its `install`, whose result is cached. After a
-  clone, `verify` must pass, `rewrite_paths` replaces the source
-  worktree's path with the new one in its text files, and `after` runs.
-  Targets with a preset are installed before those without.
+  present from the cache, else from a registered worktree whose `path`
+  records the same key (or, without that record, whose key files are
+  byte-identical, whose `key_commands` print the same and where `verify`
+  passes), else by its `install`, whose result is cached. After a clone,
+  `verify` must pass, `rewrite_paths` replaces the source worktree's path
+  with the new one in its text files, and `after` runs. The key is
+  recorded in `<path>/.fast-worktree-key` only once all of that succeeded,
+  and only a `path` with that record (or where `verify` passes) counts as
+  installed, for `check`, `install` and as a source; when the install,
+  `verify` or an `after` fails, `path` is moved away. Targets with a
+  preset are installed before those without.
+- fast-worktree touches only what is its own: a `[[clone]]` (or a project
+  found by its lockfile) whose `dir`, `path` or `key` leads out of the
+  worktree through a symlink, whose `path` holds tracked files, or whose
+  `path` holds another target's `path` or `dir`, is refused with the
+  reason, and `path` is looked at again right before it is moved away,
+  cloned into, rewritten or handed to the cache.
 - When a `.fast-worktree.toml` has at least one `[[clone]]`, only what the
   entries list is handled; without any, the tracked lockfiles are detected
   as before, with the same cache keys.
 - `remove`, and `hook remove` for a worktree it does not keep, move the
-  directory of each `[[clone]]` without a preset into the cache before the
-  worktree goes (a rename), when it matches its key or passes `verify` and
-  the cache has no entry for that key, so the next worktree clones it.
+  directory of each `[[clone]]` without a preset into the cache once the
+  worktree has been moved into the trash (a rename), when it matches its
+  key or passes `verify` and the cache has no entry for that key, so the
+  next worktree clones it. A removal that stops before that leaves the
+  worktree whole.
 - `config init [--dry-run]` adds a `[[clone]]` for each tracked lockfile
   that has none, keeping the rest of the file and its comments.
+- `config init` stops, writing nothing, when a `[[clone]]` does not
+  resolve, rather than add a second entry for its project.
 - `config check` exits 1 when a tracked lockfile is in no `[[clone]]`, a
-  `[[clone]]` names a file that does not exist, or the file has a mistake
-  (an unknown key or preset, a `path` that does not fit its preset). It
-  runs one `git ls-files`, for pre-commit hooks and CI, and does nothing
-  in a repository without `[[clone]]`.
+  `[[clone]]` names a file that does not exist or is not tracked, or the
+  file has a mistake: it does not parse, an unknown key or section (such
+  as `[[clones]]`), an `[[ignore]]` without a `reason`, an unknown preset,
+  a `path` that does not fit its preset, or a target fast-worktree refuses
+  to touch (above). It runs a few `git ls-files`, for pre-commit hooks and
+  CI. Without `[[clone]]` it does not compare the lockfiles but reports
+  the rest.
 - `plan [<path>]` lists, for each target, where its files would come
   from (a cache entry, a worktree, an incremental install, an install)
-  and why the sources before it are not used, without changing anything.
+  and why the sources before it are not used. It installs nothing, but
+  runs the `key_commands` and `verify` (never in a cache entry: a clone is
+  checked once it is made, and `plan` says so), which, like `install` and
+  `after`, are the repository's own commands, run by the post-checkout
+  hook too and trusted as `post_add` hooks are.
 - A Bundler preset, `preset = "bundler"`, and a tracked `Gemfile.lock` is
   a project for auto-detection, `config init` and `config check`. The
   directory Bundler installs into (`BUNDLE_PATH` from the project's
   `.bundle/config`, the environment or `~/.bundle/config`, else
   `<dir>/vendor/bundle`) is cloned from the cache or a worktree with the
   same `Gemfile.lock`, `ruby -v` and `RUBY_PLATFORM`, then checked with
-  `bundle check` (a clone it turns down is thrown away); else
+  `bundle check --dry-run` (a clone it turns down is thrown away); else
   `BUNDLE_PATH=<path> bundle install` runs and its result is cached. A
-  `BUNDLE_PATH` outside the worktree is not cloned: `bundle check`, else
-  `bundle install`.
+  `BUNDLE_PATH` outside the worktree (or through a symlink out of it), or
+  one that holds tracked files, is never cloned or moved away: `bundle
+  check --dry-run`, else `bundle install`. Every check has `--dry-run`, so
+  none writes `Gemfile.lock`.
 - `[[ignore]]` in `.fast-worktree.toml` (`dir`, an optional `preset`, and
   a required `reason`) leaves a project out on purpose: auto-detection
   skips it, `config init` does not add it, and `config check` does not
@@ -56,8 +80,18 @@ change bumps the minor version).
   whose directory has no tracked lockfile as missing, and one that a
   `[[clone]]` also lists as invalid.
 
+### Changed
+
+- `remove` no longer stops at a `.fast-worktree.toml` it cannot read: it
+  says so, runs no `pre_remove` hook, keeps nothing in the cache, and
+  removes the worktree after its usual checks, as `hook remove` does
+  (which no longer runs hooks from an empty config in its place).
+
 ### Fixed
 
+- The post-checkout hook (`check --post-checkout`) cloned the detected
+  projects in a new worktree whose `.fast-worktree.toml` it could not read;
+  it now says so and does nothing, as plain `check` does.
 - `wait` could report "the background install stopped before it
   finished" for an install that was running: the marker was rewritten in
   place when the background process put its pid in it, and a marker read

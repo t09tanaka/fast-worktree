@@ -51,7 +51,7 @@ and removing the worktree again means deleting tens of thousands of files.
 - **Ruby too.** A tracked `Gemfile.lock` is a project: the directory
   Bundler installs into is cloned from the cache or another worktree with
   the same `Gemfile.lock`, Ruby version and platform, and checked with
-  `bundle check`; else `bundle install` runs.
+  `bundle check --dry-run`; else `bundle install` runs.
 - **Any other directory, by key.** A [`[[clone]]`](#what-each-worktree-gets-clone)
   names a directory such as CocoaPods' `Pods` or a build cache, the files
   that decide whether a copy can be reused, and the command that makes it;
@@ -402,14 +402,18 @@ after = ["echo pods ready"]             # optional: after a clone or an install
   from `~/.bundle/config` (Bundler's own order), relative to `dir`; else
   `<dir>/vendor/bundle`. It is made present as a `[[clone]]` without a
   preset is (below): from the cache, else from a worktree, else with
-  `BUNDLE_PATH=<path> bundle install`. After a clone, `bundle check` runs
-  with `BUNDLE_PATH` set to the clone, and a clone it turns down is thrown
-  away. Nothing is rewritten after a clone: the worktree's path is only in
+  `BUNDLE_PATH=<path> bundle install`. After a clone, `bundle check
+  --dry-run` runs with `BUNDLE_PATH` set to the clone, and a clone it turns
+  down is thrown away. (Every `bundle check` here has `--dry-run`: without
+  it, Bundler writes `Gemfile.lock` when it lacks the current platform.) Nothing is rewritten after a clone: the worktree's path is only in
   the build logs (`gem_make.out`) and in the debug information of the
   compiled extensions, which load from the clone all the same. A
   `BUNDLE_PATH` outside the worktree holds gems every checkout shares:
   nothing is cloned there, `bundle check` decides and `bundle install`
-  runs when it fails. `.bundle/config` is usually ignored by git, and
+  runs when it fails. The same goes for a `BUNDLE_PATH` that holds tracked
+  files (`BUNDLE_PATH=vendor` next to a tracked `vendor/javascript`), and
+  one that leaves the worktree through a symlink: fast-worktree never
+  clones over them or moves them away. `.bundle/config` is usually ignored by git, and
   without it `bundle exec` looks for the system's gems: list it in
   [`.worktreeinclude`](#ignored-files-worktreeinclude), or set
   `BUNDLE_PATH`.
@@ -423,8 +427,10 @@ after = ["echo pods ready"]             # optional: after a clone or an install
   present by the first of:
   1. a cache entry with the same key (the contents of the `key` files and
      the output of the `key_commands`);
-  2. a registered worktree whose `key` files are byte-identical, whose
-     `key_commands` print the same there and where `verify` passes;
+  2. a registered worktree whose `path` was made from the same key (its
+     `.fast-worktree-key`, below, says so), or, without that record, whose
+     `key` files are byte-identical, whose `key_commands` print the same
+     there and where `verify` passes;
   3. `install`. Its result is stored in the cache. Without `install`,
      nothing is made, and the directory only ever comes from the cache or
      another worktree (a build cache, say).
@@ -439,6 +445,24 @@ after = ["echo pods ready"]             # optional: after a clone or an install
   `path`. All of them run with `sh -c`, with `FAST_WORKTREE_PATH` and
   `FAST_WORKTREE_MAIN` set. Unlike `node_modules`, the directory is not
   checked for symlinks with an absolute target.
+
+  Once the clone or the install, `verify` and `after` have all succeeded,
+  the key is recorded in `<path>/.fast-worktree-key`. Only a `path` with
+  that record, made from the key as it is now, counts as installed (for
+  `check`, `install` and as a source for another worktree); one without it
+  counts when `verify` passes in it (and is recorded then). When the
+  install, `verify` or an `after` fails, `path` is moved away. `verify`
+  runs in this worktree's `path` and in another worktree's without a
+  record, never in a cache entry.
+- **What fast-worktree touches.** `path` is moved away, cloned into and
+  handed to the cache whole, so it must be fast-worktree's own: a `dir`,
+  `path` or `key` that leads out of the worktree through a symlink, a
+  `path` that holds tracked files, and a `path` that holds another
+  target's `path` or `dir` are refused (`install`, `add` and the hooks
+  stop with the reason, and `config check` reports them). Where a project
+  found by its lockfile hits this, an [`[[ignore]]`](#leaving-a-project-out-ignore)
+  leaves it out. `path` is looked at again right before it is moved,
+  cloned into or rewritten.
 - **Order.** The targets with a preset are installed first, in parallel,
   then those without one: `pod install` needs what `flutter pub get`
   generates.
@@ -446,9 +470,10 @@ after = ["echo pods ready"]             # optional: after a clone or an install
   deletes a worktree after its checks, it first moves the `path` of each
   `[[clone]]` without a preset into the cache, by rename (the cache is
   usually on the same volume, so this is instant): when it was made from
-  the key files it has now (fast-worktree records the key in
-  `<path>/.fast-worktree-key`) or passes `verify`, and when the cache has
-  no entry with that key yet. The next worktree with that key clones it. A
+  the key files it has now (its `.fast-worktree-key`) or passes `verify`,
+  and when the cache has no entry with that key yet. This happens once the
+  worktree has been moved into the trash, so a removal that stops before
+  that leaves the worktree whole. The next worktree with that key clones it. A
   worktree that `hook remove` keeps in the trash, because it had changes,
   keeps its directories.
 
@@ -604,15 +629,22 @@ missing). What the file already says, comments included, is kept. With
 - `missing`: a `[[clone]]` whose lockfile or `key` file does not exist, or
   an `[[ignore]]` whose directory has no tracked lockfile (of its
   `preset`, when it names one);
-- `invalid`: a mistake in the file, such as an unknown key, an unknown
-  preset, a `path` that does not fit its preset, a `[[clone]]` without a
-  preset that lacks `path` or `key`, or a project that both a `[[clone]]`
-  and an `[[ignore]]` name.
+- `untracked`: a `[[clone]]` whose `key` file exists but is not tracked
+  (another worktree has its own, or none);
+- `invalid`: a mistake in the file, such as a file that does not parse, an
+  unknown key or section (`[[clones]]`), an `[[ignore]]` without a
+  `reason`, an unknown preset, a `path` that does not fit its preset, a
+  `[[clone]]` without a preset that lacks `path` or `key`, a project that
+  both a `[[clone]]` and an `[[ignore]]` name, or a target fast-worktree
+  would refuse to touch (a symlink out of the worktree, a `path` that holds
+  tracked files or another target).
 
-It runs one `git ls-files` (the index, so a lockfile that is only staged
-counts) and looks at which files exist, so it is quick enough for a
-pre-commit hook. In a repository without any `[[clone]]` it does nothing
-and exits 0. After a new project was added in the example:
+It runs a few `git ls-files` (the index, so a lockfile that is only
+staged counts) and looks at which files exist, so it is quick enough for
+a pre-commit hook. In a repository without any `[[clone]]` it does not
+compare the lockfiles, but still reports the other mistakes; without a
+`.fast-worktree.toml` it exits 0. After a new project was added in the
+example:
 
 ```console
 $ mkdir tools && cp web/package.json web/package-lock.json tools/ && git add tools
@@ -647,9 +679,16 @@ For each target, where its files would come from (`cache <entry>`,
 `worktree <path>`, `delta from <entry>` for npm's incremental install,
 `install (<command>)`, or `present`), and below it, one `not` line for
 each source passed over and why (no cache entry for the key, another key
-file or tool version in a worktree, `verify` failing...). It changes
-nothing: it reads files and runs only the `key_commands` (`node -v` for
-npm) and `verify`, which are meant to only look. With `<path>`, it is for
+file or tool version in a worktree, `verify` failing...). A clone that
+`verify` checks once it is made says `(verify after the clone)`: `plan`
+does not run it in a cache entry. `plan` moves, clones and installs
+nothing, but it does run commands: the `key_commands` (`node -v` for npm),
+and `verify` in this worktree and in another worktree whose `path` has no
+record of its key. These, like `install` and `after`, are shell commands
+the repository writes, and the [post-checkout hook](#post-checkout-hook)
+runs them too: they are trusted as the `post_add` hooks are, so look at a
+repository's `.fast-worktree.toml` before you run fast-worktree in it.
+With `<path>`, it is for
 that worktree as it is; without, for a new worktree with the current
 worktree's files (a new branch from origin's default branch may have other
 lockfiles), where nothing is present yet and the current worktree is one
@@ -694,7 +733,7 @@ web (npm)
   not   cache: no entry 02ed81ddfaf462f9-v20.13.1
   not   worktree ~/monorepo: no node_modules that matches package-lock.json
 mobile/ios/Pods (clone)
-  from  cache ~/Library/Caches/fast-worktree/monorepo-e8406f05/mobile__ios__Pods/d6937bd63decbc2e-365864a4
+  from  cache ~/Library/Caches/fast-worktree/monorepo-e8406f05/mobile__ios__Pods/d6937bd63decbc2e-365864a4 (verify after the clone)
 ```
 
 ## Ignored files: `.worktreeinclude`
@@ -739,7 +778,11 @@ Where fast-worktree is not installed, the hook does nothing.
 - After `git worktree add` or `git clone` (the previous commit is all zeros
   and the flag is 1), the dependencies that the cache or another worktree
   can provide are cloned in, with the project's own lifecycle scripts as
-  after any clone (so it runs `node -v` and those scripts). Nothing that
+  after any clone (so it runs `node -v` and those scripts, and the
+  `key_commands`, `verify` and `after` of the `[[clone]]` entries: the
+  repository's own commands, trusted as `post_add` hooks are). A
+  `.fast-worktree.toml` that cannot be read makes it say so and do
+  nothing. Nothing that
   downloads or resolves runs: projects that would need `npm ci`, `npm
   install` or `pub get` are listed as missing. (A fresh `git clone` has no
   cache entries or other worktrees of its own yet, so there it only
