@@ -325,7 +325,9 @@ Where fast-worktree is not installed, the hook does nothing.
   can provide are cloned in, with the project's own lifecycle scripts as
   after any clone (so it runs `node -v` and those scripts). Nothing that
   downloads or resolves runs: projects that would need `npm ci`, `npm
-  install` or `pub get` are listed as missing.
+  install` or `pub get` are listed as missing. (A fresh `git clone` has no
+  cache entries or other worktrees of its own yet, so there it only
+  lists.)
 - On any other checkout, such as `git switch`, it lists what is missing,
   like `check --quiet`.
 - It always exits 0. With the environment variable `CI` set, or
