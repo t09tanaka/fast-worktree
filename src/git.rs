@@ -33,12 +33,8 @@ pub fn output_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Resul
 }
 
 /// Run git in `dir` with inherited stdout/stderr (for commands whose
-/// output the user should see, like `git worktree add`).
-pub fn run(dir: &Path, args: &[&str]) -> Result<()> {
-    run_with_env(dir, args, &[])
-}
-
-/// [`run`] with extra environment variables for git and its hooks.
+/// output the user should see, like `git worktree add`), with extra
+/// environment variables for git and its hooks.
 pub fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<()> {
     let status = command(dir)
         .args(args)
