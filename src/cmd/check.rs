@@ -15,7 +15,7 @@
 //! change the exit code.
 
 use super::install;
-use crate::ecosystem::{self, Mode, Project};
+use crate::ecosystem::{target, Mode, Target};
 use crate::hooks::Config;
 use crate::{git, paths, pending, util};
 use std::env;
@@ -25,7 +25,8 @@ pub fn run(quiet: bool) -> i32 {
     let Ok(root) = git::toplevel(Path::new(".")) else {
         return 0;
     };
-    let Ok(projects) = ecosystem::discover(&root) else {
+    let cfg = Config::load(&root).unwrap_or_default();
+    let Ok(projects) = target::targets(&root, &cfg) else {
         return 0;
     };
     let missing: Vec<String> = missing(&root, &projects)
@@ -57,13 +58,10 @@ fn in_cache(dir: &std::path::Path) -> bool {
     dir.canonicalize().is_ok_and(|d| d.starts_with(&root))
 }
 
-fn missing(root: &Path, projects: &[Project]) -> Vec<Project> {
+fn missing(root: &Path, projects: &[Target]) -> Vec<Target> {
     projects
         .iter()
-        .filter(|p| {
-            !p.ecosystem
-                .is_installed(&ecosystem::project_path(root, &p.dir))
-        })
+        .filter(|p| !p.preset.is_installed(root, p))
         .cloned()
         .collect()
 }
@@ -120,17 +118,21 @@ fn clone_missing() {
     let Ok(root) = git::toplevel(Path::new(".")) else {
         return;
     };
-    let Ok(projects) = ecosystem::discover(&root) else {
-        return;
+    let cfg = Config::load(&root).unwrap_or_else(|e| {
+        util::warn(&format!("fast-worktree: {e}\n"));
+        Config::default()
+    });
+    let projects = match target::targets(&root, &cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            util::warn(&format!("fast-worktree: {e}\n"));
+            return;
+        }
     };
     let todo = missing(&root, &projects);
     if todo.is_empty() {
         return;
     }
-    let cfg = Config::load(&root).unwrap_or_else(|e| {
-        util::warn(&format!("fast-worktree: {e}\n"));
-        Config::default()
-    });
     let results = match install::install_projects(&root, &todo, &cfg, Mode::CloneOnly) {
         Ok(r) => r,
         Err(e) => {
@@ -160,8 +162,8 @@ fn clone_missing() {
     util::say(&report(&still, projects.len(), true));
 }
 
-fn labels(projects: &[Project]) -> Vec<String> {
-    projects.iter().map(Project::label).collect()
+fn labels(projects: &[Target]) -> Vec<String> {
+    projects.iter().map(Target::label).collect()
 }
 
 pub fn report(missing: &[String], total: usize, quiet: bool) -> String {

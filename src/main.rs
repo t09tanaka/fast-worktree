@@ -115,6 +115,30 @@ enum Cmd {
         /// The worktree (default: the current one)
         path: Option<PathBuf>,
     },
+    /// Write or check the [[clone]] entries of .fast-worktree.toml
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+    /// Show where each target's files would come from, changing nothing
+    Plan {
+        /// An existing worktree (default: a new one with the files of the
+        /// current worktree)
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Add a [[clone]] for each tracked lockfile that has none
+    Init {
+        /// Print what would be added, without writing the file
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Exit 1 when a tracked lockfile is in no [[clone]], a [[clone]]
+    /// names a file that does not exist, or the file has a mistake
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -232,6 +256,11 @@ fn main() {
             KeptCmd::Prune { older_than } => cmd::kept::prune(older_than),
         },
         Cmd::Wait { path } => cmd::hook::wait(path.as_deref()),
+        Cmd::Config { cmd } => match cmd {
+            ConfigCmd::Init { dry_run } => cmd::config::init(dry_run),
+            ConfigCmd::Check => cmd::config::check(),
+        },
+        Cmd::Plan { path } => cmd::plan::run(path.as_deref()),
     };
     let code = match result {
         Ok(c) => c,

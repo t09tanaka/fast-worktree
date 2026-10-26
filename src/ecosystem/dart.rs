@@ -17,7 +17,7 @@
 //! used, [`rewrite_moved_paths`] replaces the path where the spare was made
 //! with the new one in those files.
 
-use super::{Ctx, Ecosystem, Mode, Report};
+use super::{Ctx, Mode, Plan, Preset, Report, Target};
 use crate::paths::hex;
 use crate::util;
 use sha2::{Digest, Sha256};
@@ -32,8 +32,12 @@ const KEY_FILE: &str = ".dart_tool/fast-worktree-key";
 
 pub struct Dart;
 
-impl Ecosystem for Dart {
+impl Preset for Dart {
     fn name(&self) -> &'static str {
+        "dart"
+    }
+
+    fn label(&self) -> &'static str {
         "pub"
     }
 
@@ -41,18 +45,95 @@ impl Ecosystem for Dart {
         LOCKFILE
     }
 
-    fn is_installed(&self, project: &Path) -> bool {
-        project.join(PACKAGE_CONFIG).is_file()
+    fn managed(&self) -> &'static str {
+        ".dart_tool"
     }
 
-    fn install(&self, ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
-        install(
-            &super::project_path(&ctx.root, dir),
-            dir,
-            mode,
-            &Tools::find(),
-        )
+    fn is_installed(&self, root: &Path, t: &Target) -> bool {
+        super::project_path(root, &t.dir)
+            .join(PACKAGE_CONFIG)
+            .is_file()
     }
+
+    fn install(&self, ctx: &Ctx, t: &Target, mode: Mode) -> Result<Report, String> {
+        let project = super::project_path(&ctx.root, &t.dir);
+        let key = target_key(ctx, t)?;
+        let tools = Tools::find();
+        let get = match &t.install {
+            Some(cmd) => Get::Command {
+                cmd,
+                root: &ctx.root,
+                main: &ctx.main,
+            },
+            None => Get::Pub(&tools),
+        };
+        let report = install(&project, &t.dir, mode, &get, &key)?;
+        if report.kept || report.missing || !project.join(PACKAGE_CONFIG).is_file() {
+            return Ok(report);
+        }
+        if let Some(v) = &t.verify {
+            super::run_quietly(&ctx.root.join(&t.path), v, &ctx.root, &ctx.main)
+                .map_err(|e| format!("verify failed after the install: {e}"))?;
+        }
+        for a in &t.after {
+            super::run_quietly(&project, a, &ctx.root, &ctx.main)?;
+        }
+        Ok(report)
+    }
+
+    fn plan(&self, ctx: &Ctx, t: &Target, mode: Mode, fresh: bool) -> Plan {
+        let project = super::project_path(&ctx.root, &t.dir);
+        if !fresh && project.join(PACKAGE_CONFIG).is_file() {
+            if !mode.reinstalls_changed() {
+                return Plan::new("present (.dart_tool)", vec![]);
+            }
+            let recorded = fs::read_to_string(project.join(KEY_FILE)).unwrap_or_default();
+            if target_key(ctx, t).is_ok_and(|k| recorded.trim() == k) {
+                return Plan::new("present (up to date)", vec![]);
+            }
+        }
+        let how = match &t.install {
+            Some(c) => c.clone(),
+            None => match Tools::find() {
+                Tools {
+                    flutter: Some(_), ..
+                } => "flutter pub get".to_string(),
+                Tools { dart: Some(_), .. } => "dart pub get".to_string(),
+                _ => return Plan::new("nothing (neither flutter nor dart is installed)", vec![]),
+            },
+        };
+        let why = vec!["clone: pub keeps packages in a cache of its own".to_string()];
+        if mode.clone_only() {
+            return Plan::new(format!("later, in the background ({how})"), why);
+        }
+        Plan::new(format!("install ({how})"), why)
+    }
+
+    fn rewrite_moved(&self, root: &Path, t: &Target, from: &[PathBuf]) -> usize {
+        let project = super::project_path(root, &t.dir);
+        let mut n = rewrite_moved_paths(&project, from, root);
+        if t.rewrite_paths {
+            n += super::rewrite_tree(&root.join(&t.path), from, root);
+        }
+        n
+    }
+}
+
+/// What a target is installed from, recorded in `.dart_tool`: the
+/// lockfile's hash, as before `[[clone]]`, unless its `key` or
+/// `key_commands` say more.
+fn target_key(ctx: &Ctx, t: &Target) -> Result<String, String> {
+    let project = super::project_path(&ctx.root, &t.dir);
+    if t.key_is_lockfile_only() && t.key_commands.is_empty() {
+        let lockfile = fs::read(project.join(LOCKFILE)).map_err(|e| format!("{LOCKFILE}: {e}"))?;
+        return Ok(key(&lockfile));
+    }
+    let files = super::key_digest(&ctx.root, &t.key)?;
+    let outputs = super::command_outputs(&project, &t.key_commands, &ctx.root, &ctx.main)?;
+    let mut h = Sha256::new();
+    h.update(files);
+    h.update(super::outputs_digest(&outputs));
+    Ok(hex(&h.finalize())[..16].to_string())
 }
 
 /// Where in a project `pub get` and the Flutter tools write files that
@@ -112,29 +193,13 @@ pub fn rewrite_moved_paths(project: &Path, from: &[PathBuf], to: &Path) -> usize
         }
         let mut text = bytes.clone();
         for f in &from {
-            text = replace_all(&text, f, to);
+            text = super::replace_all(&text, f, to);
         }
         if text != bytes && fs::write(&file, &text).is_ok() {
             n += 1;
         }
     }
     n
-}
-
-/// `haystack` with every `needle` replaced by `with`.
-fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(haystack.len());
-    let mut i = 0;
-    while i < haystack.len() {
-        if haystack[i..].starts_with(needle) {
-            out.extend_from_slice(with);
-            i += needle.len();
-        } else {
-            out.push(haystack[i]);
-            i += 1;
-        }
-    }
-    out
 }
 
 /// The SDK commands available, found once per install.
@@ -156,10 +221,20 @@ fn key(lockfile: &[u8]) -> String {
     hex(&Sha256::digest(lockfile))[..16].to_string()
 }
 
-fn install(project: &Path, dir: &str, mode: Mode, tools: &Tools) -> Result<Report, String> {
+/// How `pub get` is done.
+enum Get<'a> {
+    /// `flutter pub get`, else `dart pub get`, with what is installed.
+    Pub(&'a Tools),
+    /// The `[[clone]]`'s own `install`, in the project directory.
+    Command {
+        cmd: &'a str,
+        root: &'a Path,
+        main: &'a Path,
+    },
+}
+
+fn install(project: &Path, dir: &str, mode: Mode, get: &Get, key: &str) -> Result<Report, String> {
     let start = Instant::now();
-    let lockfile = fs::read(project.join(LOCKFILE)).map_err(|e| format!("{LOCKFILE}: {e}"))?;
-    let key = key(&lockfile);
     if project.join(PACKAGE_CONFIG).is_file() {
         if !mode.reinstalls_changed() {
             return Ok(Report::kept(format!(
@@ -173,21 +248,32 @@ fn install(project: &Path, dir: &str, mode: Mode, tools: &Tools) -> Result<Repor
     if mode.clone_only() {
         return Ok(Report::missing(""));
     }
-    let how = if let Some(flutter) = &tools.flutter {
-        match pub_get(flutter, project, true) {
+    let how = match get {
+        Get::Command { cmd, root, main } => {
+            super::run_quietly(project, cmd, root, main)?;
+            "install"
+        }
+        Get::Pub(Tools {
+            flutter: Some(flutter),
+            ..
+        }) => match pub_get(flutter, project, true) {
             Ok(()) => "flutter",
             Err(_) => {
                 pub_get(flutter, project, false)?;
                 "flutter, online"
             }
+        },
+        Get::Pub(Tools {
+            dart: Some(dart), ..
+        }) => {
+            pub_get(dart, project, false)?;
+            "dart"
         }
-    } else if let Some(dart) = &tools.dart {
-        pub_get(dart, project, false)?;
-        "dart"
-    } else {
-        return Ok(Report::done(format!(
-            "note   {dir}: neither flutter nor dart is installed, skipped"
-        )));
+        Get::Pub(_) => {
+            return Ok(Report::done(format!(
+                "note   {dir}: neither flutter nor dart is installed, skipped"
+            )));
+        }
     };
     let _ = fs::write(project.join(KEY_FILE), format!("{key}\n"));
     Ok(Report::done(format!(
@@ -224,13 +310,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replace_all_replaces_every_occurrence() {
-        assert_eq!(replace_all(b"a/x b/x", b"/x", b"/yy"), b"a/yy b/yy");
-        assert_eq!(replace_all(b"none", b"/x", b"/y"), b"none");
-        assert_eq!(replace_all(b"", b"/x", b"/y"), b"");
-    }
-
-    #[test]
     fn no_sdk_is_a_note_not_a_failure() {
         let t = tempfile::tempdir().unwrap();
         fs::write(t.path().join(LOCKFILE), "packages: {}\n").unwrap();
@@ -238,13 +317,14 @@ mod tests {
             flutter: None,
             dart: None,
         };
-        let r = install(t.path(), "app", Mode::Missing, &none).unwrap();
+        let k = key(b"packages: {}\n");
+        let r = install(t.path(), "app", Mode::Missing, &Get::Pub(&none), &k).unwrap();
         assert_eq!(
             r.lines,
             "note   app: neither flutter nor dart is installed, skipped"
         );
         assert!(!r.missing);
-        let r = install(t.path(), "app", Mode::CloneOnly, &none).unwrap();
+        let r = install(t.path(), "app", Mode::CloneOnly, &Get::Pub(&none), &k).unwrap();
         assert!(r.missing, "pub get is never run from the hook");
     }
 
@@ -259,13 +339,13 @@ mod tests {
             flutter: None,
             dart: None,
         };
-        let r = install(p, "app", Mode::Missing, &none).unwrap();
+        let get = Get::Pub(&none);
+        let r = install(p, "app", Mode::Missing, &get, &key(b"a")).unwrap();
         assert_eq!(r.lines, "skip   app (.dart_tool already present)");
         fs::write(p.join(KEY_FILE), format!("{}\n", key(b"a"))).unwrap();
-        let r = install(p, "app", Mode::Changed, &none).unwrap();
+        let r = install(p, "app", Mode::Changed, &get, &key(b"a")).unwrap();
         assert_eq!(r.lines, "skip   app (up to date)");
-        fs::write(p.join(LOCKFILE), "b").unwrap();
-        let r = install(p, "app", Mode::Changed, &none).unwrap();
+        let r = install(p, "app", Mode::Changed, &get, &key(b"b")).unwrap();
         assert!(r.lines.contains("neither flutter nor dart"), "{}", r.lines);
     }
 }

@@ -40,7 +40,41 @@ pub struct Config {
     pub skip_lifecycle: Vec<SkipLifecycle>,
     #[serde(default)]
     pub pool: Option<PoolConfig>,
+    /// `[[clone]]`: what each worktree gets, when listed (see
+    /// [`crate::ecosystem::target`]). Empty: the projects are detected from
+    /// the tracked lockfiles.
+    #[serde(default)]
+    pub clone: Vec<CloneEntry>,
 }
+
+/// One `[[clone]]` as written. Every field is optional here; what a preset
+/// fills in and what must be given is decided when it is resolved
+/// ([`crate::ecosystem::target::resolve`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct CloneEntry {
+    pub preset: Option<String>,
+    pub dir: Option<String>,
+    pub path: Option<String>,
+    pub key: Option<Vec<String>>,
+    pub key_commands: Option<Vec<String>>,
+    pub install: Option<String>,
+    pub verify: Option<String>,
+    pub rewrite_paths: Option<bool>,
+    pub after: Option<Vec<String>>,
+}
+
+/// The keys a `[[clone]]` accepts.
+pub const CLONE_KEYS: [&str; 9] = [
+    "preset",
+    "dir",
+    "path",
+    "key",
+    "key_commands",
+    "install",
+    "verify",
+    "rewrite_paths",
+    "after",
+];
 
 /// `[pool]`: how many ready worktrees to keep.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -145,6 +179,7 @@ fn allowed_keys(section: &str) -> Option<&'static [&'static str]> {
     match section {
         "post_add" | "pre_remove" => Some(&["run", "requires"]),
         "skip_lifecycle" => Some(&["dir", "script", "if_equal"]),
+        "clone" => Some(&CLONE_KEYS),
         _ => None,
     }
 }

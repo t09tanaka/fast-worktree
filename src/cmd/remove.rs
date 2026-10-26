@@ -9,10 +9,11 @@
 //! from git; `git worktree prune` would also drop worktrees that are merely
 //! out of sight, such as one on a volume that is not mounted.
 
+use crate::ecosystem::{generic, target};
 use crate::error::{bail, Error, Result};
-use crate::hooks::{self, Stage};
+use crate::hooks::{self, Config, Stage};
 use crate::util::{errln, outln};
-use crate::{git, pending, pool, trash, util};
+use crate::{git, paths, pending, pool, trash, util};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -178,6 +179,7 @@ pub fn run(opts: Opts) -> Result<i32> {
     if std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
         std::env::set_current_dir(&main)?;
     }
+    reclaim(&path, &main, &cfg);
     trash::sweep();
     let dest = match trash::trash(&path) {
         Ok(d) => d,
@@ -205,6 +207,27 @@ pub fn run(opts: Opts) -> Result<i32> {
         return Ok(delete_branch(&main, branch.as_deref(), &merged));
     }
     Ok(0)
+}
+
+/// Right before the worktree `root` goes: move the directories of its
+/// `[[clone]]` entries without a preset into the cache, where the next
+/// worktree with the same key clones them ([`generic::reclaim`]). Prints
+/// what it did; a failure only means they are deleted with the worktree.
+pub fn reclaim(root: &Path, main: &Path, cfg: &Config) {
+    if cfg.clone.is_empty() {
+        return;
+    }
+    let targets = match target::targets(root, cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            outln!("note   nothing kept in the cache: {e}");
+            return;
+        }
+    };
+    let cache_repo = paths::cache_root().join(paths::repo_key(main));
+    for line in generic::reclaim(root, main, &cache_repo, &targets) {
+        outln!("{line}");
+    }
 }
 
 /// Delete the branch. One found merged ([`git::merged`]) is deleted with

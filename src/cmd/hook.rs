@@ -356,6 +356,11 @@ fn remove_worktree() -> Result<()> {
             "{e}; the worktree is still there and still registered"
         ))
     })?;
+    // What is kept is kept whole; only a worktree that goes for good gives
+    // its build caches to the next one.
+    if !keep {
+        remove::reclaim(&path, &main, &cfg);
+    }
     trash::sweep();
     let moved = if keep {
         trash::keep(&path, KEEP_SECS)

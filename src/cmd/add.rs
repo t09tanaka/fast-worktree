@@ -2,7 +2,7 @@
 //! `.worktreeinclude` files, then `install`, in one command.
 
 use super::install;
-use crate::ecosystem::{self, dart, Mode, Project};
+use crate::ecosystem::{target, Mode, Target};
 use crate::error::{bail, Result};
 use crate::hooks::Config;
 use crate::util::{errln, outln};
@@ -179,10 +179,10 @@ fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<Spare> {
 /// Everything after the worktree exists. Returns whether it all succeeded.
 fn prepare(root: &Path, spare: Option<&Spare>, defer: bool) -> Result<bool> {
     copy_included(root);
-    if let Some(s) = spare {
-        rewrite_moved(root, &s.made_at);
-    }
     let cfg = Config::load(root)?;
+    if let Some(s) = spare {
+        rewrite_moved(root, &cfg, &s.made_at);
+    }
     let mode = match (spare.is_some(), defer) {
         (false, false) => Mode::Missing,
         (false, true) => Mode::CloneOnly,
@@ -198,7 +198,7 @@ fn prepare(root: &Path, spare: Option<&Spare>, defer: bool) -> Result<bool> {
         }
     }
     if !done.missing.is_empty() {
-        let dirs: Vec<String> = done.missing.iter().map(|p| p.dir.clone()).collect();
+        let dirs: Vec<String> = done.missing.iter().map(|p| p.name.clone()).collect();
         // The background install runs the post_add hooks when it is done.
         return match pending::spawn(root, &dirs) {
             Ok(()) => {
@@ -215,19 +215,19 @@ fn prepare(root: &Path, spare: Option<&Spare>, defer: bool) -> Result<bool> {
     Ok(done.ok && hooks_ok)
 }
 
-/// In the files Flutter generated in a spare's Dart projects, replace the
-/// path where the spare was made (`made_at`) with `root`.
-fn rewrite_moved(root: &Path, made_at: &[PathBuf]) {
-    let Ok(projects) = ecosystem::discover(root) else {
+/// In the files of a spare's targets that record where it was made
+/// (`made_at`), such as those Flutter generates in its Dart projects,
+/// replace that path with `root` ([`crate::ecosystem::Preset::rewrite_moved`]).
+fn rewrite_moved(root: &Path, cfg: &Config, made_at: &[PathBuf]) {
+    let Ok(projects) = target::targets(root, cfg) else {
         return;
     };
-    for p in projects.iter().filter(|p| p.ecosystem.name() == "pub") {
-        let project = ecosystem::project_path(root, &p.dir);
-        let n = dart::rewrite_moved_paths(&project, made_at, root);
+    for p in &projects {
+        let n = p.preset.rewrite_moved(root, p, made_at);
         if n > 0 {
             outln!(
                 "paths  {}: {n} generated file(s) pointed to where the spare was made, rewritten",
-                p.dir
+                p.name
             );
         }
     }
@@ -237,7 +237,7 @@ fn rewrite_moved(root: &Path, made_at: &[PathBuf]) {
 /// whatever its projects' own install steps wrote by absolute path points
 /// there. Run those steps again for the projects among `kept`, here.
 /// Returns the projects where that failed.
-fn rerun_moved(root: &Path, kept: &[Project], cfg: &Config) -> Vec<Project> {
+fn rerun_moved(root: &Path, kept: &[Target], cfg: &Config) -> Vec<Target> {
     let cache_repo = match install::main_checkout(root) {
         Ok(main) => paths::cache_root().join(paths::repo_key(&main)),
         Err(e) => {
@@ -248,8 +248,8 @@ fn rerun_moved(root: &Path, kept: &[Project], cfg: &Config) -> Vec<Project> {
     let mut failed = Vec::new();
     for p in kept {
         match p
-            .ecosystem
-            .rerun_own_scripts(root, &p.dir, &cfg.skip_lifecycle, &cache_repo)
+            .preset
+            .rerun_own_scripts(root, p, &cfg.skip_lifecycle, &cache_repo)
         {
             Ok(notes) => {
                 for n in notes {

@@ -1,7 +1,9 @@
 pub mod add;
 pub mod cache;
 pub mod check;
+pub mod config;
 pub mod hook;
 pub mod install;
 pub mod kept;
+pub mod plan;
 pub mod remove;

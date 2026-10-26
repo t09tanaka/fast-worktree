@@ -1,10 +1,12 @@
 //! The dependency cache.
 //!
 //! An entry is a directory `<cache>/<repo>/<project>/<key>` holding one
-//! installed `node_modules`. Next to it, `<key>.ok` records that the tree
-//! was checked for absolute symlinks when it was stored, so cloning it does
-//! not walk every file again. The marker lives outside the entry so that it
-//! is never cloned into a worktree.
+//! installed `node_modules` (or, for a `[[clone]]` without a preset, its
+//! `path`, under `<cache>/<repo>/<path>/<key>`). Next to it, `<key>.ok`
+//! records that the tree was checked for absolute symlinks when it was
+//! stored, so cloning it does not walk every file again, and `<key>.src`
+//! the worktree it was made in, for `rewrite_paths`. These live outside the
+//! entry so that they are never cloned into a worktree.
 //!
 //! An entry's modification time is its "last used": it is set when the
 //! entry is stored and each time it is cloned.
@@ -20,6 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const TTL_DAYS: u64 = 7;
 
 const MARKER_SUFFIX: &str = ".ok";
+const SOURCE_SUFFIX: &str = ".src";
 const TMP_INFIX: &str = ".tmp-";
 
 /// Where the "checked" marker of `entry` lives.
@@ -39,11 +42,32 @@ pub fn mark_checked(entry: &Path) {
     let _ = fs::write(marker(entry), b"");
 }
 
+/// Where the record of the worktree `entry` was made in lives.
+fn source_record(entry: &Path) -> PathBuf {
+    let mut s = entry.as_os_str().to_owned();
+    s.push(SOURCE_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// Record that `entry` was made in the worktree `root`.
+pub fn record_source(entry: &Path, root: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let _ = fs::write(source_record(entry), root.as_os_str().as_bytes());
+}
+
+/// The worktree `entry` was made in, when that was recorded.
+pub fn source(entry: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = fs::read(source_record(entry)).ok()?;
+    (!bytes.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)))
+}
+
 /// A directory name that is an entry, not a marker, a half-made entry, or
 /// a spare of the pool (which lives in `<repo>/pool`, where a project
 /// directory named `pool` would keep its entries too).
 fn is_entry_name(name: &str) -> bool {
     !name.ends_with(MARKER_SUFFIX)
+        && !name.ends_with(SOURCE_SUFFIX)
         && !name.contains(TMP_INFIX)
         && !name.starts_with('.')
         && !name.starts_with(crate::pool::SPARE_PREFIX)
@@ -52,9 +76,15 @@ fn is_entry_name(name: &str) -> bool {
 /// Clone `node_modules` into the cache at `entry`, unless it is there
 /// already. Built under a temporary name and renamed, so a concurrent run
 /// never sees a half-made entry. `checked` says the tree was already found
-/// free of absolute symlinks; otherwise it is checked here, once, and a
-/// tree that has one is not cached (it may point into its worktree).
-pub fn store(node_modules: &Path, entry: &Path, checked: bool) -> Result<(), String> {
+/// free of absolute symlinks (or need not be); otherwise it is checked
+/// here, once, and a tree that has one is not cached (it may point into its
+/// worktree). `made_in` is the worktree it was made in.
+pub fn store(
+    node_modules: &Path,
+    entry: &Path,
+    checked: bool,
+    made_in: &Path,
+) -> Result<(), String> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     if entry.exists() {
         return Ok(());
@@ -75,10 +105,29 @@ pub fn store(node_modules: &Path, entry: &Path, checked: bool) -> Result<(), Str
     touch(&tmp);
     if fs::rename(&tmp, entry).is_ok() {
         mark_checked(entry);
+        record_source(entry, made_in);
     } else {
         let _ = trash::trash(&tmp);
     }
     Ok(())
+}
+
+/// Move the directory `dir` into the cache as `entry`, by rename, unless
+/// there is an entry already. `made_in` is the worktree it comes from. An
+/// error when it cannot be renamed there (another volume), in which case it
+/// stays where it is.
+pub fn adopt(dir: &Path, entry: &Path, made_in: &Path) -> Result<bool, String> {
+    if entry.exists() {
+        return Ok(false);
+    }
+    let parent = entry.parent().ok_or("no parent")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    fs::rename(dir, entry).map_err(|e| e.to_string())?;
+    let _ = fs::remove_dir_all(entry.join(".cache"));
+    touch(entry);
+    mark_checked(entry);
+    record_source(entry, made_in);
+    Ok(true)
 }
 
 /// The most recently used entry in `project_dir` (one project of one
@@ -112,7 +161,8 @@ pub fn prune(project_dir: &Path, ttl: Duration) -> Vec<PathBuf> {
     for e in entries.flatten() {
         let Ok(meta) = e.metadata() else { continue };
         if !meta.is_dir() {
-            if e.file_name().to_string_lossy().ends_with(MARKER_SUFFIX) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(MARKER_SUFFIX) || name.ends_with(SOURCE_SUFFIX) {
                 markers.push(e.path());
             }
             continue;
@@ -131,7 +181,11 @@ pub fn prune(project_dir: &Path, ttl: Duration) -> Vec<PathBuf> {
     }
     for m in markers {
         let s = m.to_string_lossy();
-        let entry = Path::new(s.strip_suffix(MARKER_SUFFIX).unwrap_or(&s));
+        let entry = Path::new(
+            s.strip_suffix(MARKER_SUFFIX)
+                .or_else(|| s.strip_suffix(SOURCE_SUFFIX))
+                .unwrap_or(&s),
+        );
         if !entry.is_dir() {
             let _ = fs::remove_file(&m);
         }
@@ -183,7 +237,8 @@ pub fn is_repo_name(name: &str) -> bool {
 }
 
 /// Whether an entry's name is a key, as [`crate::ecosystem::npm::cache_key`]
-/// makes them: `<16 hex digits>-<node -v>`.
+/// makes them, `<16 hex digits>-<node -v>`, and a `[[clone]]` without a
+/// preset, `<16 hex digits>-<8 hex digits>`.
 fn is_key_name(name: &str) -> bool {
     is_entry_name(name)
         && name.split_once('-').is_some_and(|(h, v)| {
@@ -358,7 +413,10 @@ mod tests {
         fs::create_dir_all(proj.join("wt-1-1-0")).unwrap();
         mark_checked(&proj.join("old-v20.1"));
         mark_checked(&proj.join("new-v20.1"));
+        record_source(&proj.join("old-v20.1"), Path::new("/wt/a"));
+        record_source(&proj.join("new-v20.1"), Path::new("/wt/b"));
         fs::write(proj.join("gone-v20.1.ok"), "").unwrap();
+        fs::write(proj.join("gone-v20.1.src"), "/x").unwrap();
         std::thread::sleep(Duration::from_millis(1100));
         touch(&proj.join("new-v20.1"));
         let removed = prune(&proj, Duration::from_secs(1));
@@ -366,6 +424,13 @@ mod tests {
         assert!(!proj.join("old-v20.1").exists());
         assert!(!proj.join("old-v20.1.ok").exists());
         assert!(!proj.join("gone-v20.1.ok").exists(), "orphan marker");
+        assert!(!proj.join("gone-v20.1.src").exists(), "orphan record");
+        assert!(!proj.join("old-v20.1.src").exists());
+        assert_eq!(
+            source(&proj.join("new-v20.1")),
+            Some(PathBuf::from("/wt/b"))
+        );
+        assert_eq!(source(&proj.join("none")), None);
         assert!(proj.join("new-v20.1").exists());
         assert!(proj.join("wt-1-1-0").exists(), "spares are not entries");
         assert!(is_checked(&proj.join("new-v20.1")));
@@ -410,6 +475,24 @@ mod tests {
     }
 
     #[test]
+    fn adopt_moves_a_directory_in_unless_the_entry_exists() {
+        let t = tempfile::tempdir().unwrap();
+        let wt = t.path().join("wt");
+        fs::create_dir_all(wt.join("Pods/.cache")).unwrap();
+        fs::write(wt.join("Pods/Manifest.lock"), "m").unwrap();
+        let entry = t.path().join("c/repo/Pods/0123456789abcdef-01234567");
+        assert_eq!(adopt(&wt.join("Pods"), &entry, &wt), Ok(true));
+        assert!(!wt.join("Pods").exists());
+        assert!(entry.join("Manifest.lock").is_file());
+        assert!(!entry.join(".cache").exists());
+        assert!(is_checked(&entry));
+        assert_eq!(source(&entry), Some(wt.clone()));
+        fs::create_dir_all(wt.join("Pods")).unwrap();
+        assert_eq!(adopt(&wt.join("Pods"), &entry, &wt), Ok(false));
+        assert!(wt.join("Pods").is_dir(), "left where it is");
+    }
+
+    #[test]
     fn repository_and_key_names() {
         assert!(is_repo_name("app-1234abcd"));
         assert!(is_repo_name("my-app-0000ffff"));
@@ -421,6 +504,8 @@ mod tests {
         assert!(!is_key_name("0123456789abcdef-v20.13.1.ok"));
         assert!(!is_key_name("ansi-colors"));
         assert!(!is_key_name("0123456789abcdef"));
+        assert!(is_key_name("0123456789abcdef-01234567"));
+        assert!(!is_key_name("0123456789abcdef-01234567.src"));
     }
 
     #[test]

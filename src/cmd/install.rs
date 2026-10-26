@@ -1,6 +1,6 @@
 //! `fast-worktree install`: make every tracked project's dependencies present.
 
-use crate::ecosystem::{self, Ctx, Mode, Project, Report};
+use crate::ecosystem::{target, Ctx, Mode, Report, Target};
 use crate::error::{bail, Result};
 use crate::hooks::{self, Config, Stage};
 use crate::util::outln;
@@ -42,10 +42,10 @@ fn install(root: &Path, opts: &Opts) -> Result<i32> {
 pub struct Installed {
     /// No project failed.
     pub ok: bool,
-    /// Projects a clone-only mode could not provide, still to install.
-    pub missing: Vec<Project>,
-    /// Projects whose dependencies were left as they were.
-    pub kept: Vec<Project>,
+    /// Targets a clone-only mode could not provide, still to install.
+    pub missing: Vec<Target>,
+    /// Targets whose dependencies were left as they were.
+    pub kept: Vec<Target>,
 }
 
 /// Real path of the main checkout of the repository at `root`.
@@ -60,19 +60,20 @@ pub fn main_checkout(root: &Path) -> Result<PathBuf> {
         .unwrap_or_else(|_| main.path.clone()))
 }
 
-/// Install into every project under `root` (or only `only`, given relative
-/// to `root` or to the current directory). Prints one line per project.
+/// Install every target of `root` ([`target::targets`]: its `[[clone]]`
+/// entries, else the tracked projects), or only `only`, given relative to
+/// `root` or to the current directory. Prints one line per target.
 pub fn install_deps(root: &Path, only: &[String], cfg: &Config, mode: Mode) -> Result<Installed> {
     let start = Instant::now();
     let root = root.canonicalize()?;
-    let mut projects = ecosystem::discover(&root)?;
+    let mut projects = target::targets(&root, cfg)?;
     if !only.is_empty() {
-        let dirs: Vec<&str> = projects.iter().map(|p| p.dir.as_str()).collect();
+        let dirs: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
         let wanted: Vec<String> = only
             .iter()
             .map(|p| resolve_project(&relative_project(&root, p)?, p, &dirs))
             .collect::<Result<_>>()?;
-        projects.retain(|p| wanted.contains(&p.dir));
+        projects.retain(|p| wanted.contains(&p.name));
     }
     if projects.is_empty() {
         outln!("no lockfile tracked");
@@ -90,7 +91,7 @@ pub fn install_deps(root: &Path, only: &[String], cfg: &Config, mode: Mode) -> R
         out.ok &= print_result(p, &r);
         match &r {
             Ok(rep) if rep.missing => {
-                outln!("later  {} (installed in the background)", p.dir);
+                outln!("later  {} (installed in the background)", p.name);
                 out.missing.push(p.clone());
             }
             Ok(rep) if rep.kept => out.kept.push(p.clone()),
@@ -101,17 +102,8 @@ pub fn install_deps(root: &Path, only: &[String], cfg: &Config, mode: Mode) -> R
     Ok(out)
 }
 
-/// Install `projects` of the worktree `root` in parallel, one result per
-/// project in the same order. Nothing is printed. This is the entry point
-/// for callers that pick the projects themselves; with [`Mode::Changed`],
-/// projects whose dependencies are present and up to date are left alone.
-pub fn install_projects(
-    root: &Path,
-    projects: &[Project],
-    cfg: &Config,
-    mode: Mode,
-) -> Result<Vec<std::result::Result<Report, String>>> {
-    trash::sweep();
+/// What an install in the worktree `root` needs to know.
+pub fn context(root: &Path, cfg: &Config) -> Result<Ctx> {
     let root = root.canonicalize()?;
     let worktrees: Vec<PathBuf> = git::worktrees(&root)?
         .into_iter()
@@ -120,33 +112,56 @@ pub fn install_projects(
     let Some(main) = worktrees.first().cloned() else {
         bail!("no worktrees registered");
     };
-    let ctx = Ctx {
+    Ok(Ctx {
         root,
-        worktrees,
         cache_repo: paths::cache_root().join(paths::repo_key(&main)),
+        main,
+        worktrees,
         skip_lifecycle: cfg.skip_lifecycle.clone(),
-    };
-    Ok(std::thread::scope(|s| {
-        let handles: Vec<_> = projects
-            .iter()
-            .map(|p| {
-                let ctx = &ctx;
-                s.spawn(move || p.ecosystem.install(ctx, &p.dir, mode))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Err("install thread panicked".into()))
-            })
-            .collect()
-    }))
+    })
+}
+
+/// Install `projects` of the worktree `root`, one result per target in the
+/// same order. Nothing is printed. Targets with a preset run in parallel
+/// first, then those without one (in parallel too): a `[[clone]]` such as
+/// `ios/Pods` is usually made from what the presets install. This is the
+/// entry point for callers that pick the targets themselves; with
+/// [`Mode::Changed`], targets that are present and up to date are left
+/// alone.
+pub fn install_projects(
+    root: &Path,
+    projects: &[Target],
+    cfg: &Config,
+    mode: Mode,
+) -> Result<Vec<std::result::Result<Report, String>>> {
+    trash::sweep();
+    let ctx = context(root, cfg)?;
+    let mut results: Vec<Option<std::result::Result<Report, String>>> = vec![None; projects.len()];
+    for phase in [true, false] {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = projects
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.has_preset() == phase)
+                .map(|(i, p)| {
+                    let ctx = &ctx;
+                    (i, s.spawn(move || p.preset.install(ctx, p, mode)))
+                })
+                .collect();
+            for (i, h) in handles {
+                results[i] = Some(
+                    h.join()
+                        .unwrap_or_else(|_| Err("install thread panicked".into())),
+                );
+            }
+        });
+    }
+    Ok(results.into_iter().flatten().collect())
 }
 
 /// Print one project's result (also for `check`, so it never panics on a
 /// closed stdout). Returns whether it succeeded.
-pub fn print_result(p: &Project, r: &std::result::Result<Report, String>) -> bool {
+pub fn print_result(p: &Target, r: &std::result::Result<Report, String>) -> bool {
     match r {
         Ok(report) => {
             if !report.lines.is_empty() {
@@ -155,7 +170,7 @@ pub fn print_result(p: &Project, r: &std::result::Result<Report, String>) -> boo
             true
         }
         Err(log) => {
-            let mut s = format!("FAILED {}:\n", p.dir);
+            let mut s = format!("FAILED {}:\n", p.name);
             for l in util::tail(log, 30).lines() {
                 s.push_str(&format!("  {l}\n"));
             }
