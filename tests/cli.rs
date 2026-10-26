@@ -3764,16 +3764,16 @@ fn took_and_waited(out: &str, what: &str) -> Option<(f64, f64)> {
 fn the_wait_for_the_lifecycle_lock_is_shown_apart() {
     let w = World::new();
     let main = w.main();
-    // lib has no script, so this takes no lock; it makes the repository's
-    // cache directory.
-    w.fw(&main, &["install", "lib"]).assert_ok();
-    let repo = fs::read_dir(&w.cache)
+    // app's postinstall takes the lock, which makes its file.
+    w.fw(&main, &["install"]).assert_ok();
+    let lock_file = fs::read_dir(&w.cache)
         .unwrap()
         .flatten()
-        .find(|e| e.file_name() != "trash")
-        .unwrap()
-        .path();
-    let lock = hold_lock(&repo.join("lifecycle.lock"));
+        .map(|e| e.path().join("lifecycle.lock"))
+        .find(|p| p.is_file())
+        .expect("a lifecycle lock");
+    fs::remove_dir_all(main.join("app/node_modules")).unwrap();
+    let lock = hold_lock(&lock_file);
     let mut c = Command::new(env!("CARGO_BIN_EXE_fast-worktree"));
     w.env(&mut c);
     let child = c
@@ -3787,8 +3787,10 @@ fn the_wait_for_the_lifecycle_lock_is_shown_apart() {
     drop(lock);
     let r = Run(child.wait_with_output().unwrap());
     r.assert_ok();
-    let (took, waited) =
-        took_and_waited(&r.out(), "npm ci app (").unwrap_or_else(|| panic!("{}", r.out()));
+    // npm ci, or on macOS a clone from the cache, whose postinstall waits.
+    let (took, waited) = took_and_waited(&r.out(), "npm ci app (")
+        .or_else(|| took_and_waited(&r.out(), "clone  app from "))
+        .unwrap_or_else(|| panic!("{}", r.out()));
     assert!(waited >= 1.0, "{}", r.out());
     assert!(took < waited, "the wait is not in the time: {}", r.out());
 }
