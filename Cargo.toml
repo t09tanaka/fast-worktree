@@ -1,0 +1,11 @@
+[package]
+name = "fast-worktree"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Create git worktrees with their dependencies in seconds, and remove them in one"
+license = "MIT"
+repository = "https://github.com/t09tanaka/fast-worktree"
+readme = "README.md"
+
+[dependencies]
