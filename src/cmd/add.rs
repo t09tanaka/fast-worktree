@@ -87,7 +87,10 @@ pub fn create(here: &Path, path: &Path, branch: &Branch, defer: bool) -> Result<
     };
     if spare.is_none() {
         let p = path.to_string_lossy().into_owned();
-        let mut args = vec!["worktree", "add", &p];
+        // `--quiet`: no "Preparing worktree" lines and, above all, no
+        // "Updating files: N%" progress, which git prints on a terminal for
+        // a large checkout. Errors are still printed.
+        let mut args = vec!["worktree", "add", "--quiet", &p];
         match branch {
             Branch::New { name, start } => args.extend(["-b", name, start]),
             Branch::Existing(name) => args.push(name),

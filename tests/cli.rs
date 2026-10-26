@@ -3443,3 +3443,50 @@ fn everything_works_with_relative_worktree_paths() {
     assert_eq!(list.matches("worktree ").count(), 1, "{list}");
     assert_eq!(w.git(&main, &["worktree", "prune", "-n", "-v"]), "");
 }
+
+// ---- v0.2.1 ----
+
+impl World {
+    /// Run fast-worktree on a pseudo-terminal (`script`), where git shows
+    /// its progress. `None` when `script` is not there. stdout and stderr
+    /// both come back on stdout.
+    fn fw_on_tty(&self, dir: &Path, args: &[&str], extra: &[(&str, &str)]) -> Option<Run> {
+        let bin = env!("CARGO_BIN_EXE_fast-worktree");
+        let mut c = Command::new("script");
+        if cfg!(target_os = "macos") {
+            c.args(["-q", "/dev/null", bin]).args(args);
+        } else {
+            let line: Vec<String> = std::iter::once(bin)
+                .chain(args.iter().copied())
+                .map(|a| format!("'{a}'"))
+                .collect();
+            c.args(["-qec", &line.join(" "), "/dev/null"]);
+        }
+        self.env(&mut c);
+        for (k, v) in extra {
+            c.env(k, v);
+        }
+        c.current_dir(dir).output().ok().map(Run)
+    }
+}
+
+#[test]
+fn add_shows_no_git_progress_on_a_terminal() {
+    let w = World::new();
+    let main = w.main();
+    // Progress at once, however short the checkout.
+    let now = [("GIT_PROGRESS_DELAY", "0")];
+    let Some(r) = w.fw_on_tty(&main, &["add", "../wt", "-b", "x"], &now) else {
+        eprintln!("skipped: no `script` to make a terminal");
+        return;
+    };
+    let out = r.out();
+    assert!(w.base.join("wt/app/package.json").is_file(), "{out}");
+    assert!(out.contains("worktree added in "), "{out}");
+    assert!(!out.contains("Updating files"), "{out}");
+    assert!(!out.contains("Preparing worktree"), "{out}");
+    // git's errors still come through.
+    let r = w.fw(&main, &["add", "../wt", "-b", "y"]);
+    r.assert_fails();
+    assert!(r.err().contains("already exists"), "{}", r.err());
+}
