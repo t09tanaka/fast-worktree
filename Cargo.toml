@@ -1,6 +1,6 @@
 [package]
 name = "fast-worktree"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Create a git worktree with its dependencies in seconds, and remove it in one"
@@ -16,6 +16,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+toml_edit = "0.22"
 sha2 = "0.10"
 libc = "0.2"
 ignore = "0.4"

@@ -55,9 +55,16 @@ const KEEP_PREFIX: &str = "keep-";
 /// where it went. Falls back to a hidden sibling when the trash directory
 /// is on another volume, so the rename stays cheap.
 pub fn trash(path: &Path) -> io::Result<PathBuf> {
-    let dest = move_away(path, &unique_name(path))?;
+    let dest = move_aside(path)?;
     spawn_rm(&dest);
     Ok(dest)
+}
+
+/// Move `path` into the trash as [`trash`] does, but start no deleter:
+/// the caller takes what it needs out of it first, then calls
+/// [`spawn_rm`]. One left there is deleted by a later [`sweep`].
+pub fn move_aside(path: &Path) -> io::Result<PathBuf> {
+    move_away(path, &unique_name(path))
 }
 
 /// Move `path` into the trash and leave it there for at least `secs`

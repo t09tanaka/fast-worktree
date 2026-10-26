@@ -1,0 +1,7 @@
+PODS:
+  - Example (1.0.0)
+
+DEPENDENCIES:
+  - Example (from `Example`)
+
+COCOAPODS: 1.15.2

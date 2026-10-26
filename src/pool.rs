@@ -34,10 +34,10 @@
 //! the path where the spare was made is replaced with the new one in the
 //! files Flutter generated ([`crate::ecosystem::dart::rewrite_moved_paths`]),
 //! and the npm projects' own install steps run again where the worktree now
-//! is ([`crate::ecosystem::Ecosystem::rerun_own_scripts`]).
+//! is ([`crate::ecosystem::Preset::rerun_own_scripts`]).
 
 use crate::cmd::install;
-use crate::ecosystem::{self, Mode};
+use crate::ecosystem::{self, target, Mode};
 use crate::error::{bail, Error, Result};
 use crate::hooks::{self, Config};
 use crate::util::{errln, out, outln};
@@ -467,7 +467,9 @@ fn make_spare(main: &Path, pool: &Path, base: &str) -> Result<()> {
             _ => bail!("installing into a new spare failed"),
         }
     }
-    drop_absolute_symlinks(&building);
+    if let Ok(cfg) = Config::load(&building) {
+        drop_absolute_symlinks(&building, &cfg);
+    }
     git::output(main, &["worktree", "lock", "--reason", LOCK_REASON, &b])?;
     let ready = pool.join(&id);
     fs::rename(&building, &ready)?;
@@ -485,8 +487,11 @@ fn make_spare(main: &Path, pool: &Path, base: &str) -> Result<()> {
 /// Move away the `node_modules` of the spare at `root` that have a symlink
 /// with an absolute target: it points into the pool, where the spare will
 /// not be. The `add` that takes the spare installs those projects again.
-fn drop_absolute_symlinks(root: &Path) {
-    for p in ecosystem::discover(root).unwrap_or_default() {
+fn drop_absolute_symlinks(root: &Path, cfg: &Config) {
+    for p in target::targets(root, cfg).unwrap_or_default() {
+        if p.preset.name() != "npm" {
+            continue;
+        }
         let nm = ecosystem::project_path(root, &p.dir).join("node_modules");
         if nm.is_dir() && clone::has_absolute_symlink(&nm) {
             let _ = trash::trash(&nm);

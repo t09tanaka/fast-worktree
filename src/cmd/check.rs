@@ -1,8 +1,9 @@
 //! `fast-worktree check`: list projects whose dependencies are missing.
 //!
 //! Meant for a `post-checkout` hook, so it always exits 0. Plain `check`
-//! spawns nothing but `git rev-parse` and one `git ls-files`, and stays
-//! well under 100 ms.
+//! spawns nothing but `git rev-parse` and at most two `git ls-files` (the
+//! tracked lockfiles, when the projects are detected, and whether a
+//! target's `path` holds tracked files), and stays well under 100 ms.
 //!
 //! `check --post-checkout <prev> <new> <flag>` takes the hook's arguments.
 //! Right after `git worktree add` or `git clone` (`<prev>` is all zeros and
@@ -15,7 +16,7 @@
 //! change the exit code.
 
 use super::install;
-use crate::ecosystem::{self, Mode, Project};
+use crate::ecosystem::{target, Mode, Target};
 use crate::hooks::Config;
 use crate::{git, paths, pending, util};
 use std::env;
@@ -25,8 +26,14 @@ pub fn run(quiet: bool) -> i32 {
     let Ok(root) = git::toplevel(Path::new(".")) else {
         return 0;
     };
-    let Ok(projects) = ecosystem::discover(&root) else {
-        return 0;
+    // A config that cannot be read says nothing about what is listed: not
+    // detecting in its place, which would name projects it may leave out.
+    let projects = match Config::load(&root).and_then(|cfg| target::targets(&root, &cfg)) {
+        Ok(p) => p,
+        Err(e) => {
+            util::warn(&format!("fast-worktree: {e}\n"));
+            return 0;
+        }
     };
     let missing: Vec<String> = missing(&root, &projects)
         .iter()
@@ -36,8 +43,24 @@ pub fn run(quiet: bool) -> i32 {
         util::say(&report_pending(&missing));
         return 0;
     }
+    let unrecorded = labels(&unrecorded(&root, &projects));
+    util::say(&report_unrecorded(&unrecorded, quiet));
     util::say(&report(&missing, projects.len(), quiet));
     0
+}
+
+/// Directories that are there without a record of what they were made
+/// from, which `install` leaves as they are: not listed as missing, so that
+/// `check` never sends anyone to an install that would not touch them (or,
+/// with `--changed`, would replace them). Said only when not `quiet`.
+pub fn report_unrecorded(unrecorded: &[String], quiet: bool) -> String {
+    if quiet {
+        return String::new();
+    }
+    unrecorded
+        .iter()
+        .map(|u| format!("not made by fast-worktree, left as it is: {u}\n"))
+        .collect()
 }
 
 /// While `hook create`'s background install runs.
@@ -57,13 +80,21 @@ fn in_cache(dir: &std::path::Path) -> bool {
     dir.canonicalize().is_ok_and(|d| d.starts_with(&root))
 }
 
-fn missing(root: &Path, projects: &[Project]) -> Vec<Project> {
+/// The targets that are not installed, but those [`unrecorded`] names.
+fn missing(root: &Path, projects: &[Target]) -> Vec<Target> {
     projects
         .iter()
-        .filter(|p| {
-            !p.ecosystem
-                .is_installed(&ecosystem::project_path(root, &p.dir))
-        })
+        .filter(|p| !p.preset.is_installed(root, p) && !p.preset.is_unrecorded(root, p))
+        .cloned()
+        .collect()
+}
+
+/// The targets whose directory is there without a record of its key
+/// ([`crate::ecosystem::Preset::is_unrecorded`]).
+fn unrecorded(root: &Path, projects: &[Target]) -> Vec<Target> {
+    projects
+        .iter()
+        .filter(|p| !p.preset.is_installed(root, p) && p.preset.is_unrecorded(root, p))
         .cloned()
         .collect()
 }
@@ -120,17 +151,26 @@ fn clone_missing() {
     let Ok(root) = git::toplevel(Path::new(".")) else {
         return;
     };
-    let Ok(projects) = ecosystem::discover(&root) else {
-        return;
+    // As in `run`: a config that cannot be read is not replaced by
+    // detection, which would clone projects it may leave out.
+    let cfg = match Config::load(&root) {
+        Ok(c) => c,
+        Err(e) => {
+            util::warn(&format!("fast-worktree: {e}\n"));
+            return;
+        }
+    };
+    let projects = match target::targets(&root, &cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            util::warn(&format!("fast-worktree: {e}\n"));
+            return;
+        }
     };
     let todo = missing(&root, &projects);
     if todo.is_empty() {
         return;
     }
-    let cfg = Config::load(&root).unwrap_or_else(|e| {
-        util::warn(&format!("fast-worktree: {e}\n"));
-        Config::default()
-    });
     let results = match install::install_projects(&root, &todo, &cfg, Mode::CloneOnly) {
         Ok(r) => r,
         Err(e) => {
@@ -160,8 +200,8 @@ fn clone_missing() {
     util::say(&report(&still, projects.len(), true));
 }
 
-fn labels(projects: &[Project]) -> Vec<String> {
-    projects.iter().map(Project::label).collect()
+fn labels(projects: &[Target]) -> Vec<String> {
+    projects.iter().map(Target::label).collect()
 }
 
 pub fn report(missing: &[String], total: usize, quiet: bool) -> String {
