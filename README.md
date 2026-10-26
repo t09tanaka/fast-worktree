@@ -492,8 +492,8 @@ its own worktrees.
 **`hook create`** reads the hook input on stdin (`name`, and `cwd`, from
 which it finds the main checkout) and creates the worktree where Claude
 Code would: `<main checkout>/.claude/worktrees/<name>`, on a new branch
-`worktree-<name>` from origin's default branch, fetched (from `HEAD` when
-there is no origin), as [Claude Code's
+`worktree-<name>` from origin's default branch, fetched (for at most 5
+seconds, else as last fetched; from `HEAD` when there is no origin), as [Claude Code's
 documentation](https://code.claude.com/docs/en/worktrees) describes its own.
 If that branch exists (a previous `hook remove` kept it), it is checked
 out; if the worktree exists, it is used as it is.

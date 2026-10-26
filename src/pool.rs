@@ -317,7 +317,7 @@ fn stamp() -> String {
 /// fetch is reported and the ref as last fetched is used.
 fn fetched_base(main: &Path) -> Result<String> {
     let base = git::origin_default_branch(main)?;
-    if let Err(e) = git::fetch_quietly(main, &base) {
+    if let Err(e) = git::fetch_quietly(main, &base, None) {
         println!("note   pool: fetch failed, using origin/{base} as last fetched: {e}");
     }
     Ok(format!("origin/{base}"))

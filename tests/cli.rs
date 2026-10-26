@@ -1945,7 +1945,7 @@ fn hook_create_prints_the_worktree_path_last() {
     w.git(&main, &["pull", "-q"]);
     fs::write(main.join(".env"), "SECRET=1\n").unwrap();
 
-    let r = w.hook_create("feat", &[("FAKE_NPM_SLEEP", "1")]);
+    let r = w.hook_create("feat", &[("FAKE_NPM_SLEEP", "3")]);
     r.assert_ok();
     let path = PathBuf::from(last_line(&r.out()));
     assert_eq!(

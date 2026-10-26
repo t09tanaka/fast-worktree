@@ -4,6 +4,7 @@ use crate::error::{bail, Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn command(dir: &Path) -> Command {
     let mut c = Command::new("git");
@@ -226,14 +227,36 @@ pub fn branch_exists(dir: &Path, branch: &str) -> bool {
 }
 
 /// `git fetch -q origin <branch>` that never waits for a password or a
-/// passphrase: without a terminal prompt, it fails instead.
-pub fn fetch_quietly(dir: &Path, branch: &str) -> Result<()> {
-    output_with_env(
-        dir,
-        &["fetch", "-q", "origin", branch],
-        &[("GIT_TERMINAL_PROMPT", "0")],
-    )
-    .map(|_| ())
+/// passphrase: without a terminal prompt, it fails instead. With `limit`,
+/// a fetch still running after that long is stopped and counts as failed.
+pub fn fetch_quietly(dir: &Path, branch: &str, limit: Option<Duration>) -> Result<()> {
+    let args = ["fetch", "-q", "origin", branch];
+    let Some(limit) = limit else {
+        return output_with_env(dir, &args, &[("GIT_TERMINAL_PROMPT", "0")]).map(|_| ());
+    };
+    let mut child = command(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| Error(format!("cannot run git: {e}")))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(s) if s.success() => return Ok(()),
+            Some(_) => bail!("git fetch origin {branch} failed"),
+            None if start.elapsed() >= limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "git fetch origin {branch} took longer than {}s",
+                    limit.as_secs()
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
 }
 
 /// The remote's default branch, from `refs/remotes/origin/HEAD`. When that

@@ -26,6 +26,10 @@ use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// How long `hook create` lets the fetch of the default branch take (it
+/// holds up the session; Claude Code caps its own fetch at 5 seconds).
+const FETCH_LIMIT: Duration = Duration::from_secs(5);
+
 /// How long `hook remove` keeps a worktree that had changes.
 pub const KEEP_SECS: u64 = 24 * 3_600;
 
@@ -154,7 +158,7 @@ fn create_worktree() -> Result<PathBuf> {
 fn fresh_start(main: &Path) -> String {
     match git::origin_default_branch(main) {
         Ok(base) => {
-            if let Err(e) = git::fetch_quietly(main, &base) {
+            if let Err(e) = git::fetch_quietly(main, &base, Some(FETCH_LIMIT)) {
                 eprintln!("fast-worktree: fetch failed, using origin/{base} as last fetched: {e}");
             }
             format!("origin/{base}")
