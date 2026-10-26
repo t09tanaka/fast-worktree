@@ -624,6 +624,12 @@ mod tests {
         // flock is per open file: a second open in this process conflicts.
         assert!(try_lock(t.path()).unwrap().is_none());
         drop(held);
-        assert!(try_lock(t.path()).unwrap().is_some());
+        // A child another test is forking right now may hold a copy of the
+        // descriptor until it execs.
+        let start = Instant::now();
+        while try_lock(t.path()).unwrap().is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5), "still locked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
