@@ -13,6 +13,11 @@
 //! 3. `npm ci --prefer-offline --no-audit --no-fund`. The result is cloned
 //!    into the cache.
 //!
+//! Only a tree whose `node_modules/.package-lock.json` matches the lockfile
+//! goes into the cache. A `node_modules` without `.package-lock.json` (an
+//! install that did not finish) does not count as installed: it is moved to
+//! the trash and installed again.
+//!
 //! The key is the first 16 hex digits of the lockfile's sha256 plus the
 //! `node -v` that the project directory resolves (version managers pick
 //! it per directory). The Node version is part of the key and of the
@@ -165,8 +170,17 @@ fn install(ctx: &Ctx, dir: &str) -> Result<String, String> {
     let start = Instant::now();
     let target = super::project_path(&ctx.root, dir);
     let node_modules = target.join("node_modules");
+    let mut lines = Vec::new();
     if node_modules.symlink_metadata().is_ok() {
-        return Ok(format!("skip   {dir} (node_modules already present)"));
+        if Npm.is_installed(&target) {
+            return Ok(format!("skip   {dir} (node_modules already present)"));
+        }
+        // Left by an install that did not finish, or made by hand: npm
+        // writes `.package-lock.json` last.
+        trash::trash(&node_modules).map_err(|e| format!("cannot move node_modules away: {e}"))?;
+        lines.push(format!(
+            "note   {dir}: node_modules has no .package-lock.json, installing again"
+        ));
     }
     let lockfile = fs::read(target.join(LOCKFILE)).map_err(|e| format!("{LOCKFILE}: {e}"))?;
     if !has_dependencies(&lockfile) {
@@ -177,7 +191,6 @@ fn install(ctx: &Ctx, dir: &str) -> Result<String, String> {
         .cache_repo
         .join(project_slug(dir))
         .join(cache_key(&lockfile, &nodev));
-    let mut lines = Vec::new();
 
     if clone::SUPPORTED {
         let from_cache = entry.is_dir();
@@ -200,7 +213,7 @@ fn install(ctx: &Ctx, dir: &str) -> Result<String, String> {
                 Ok(()) => {
                     run_own_lifecycle(&target)?;
                     if !from_cache {
-                        if let Err(e) = cache_store(&node_modules, &entry) {
+                        if let Err(e) = cache_store(&node_modules, &entry, &lockfile) {
                             lines.push(format!("note   {dir}: cache not saved: {e}"));
                         }
                     }
@@ -218,7 +231,7 @@ fn install(ctx: &Ctx, dir: &str) -> Result<String, String> {
 
     npm_ci(&target)?;
     if clone::SUPPORTED && node_modules.is_dir() {
-        if let Err(e) = cache_store(&node_modules, &entry) {
+        if let Err(e) = cache_store(&node_modules, &entry, &lockfile) {
             lines.push(format!("note   {dir}: cache not saved: {e}"));
         }
         if let Some(parent) = entry.parent() {
@@ -329,12 +342,19 @@ fn npm_ci(project: &Path) -> Result<(), String> {
 }
 
 /// Clone `node_modules` into the cache at `entry`, unless it is there
-/// already. Built under a temporary name and renamed, so a concurrent run
-/// never sees a half-made entry.
-fn cache_store(node_modules: &Path, entry: &Path) -> Result<(), String> {
+/// already. Only a tree whose `.package-lock.json` matches `lockfile` is
+/// stored: anything else (an install that wrote part of the tree) would be
+/// cloned into every later worktree. Built under a temporary name and
+/// renamed, so a concurrent run never sees a half-made entry.
+fn cache_store(node_modules: &Path, entry: &Path, lockfile: &[u8]) -> Result<(), String> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     if entry.exists() {
         return Ok(());
+    }
+    let hidden = fs::read(node_modules.join(".package-lock.json"))
+        .map_err(|_| "node_modules has no .package-lock.json".to_string())?;
+    if tree_match::tree_matches(lockfile, &hidden).is_err() {
+        return Err("node_modules does not match package-lock.json".into());
     }
     let parent = entry.parent().ok_or("no parent")?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;

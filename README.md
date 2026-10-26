@@ -23,20 +23,22 @@ and removing the worktree again means deleting tens of thousands of files.
   directory is cloned copy-on-write with one `clonefile(2)` call. Cloning
   file by file (`cp -Rc`) is about as slow as `npm ci`; one call on the
   directory is what makes it fast.
-- **A cache keyed by what matters.** Every `npm ci` result is kept under
-  the lockfile's hash and the `node -v` the project resolves (native
+- **A cache keyed by what matters.** Every `npm ci` result whose installed
+  tree matches the lockfile is kept under the lockfile's hash and the `node -v` the project resolves (native
   addons are built for one Node ABI). The next worktree with the same
   lockfile clones it.
 - **Other worktrees as a source.** Without a cache entry, a registered
   worktree (the main checkout included) is cloned from when its lockfile is
   byte-identical, its installed tree matches that lockfile (compared with
-  `node_modules/.package-lock.json`, so a checkout that pulled but did not
-  reinstall is not used), and its Node version is the same.
+  `node_modules/.package-lock.json`: versions, integrity, resolved sources
+  and links, so a checkout that pulled but did not reinstall is not used,
+  nor one whose git dependency moved to another commit), and its Node
+  version is the same.
 - **`npm ci` only when nothing matches.** Projects are handled in
   parallel.
 - **Removal by rename.** `remove` renames the worktree into a trash
-  directory on the same volume, prunes it from git, and deletes the files
-  in a detached background process.
+  directory on the same volume, removes its own entry from git (and no
+  other), and deletes the files in a detached background process.
 
 ## Install
 
@@ -66,8 +68,10 @@ fast-worktree install [--root <dir>] [<project-dir>...]
 For every tracked `package-lock.json` (or only the given project
 directories), makes `node_modules` present: from the cache, else from a
 matching worktree, else with `npm ci --prefer-offline --no-audit
---no-fund`. A project that already has `node_modules` is skipped. Then the
-`post_add` hooks run.
+--no-fund`. A project whose `node_modules` has its
+`node_modules/.package-lock.json` is skipped; a `node_modules` without one
+(an install that did not finish) is moved to the trash and installed again.
+Then the `post_add` hooks run.
 
 ```sh
 fast-worktree check [--quiet]
@@ -82,11 +86,23 @@ fast-worktree remove <path> [--delete-branch]
 ```
 
 Refuses (exit 1) the main checkout, a path that is not a worktree root, a
-locked worktree, a worktree with uncommitted or untracked changes (ignored
-files do not count), and a worktree with submodules. Otherwise runs the
-`pre_remove` hooks, renames the worktree away, runs `git worktree prune`
-and deletes the files in the background. `--delete-branch` then runs `git
-branch -d`, which keeps a branch that has unmerged commits.
+locked worktree, a worktree with another registered worktree inside it
+(even in an ignored directory), a worktree with uncommitted or untracked
+changes, and a worktree with submodules. Changes are what `git status
+--porcelain --untracked-files=all --ignore-submodules=none` prints, so
+`status.showUntrackedFiles=no` hides nothing; ignored files do not count,
+and a `git status` that fails counts as changes. It also refuses, before
+any hook runs, a worktree that cannot be renamed (its parent directory is
+not writable, or it is a mount point).
+
+Otherwise runs the `pre_remove` hooks, renames the worktree away, deletes
+its entry under `.git/worktrees/` and deletes the files in the background.
+It does not run `git worktree prune`, which would also unregister other
+worktrees that are only out of sight, such as one on a volume that is not
+mounted. If the rename still fails after the hooks ran, it says so and
+exits 1; the worktree stays where it was, registered. `--delete-branch`
+then runs `git branch -d`, which keeps a branch that has unmerged
+commits.
 
 ### Example
 
@@ -183,8 +199,11 @@ requires = "docker"
   so two checkouts with the same name never share entries. Entries unused
   for 7 days are removed. Clones share blocks with their source, so the
   cache costs almost no disk while worktrees made from it exist.
-- Trash: `<cache>/trash`. Each run deletes again whatever an interrupted
-  background deletion left there.
+- Trash: `<cache>/trash`. When the trash is on another volume than the
+  directory being deleted, that directory is renamed to a hidden
+  `.fast-worktree-trash-*` sibling instead, and a note in the trash records
+  where. Each run deletes again whatever an interrupted background deletion
+  left in the trash or in a sibling it has a note for.
 
 ## What is safe to clone
 

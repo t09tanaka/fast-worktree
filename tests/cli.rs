@@ -17,6 +17,8 @@ echo "$1 $2 $(pwd -P)" >> "$FAKE_NPM_LOG"
 case "$1" in
   ci)
     if [ -n "$FAKE_NPM_FAIL" ]; then echo "npm ERR! simulated failure" >&2; exit 1; fi
+    # An install that exits 0 but leaves no record of the tree.
+    if [ -n "$FAKE_NPM_PARTIAL" ]; then mkdir -p node_modules/dep; echo dep > node_modules/dep/index.js; exit 0; fi
     mkdir -p node_modules/.cache node_modules/dep
     cp package-lock.json node_modules/.package-lock.json
     echo cached > node_modules/.cache/tool
@@ -463,9 +465,192 @@ fn a_lockfile_at_the_repository_root_is_a_project() {
     assert!(w.base.join("wt/node_modules/.package-lock.json").is_file());
 }
 
+/// The main checkout plus `wt`, a plain `git worktree add` (no installs).
+fn with_worktree(w: &World, rel: &str) -> PathBuf {
+    let main = w.main();
+    let name = rel.rsplit('/').next().unwrap().to_string();
+    w.git(&main, &["worktree", "add", "-q", rel, "-b", &name]);
+    main.join(rel).canonicalize().unwrap()
+}
+
+fn registered(w: &World) -> String {
+    w.git(&w.main(), &["worktree", "list", "--porcelain"])
+}
+
+#[test]
+fn remove_sees_untracked_files_whatever_the_status_config_says() {
+    let w = World::new();
+    let wt = with_worktree(&w, "../wt");
+    w.git(&wt, &["config", "status.showUntrackedFiles", "no"]);
+    fs::write(wt.join("notes.txt"), "wip").unwrap();
+    assert_eq!(
+        w.git(&wt, &["status", "--porcelain"]),
+        "",
+        "hidden by the config"
+    );
+    let r = w.fw(&w.main(), &["remove", "../wt"]);
+    r.assert_fails();
+    assert!(
+        r.err().contains("uncommitted or untracked changes"),
+        "{}",
+        r.err()
+    );
+    assert!(wt.join("notes.txt").is_file());
+}
+
+#[test]
+fn remove_unregisters_only_its_own_worktree() {
+    let w = World::new();
+    let main = w.main();
+    // A worktree on a volume that is not mounted right now: its directory
+    // is out of sight, so `git worktree prune` would drop it.
+    fs::create_dir_all(w.base.join("vol")).unwrap();
+    let ext = with_worktree(&w, "../vol/ext");
+    let wt = with_worktree(&w, "../wt");
+    fs::rename(w.base.join("vol"), w.base.join("vol-unmounted")).unwrap();
+    assert!(registered(&w).contains("prunable"), "{}", registered(&w));
+
+    let r = w.fw(&main, &["remove", "../wt"]);
+    r.assert_ok();
+    assert!(!wt.exists());
+    let list = registered(&w);
+    assert!(
+        !list.contains(&format!("worktree {}\n", wt.display())),
+        "{list}"
+    );
+    assert!(
+        list.contains(&format!("worktree {}\n", ext.display())),
+        "{list}"
+    );
+
+    // Mounted again, it is still a working worktree.
+    fs::rename(w.base.join("vol-unmounted"), w.base.join("vol")).unwrap();
+    assert_eq!(w.git(&ext, &["status", "--porcelain"]), "");
+    assert!(!registered(&w).contains("prunable"), "{}", registered(&w));
+}
+
+#[test]
+fn remove_refuses_a_worktree_with_another_one_inside() {
+    let w = World::new();
+    let main = w.main();
+    // Ignored for every worktree, so `status` does not show what is inside.
+    fs::write(main.join(".git/info/exclude"), ".claude/\n").unwrap();
+    let wt = with_worktree(&w, "../wt");
+    fs::create_dir_all(wt.join(".claude/worktrees")).unwrap();
+    w.git(
+        &wt,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            ".claude/worktrees/inner",
+            "-b",
+            "inner",
+        ],
+    );
+    let inner = wt.join(".claude/worktrees/inner");
+    assert_eq!(w.git(&wt, &["status", "--porcelain"]), "");
+
+    let r = w.fw(&main, &["remove", "../wt"]);
+    r.assert_fails();
+    assert!(
+        r.err().contains("another worktree is inside it"),
+        "{}",
+        r.err()
+    );
+    assert!(
+        r.err().contains(&inner.display().to_string()),
+        "{}",
+        r.err()
+    );
+    assert!(inner.join(".git").exists());
+    assert!(
+        !w.hook_log().contains("pre_remove"),
+        "refused before the hooks"
+    );
+
+    // Inner first, then the outer one.
+    w.fw(&main, &["remove", &inner.to_string_lossy()])
+        .assert_ok();
+    w.fw(&main, &["remove", "../wt"]).assert_ok();
+    assert!(!wt.exists());
+}
+
+#[test]
+fn remove_checks_that_the_worktree_can_be_moved_before_the_hooks() {
+    // SAFETY: no arguments.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root can rename anywhere
+    }
+    let w = World::new();
+    fs::create_dir_all(w.base.join("ro")).unwrap();
+    let wt = with_worktree(&w, "../ro/wt");
+    let ro = w.base.join("ro");
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
+    let r = w.fw(&w.main(), &["remove", "../ro/wt"]);
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+    r.assert_fails();
+    assert!(r.err().contains("nothing was removed"), "{}", r.err());
+    assert!(r.err().contains("not writable"), "{}", r.err());
+    assert!(!w.hook_log().contains("pre_remove"), "{}", w.hook_log());
+    assert!(wt.join(".git").is_file());
+    assert!(registered(&w).contains(&wt.display().to_string()));
+}
+
+#[test]
+fn install_redoes_a_node_modules_without_its_record() {
+    let w = World::new();
+    let main = w.main();
+    w.fw(&main, &["add", "../wt", "-b", "x"]).assert_ok();
+    let wt = w.base.join("wt");
+    // An install interrupted before npm wrote `.package-lock.json`.
+    fs::remove_file(wt.join("lib/node_modules/.package-lock.json")).unwrap();
+    let r = w.fw(&wt, &["install"]);
+    r.assert_ok();
+    assert!(
+        r.out()
+            .contains("note   lib: node_modules has no .package-lock.json, installing again"),
+        "{}",
+        r.out()
+    );
+    assert!(r
+        .out()
+        .contains("skip   app (node_modules already present)"));
+    assert!(wt.join("lib/node_modules/.package-lock.json").is_file());
+    assert_eq!(w.fw(&wt, &["check", "--quiet"]).out(), "");
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
+
+    #[test]
+    fn a_tree_without_its_record_is_not_cached() {
+        let w = World::new();
+        let main = w.main();
+        let r = w.fw_with(
+            &main,
+            &["add", "../wt1", "-b", "a"],
+            &[("FAKE_NPM_PARTIAL", "1")],
+        );
+        r.assert_ok();
+        assert!(
+            r.out()
+                .contains("note   app: cache not saved: node_modules has no .package-lock.json"),
+            "{}",
+            r.out()
+        );
+        let entries: Vec<_> = walk_dirs(&w.cache)
+            .into_iter()
+            .filter(|p| p.join("dep").is_dir())
+            .collect();
+        assert!(entries.is_empty(), "{entries:?}");
+        // The next worktree neither clones the cache nor wt1's tree.
+        let r = w.fw(&main, &["add", "../wt2", "-b", "b"]);
+        r.assert_ok();
+        assert!(r.out().contains("npm ci app ("), "{}", r.out());
+        assert!(r.out().contains("npm ci lib ("), "{}", r.out());
+    }
 
     #[test]
     fn clones_from_a_matching_worktree_but_not_a_stale_one() {

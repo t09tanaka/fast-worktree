@@ -1,6 +1,7 @@
 //! Thin wrappers around the `git` CLI.
 
 use crate::error::{bail, Error, Result};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -79,6 +80,64 @@ pub fn parse_worktrees(porcelain: &str) -> Vec<Worktree> {
     }
     out.extend(cur);
     out
+}
+
+/// The administrative directory of the linked worktree whose root is
+/// `path`: `<common dir>/worktrees/<id>`, where git keeps its `HEAD`,
+/// index and the `gitdir` file pointing back at `path/.git`. Taken while
+/// the worktree is still in place, for [`unregister`]. An error when `path`
+/// is not a linked worktree (the main checkout has none).
+pub fn admin_dir(path: &Path) -> Result<PathBuf> {
+    let out = output(
+        path,
+        &[
+            "rev-parse",
+            "--absolute-git-dir",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+    )?;
+    let mut lines = out.lines();
+    let (Some(git_dir), Some(common)) = (lines.next(), lines.next()) else {
+        bail!(
+            "git rev-parse printed no git directory for {}",
+            path.display()
+        );
+    };
+    let real = |p: &str| {
+        let p = PathBuf::from(p);
+        p.canonicalize().unwrap_or(p)
+    };
+    let (admin, common) = (real(git_dir), real(common));
+    let gitdir_file = fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
+    let points_back = Path::new(gitdir_file.trim_end_matches('\n'))
+        .parent()
+        .and_then(|p| p.canonicalize().ok())
+        .is_some_and(|p| p == path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    if admin.parent() != Some(common.join("worktrees").as_path()) || !points_back {
+        bail!(
+            "{}: cannot find its entry under {}",
+            path.display(),
+            common.join("worktrees").display()
+        );
+    }
+    Ok(admin)
+}
+
+/// Unregister one worktree whose files have been moved away, by deleting
+/// its administrative directory (from [`admin_dir`]). This is what `git
+/// worktree prune` does for that entry, without touching the others: a
+/// worktree on a volume that is not mounted right now also looks missing to
+/// `prune`, and must keep its registration.
+pub fn unregister(admin: &Path) -> Result<()> {
+    let is_entry = admin
+        .parent()
+        .is_some_and(|p| p.file_name().is_some_and(|n| n == "worktrees"))
+        && admin.join("gitdir").is_file();
+    if !is_entry {
+        bail!("{}: not a worktree entry; left alone", admin.display());
+    }
+    fs::remove_dir_all(admin).map_err(|e| Error(format!("{}: {e}", admin.display())))
 }
 
 /// Tracked files under `root` matching the pathspecs, relative to `root`.

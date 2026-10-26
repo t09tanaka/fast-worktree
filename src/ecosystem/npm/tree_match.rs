@@ -9,8 +9,10 @@
 //!
 //! The rules, per entry of `packages` (the `""` root entry is skipped):
 //! - in the tree but not in the lockfile: `extra`
-//! - in both, with a different `version`, or a different `integrity` when
-//!   both have one: `diff`
+//! - in both, with a different `version`; a different `integrity` or
+//!   `resolved` when both have one (a git dependency whose `#<commit>`
+//!   moved keeps its version and has no integrity); or `link` on one side
+//!   only: `diff`
 //! - in the lockfile but not in the tree, unless `optional`, `devOptional`
 //!   or `peer` (npm may legitimately leave those out): `missing`
 //!
@@ -38,10 +40,15 @@ pub fn tree_matches(lockfile: &[u8], hidden: &[u8]) -> Result<(), Vec<String>> {
         match lock.get(k) {
             None => why.push(format!("extra {k}")),
             Some(l) => {
-                let li = l.get("integrity");
-                let vi = v.get("integrity");
-                let integrity_differs = truthy(li) && truthy(vi) && li != vi;
-                if l.get("version") != v.get("version") || integrity_differs {
+                let both_and_differ = |f: &str| {
+                    let (a, b) = (l.get(f), v.get(f));
+                    truthy(a) && truthy(b) && a != b
+                };
+                if l.get("version") != v.get("version")
+                    || both_and_differ("integrity")
+                    || both_and_differ("resolved")
+                    || truthy(l.get("link")) != truthy(v.get("link"))
+                {
                     why.push(format!("diff {k}"));
                 }
             }
@@ -119,6 +126,39 @@ mod tests {
         assert_eq!(check(lock.clone(), empty), Ok(()), "empty string is falsy");
         let other = pkgs(json!({ "node_modules/a": { "version": "1", "integrity": "sha512-y" } }));
         assert_eq!(check(lock, other), Err(vec!["diff node_modules/a".into()]));
+    }
+
+    #[test]
+    fn a_git_dependency_whose_commit_moved_is_a_diff() {
+        let at = |sha: &str| {
+            pkgs(json!({ "node_modules/a": {
+                "version": "1.0.0",
+                "resolved": format!("git+ssh://git@example.com/a.git#{sha}"),
+            } }))
+        };
+        assert_eq!(check(at("aaa"), at("aaa")), Ok(()));
+        assert_eq!(
+            check(at("bbb"), at("aaa")),
+            Err(vec!["diff node_modules/a".into()])
+        );
+        // Compared only when both have one, like integrity.
+        let bare = pkgs(json!({ "node_modules/a": { "version": "1.0.0" } }));
+        assert_eq!(check(at("bbb"), bare), Ok(()));
+    }
+
+    #[test]
+    fn a_link_is_compared_by_its_target_and_its_flag() {
+        let link = |to: &str| pkgs(json!({ "node_modules/a": { "resolved": to, "link": true } }));
+        assert_eq!(check(link("packages/a"), link("packages/a")), Ok(()));
+        assert_eq!(
+            check(link("packages/b"), link("packages/a")),
+            Err(vec!["diff node_modules/a".into()])
+        );
+        let not_link = pkgs(json!({ "node_modules/a": { "resolved": "packages/a" } }));
+        assert_eq!(
+            check(link("packages/a"), not_link),
+            Err(vec!["diff node_modules/a".into()])
+        );
     }
 
     #[test]
