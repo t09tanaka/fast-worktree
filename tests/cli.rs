@@ -646,6 +646,114 @@ fn install_redoes_a_node_modules_without_its_record() {
     assert_eq!(w.fw(&wt, &["check", "--quiet"]).out(), "");
 }
 
+#[test]
+fn worktreeinclude_never_copies_another_repository() {
+    let w = World::new();
+    let main = w.main();
+    fs::write(main.join(".git/info/exclude"), ".claude/\n").unwrap();
+    fs::write(main.join(".worktreeinclude"), ".claude/\n").unwrap();
+    fs::create_dir_all(main.join(".claude/worktrees")).unwrap();
+    fs::write(main.join(".claude/settings.local.json"), "{}\n").unwrap();
+    w.git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            ".claude/worktrees/other",
+            "-b",
+            "other",
+        ],
+    );
+    w.git(&main, &["init", "-q", ".claude/clone"]);
+    fs::write(main.join(".claude/clone/x.txt"), "x\n").unwrap();
+
+    // The new worktree is inside the directory it copies from, too.
+    let r = w.fw(
+        &main,
+        &["add", ".claude/worktrees/new", "-b", "new", "HEAD"],
+    );
+    r.assert_ok();
+    let new = main.join(".claude/worktrees/new");
+    assert_eq!(
+        fs::read_to_string(new.join(".claude/settings.local.json")).unwrap(),
+        "{}\n"
+    );
+    assert!(
+        r.out().contains("copy   .claude/settings.local.json\n"),
+        "{}",
+        r.out()
+    );
+    assert!(!new.join(".claude/worktrees/other").exists(), "{}", r.out());
+    assert!(!new.join(".claude/worktrees/new").exists(), "{}", r.out());
+    assert!(!new.join(".claude/clone").exists(), "{}", r.out());
+}
+
+#[test]
+fn install_changed_reinstalls_when_a_git_dependency_moves() {
+    let w = World::new();
+    let main = w.main();
+    let lock = |sha: &str| {
+        format!(
+            r#"{{"name":"lib","lockfileVersion":3,"requires":true,"packages":{{"":{{"name":"lib"}},"node_modules/dep":{{"version":"1.0.0","resolved":"git+ssh://git@example.com/dep.git#{sha}"}}}}}}"#
+        )
+    };
+    w.commit(
+        &main,
+        &[("lib/package-lock.json", &lock("aaa"))],
+        "a git dependency",
+    );
+    w.fw(&main, &["add", "../wt", "-b", "x", "HEAD"])
+        .assert_ok();
+    let wt = w.base.join("wt");
+    // Another commit of the dependency: same version, no integrity.
+    fs::write(wt.join("lib/package-lock.json"), lock("bbb")).unwrap();
+    let r = w.fw(&wt, &["install", "--changed", "lib"]);
+    r.assert_ok();
+    assert!(!r.out().contains("up to date"), "{}", r.out());
+    assert!(
+        r.out()
+            .contains("note   lib: lockfile or Node version changed, installing again"),
+        "{}",
+        r.out()
+    );
+    let hidden = fs::read_to_string(wt.join("lib/node_modules/.package-lock.json")).unwrap();
+    assert!(hidden.contains("#bbb"), "{hidden}");
+}
+
+#[test]
+fn check_exits_0_when_its_stdout_is_closed() {
+    let w = World::new();
+    // Nothing installed in the main checkout: both modes have lines to print.
+    let zeros = "0000000000000000000000000000000000000000";
+    for args in [
+        vec!["check"],
+        vec!["check", "--post-checkout", "1111", "2222", "1"],
+        vec!["check", "--post-checkout", zeros, "2222", "1"],
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let mut c = Command::new(env!("CARGO_BIN_EXE_fast-worktree"));
+        w.env(&mut c);
+        let out = c
+            .args(&args)
+            .current_dir(w.main())
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{args:?}");
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;

@@ -113,20 +113,22 @@ pub fn install_projects(
     }))
 }
 
-/// Print one project's result. Returns whether it succeeded.
+/// Print one project's result (also for `check`, so it never panics on a
+/// closed stdout). Returns whether it succeeded.
 pub fn print_result(p: &Project, r: &std::result::Result<Report, String>) -> bool {
     match r {
         Ok(report) => {
             if !report.lines.is_empty() {
-                println!("{}", report.lines);
+                util::say(&format!("{}\n", report.lines));
             }
             true
         }
         Err(log) => {
-            println!("FAILED {}:", p.dir);
+            let mut s = format!("FAILED {}:\n", p.dir);
             for l in util::tail(log, 30).lines() {
-                println!("  {l}");
+                s.push_str(&format!("  {l}\n"));
             }
+            util::say(&s);
             false
         }
     }

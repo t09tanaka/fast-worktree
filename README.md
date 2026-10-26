@@ -305,7 +305,11 @@ overwritten. A directory that git ignores as a whole (such as
 directory itself matches, an anchored pattern starts with its path (write
 `vendor/**/config.json`, not `**/config.json`), or, for a pattern starting
 with `**/` (or without a slash), the first name after `**/` is one of the
-directory's names. Copies are clones on macOS.
+directory's names. Another repository is never copied: a registered
+worktree, or a directory with a `.git` of its own, is left out. A matching
+directory with one inside (such as `.claude/` holding
+`.claude/worktrees/<name>/`) is copied entry by entry around it. Copies are
+clones on macOS.
 
 ## Post-checkout hook
 
@@ -330,7 +334,8 @@ Where fast-worktree is not installed, the hook does nothing.
   lists.)
 - On any other checkout, such as `git switch`, it lists what is missing,
   like `check --quiet`.
-- It always exits 0. With the environment variable `CI` set, or
+- It always exits 0, also when its output goes to a pipe that is already
+  closed. With the environment variable `CI` set, or
   `FAST_WORKTREE_SKIP=1`, it does nothing.
 
 ## Where things live

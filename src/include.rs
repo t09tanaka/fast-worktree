@@ -12,6 +12,11 @@
 //! for a pattern that starts with `**/` (or has no slash, which means the
 //! same), the first name after `**/` is one of the names in the
 //! directory's path.
+//!
+//! Another repository is never copied: a directory that is a registered
+//! worktree, or that has a `.git` of its own, is left out. A directory that
+//! matches but has one below it (such as `.claude/` with
+//! `.claude/worktrees/<name>/`) is copied entry by entry around it.
 
 use crate::{clone, git};
 use globset::GlobBuilder;
@@ -49,8 +54,18 @@ pub fn copy(main: &Path, dst: &Path) -> Result<Copied, String> {
         ],
     )
     .map_err(|e| e.to_string())?;
+    let real_main = main.canonicalize().unwrap_or_else(|_| main.to_path_buf());
+    let worktrees: Vec<PathBuf> = git::worktrees(main)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter_map(|w| {
+            let p = w.path.canonicalize().unwrap_or(w.path);
+            p.strip_prefix(&real_main).ok().map(Path::to_path_buf)
+        })
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .collect();
     let mut out = Copied::default();
-    for c in candidates(&listing, &rules, main) {
+    for c in candidates(&listing, &rules, main, &worktrees) {
         put(&main.join(&c), &dst.join(&c), &c, &mut out)?;
     }
     Ok(out)
@@ -84,7 +99,8 @@ fn put(src: &Path, to: &Path, rel: &Path, out: &mut Copied) -> Result<(), String
 /// `main`, from `git ls-files -z --others --ignored --exclude-standard
 /// --directory`. In that listing a directory ends with `/`; one that git
 /// did not descend into (no entry below it) is ignored as a whole.
-fn candidates(listing: &str, rules: &Rules, main: &Path) -> Vec<PathBuf> {
+/// `worktrees` are the registered worktrees inside `main`, relative to it.
+fn candidates(listing: &str, rules: &Rules, main: &Path, worktrees: &[PathBuf]) -> Vec<PathBuf> {
     let entries: Vec<&str> = listing.split('\0').filter(|e| !e.is_empty()).collect();
     // Every directory that has an entry below it, as `a/b/`.
     let mut walked = std::collections::HashSet::new();
@@ -98,7 +114,7 @@ fn candidates(listing: &str, rules: &Rules, main: &Path) -> Vec<PathBuf> {
     for e in &entries {
         if let Some(d) = e.strip_suffix('/') {
             if !walked.contains(e) {
-                collect_dir(main, Path::new(d), rules, &mut out);
+                collect_dir(main, Path::new(d), rules, worktrees, &mut out);
             }
         } else if rules.matches(Path::new(e), false) {
             out.push(PathBuf::from(e));
@@ -109,13 +125,30 @@ fn candidates(listing: &str, rules: &Rules, main: &Path) -> Vec<PathBuf> {
 }
 
 /// Inside a wholly ignored directory: take it whole if it matches, else
-/// look inside only where a pattern can reach.
-fn collect_dir(main: &Path, rel: &Path, rules: &Rules, out: &mut Vec<PathBuf>) {
-    if rules.matches(rel, true) {
+/// look inside only where a pattern can reach. Another repository (a
+/// registered worktree, or a directory with its own `.git`) is skipped, and
+/// a matching directory with a worktree below it is looked into instead of
+/// taken whole.
+fn collect_dir(
+    main: &Path,
+    rel: &Path,
+    rules: &Rules,
+    worktrees: &[PathBuf],
+    out: &mut Vec<PathBuf>,
+) {
+    if worktrees.iter().any(|w| w == rel) || main.join(rel).join(".git").symlink_metadata().is_ok()
+    {
+        return;
+    }
+    let matched = rules.matches(rel, true);
+    if matched
+        && !worktrees.iter().any(|w| w.starts_with(rel))
+        && !has_repository_below(&main.join(rel))
+    {
         out.push(rel.to_path_buf());
         return;
     }
-    if !rules.may_reach_into(rel) {
+    if !matched && !rules.may_reach_into(rel) {
         return;
     }
     let Ok(entries) = fs::read_dir(main.join(rel)) else {
@@ -124,11 +157,32 @@ fn collect_dir(main: &Path, rel: &Path, rules: &Rules, out: &mut Vec<PathBuf>) {
     for e in entries.flatten() {
         let child = rel.join(e.file_name());
         match e.file_type() {
-            Ok(t) if t.is_dir() => collect_dir(main, &child, rules, out),
+            Ok(t) if t.is_dir() => collect_dir(main, &child, rules, worktrees, out),
             Ok(_) if rules.matches(&child, false) => out.push(child),
             _ => {}
         }
     }
+}
+
+/// Whether a directory below `dir` (symlinks not followed) has a `.git`.
+fn has_repository_below(dir: &Path) -> bool {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let p = e.path();
+            if p.join(".git").symlink_metadata().is_ok() {
+                return true;
+            }
+            stack.push(p);
+        }
+    }
+    false
 }
 
 struct Rules {
@@ -281,7 +335,7 @@ mod tests {
         // As git lists them: `.env` and `api/.env` are files; the three
         // directories are ignored whole.
         let listing = ".env\0api/.env\0api/x.log\0node_modules/\0vendor/\0cfg/\0";
-        let got = candidates(listing, &r, main);
+        let got = candidates(listing, &r, main, &[]);
         assert_eq!(
             got,
             vec![
@@ -294,8 +348,60 @@ mod tests {
         // A directory git descended into is not taken whole.
         let listing = "deep/\0deep/x/\0deep/x/.env\0";
         assert_eq!(
-            candidates(listing, &r, main),
+            candidates(listing, &r, main, &[]),
             vec![PathBuf::from("deep/x/.env")]
+        );
+    }
+
+    #[test]
+    fn candidates_leave_out_worktrees_and_repositories() {
+        let t = tempfile::tempdir().unwrap();
+        let main = t.path();
+        for d in [
+            ".claude/worktrees/other/src",
+            ".claude/worktrees/new",
+            ".claude/skills",
+            ".claude/clone/.git",
+            "vendor/lib/.git",
+        ] {
+            fs::create_dir_all(main.join(d)).unwrap();
+        }
+        fs::write(main.join(".claude/worktrees/other/.git"), "gitdir: x\n").unwrap();
+        fs::write(main.join(".claude/worktrees/new/.git"), "gitdir: y\n").unwrap();
+        for f in [
+            ".claude/settings.local.json",
+            ".claude/skills/a.md",
+            ".claude/worktrees/other/src/.env",
+            ".claude/worktrees/notes.txt",
+        ] {
+            fs::write(main.join(f), "").unwrap();
+        }
+        let r = rules(".claude/\nvendor/\n");
+        let listing = ".claude/\0vendor/\0";
+        let worktrees = [
+            PathBuf::from(".claude/worktrees/other"),
+            PathBuf::from(".claude/worktrees/new"),
+        ];
+        let mut got = candidates(listing, &r, main, &worktrees);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from(".claude/settings.local.json"),
+                PathBuf::from(".claude/skills"),
+                PathBuf::from(".claude/worktrees/notes.txt"),
+            ]
+        );
+        // A repository that is not registered is found below, too.
+        let mut got = candidates(listing, &r, main, &[]);
+        got.sort();
+        assert_eq!(got.len(), 3, "{got:?}");
+        // With no repository below it, a matching directory is still whole.
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join(".claude/skills")).unwrap();
+        assert_eq!(
+            candidates(".claude/\0", &r, t.path(), &[]),
+            vec![PathBuf::from(".claude")]
         );
     }
 }

@@ -10,12 +10,14 @@
 //! provide, but never runs anything that downloads or builds (`npm ci`,
 //! `npm install`, `pub get`): those are listed as missing. On any other
 //! checkout it only lists. With `CI` set, or `FAST_WORKTREE_SKIP=1`, it does
-//! nothing.
+//! nothing. Its output is best effort: a closed stdout or stderr (a hook
+//! whose output is piped into something that already exited) does not
+//! change the exit code.
 
 use super::install;
 use crate::ecosystem::{self, Mode, Project};
-use crate::git;
 use crate::hooks::Config;
+use crate::{git, util};
 use std::env;
 use std::path::Path;
 
@@ -30,7 +32,7 @@ pub fn run(quiet: bool) -> i32 {
         .iter()
         .map(|p| p.label())
         .collect();
-    print!("{}", report(&missing, projects.len(), quiet));
+    util::say(&report(&missing, projects.len(), quiet));
     0
 }
 
@@ -101,14 +103,14 @@ fn clone_missing() {
         return;
     }
     let cfg = Config::load(&root).unwrap_or_else(|e| {
-        eprintln!("fast-worktree: {e}");
+        util::warn(&format!("fast-worktree: {e}\n"));
         Config::default()
     });
     let results = match install::install_projects(&root, &todo, &cfg, Mode::CloneOnly) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("fast-worktree: {e}");
-            print!("{}", report(&labels(&todo), projects.len(), true));
+            util::warn(&format!("fast-worktree: {e}\n"));
+            util::say(&report(&labels(&todo), projects.len(), true));
             return;
         }
     };
@@ -117,7 +119,7 @@ fn clone_missing() {
         match &r {
             Ok(rep) if rep.missing => {
                 if !rep.lines.is_empty() {
-                    println!("{}", rep.lines);
+                    util::say(&format!("{}\n", rep.lines));
                 }
                 still.push(p.label());
             }
@@ -130,7 +132,7 @@ fn clone_missing() {
             }
         }
     }
-    print!("{}", report(&still, projects.len(), true));
+    util::say(&report(&still, projects.len(), true));
 }
 
 fn labels(projects: &[Project]) -> Vec<String> {

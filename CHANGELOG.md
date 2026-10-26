@@ -53,6 +53,14 @@ change bumps the minor version).
 - `remove --delete-branch` refuses a branch that `git branch -d` would
   keep before removing anything, instead of removing the worktree and
   then failing.
+- `.worktreeinclude` never copies another repository: registered
+  worktrees and directories with their own `.git` are left out, and a
+  matching directory with one inside (`.claude/` with
+  `.claude/worktrees/<name>/`) is copied around it.
+- `check` exits 0 when its stdout is a closed pipe, instead of panicking
+  with exit code 101.
+- `install --changed` installs again when a git dependency moved to
+  another commit (the tree check now compares `resolved`).
 
 ## [0.1.0]
 

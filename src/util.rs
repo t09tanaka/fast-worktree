@@ -11,6 +11,21 @@ pub fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// Write to stdout, ignoring errors. `print!` panics when stdout is a pipe
+/// whose reader has gone (EPIPE); `check` promises to exit 0 whatever
+/// happens to its output.
+pub fn say(s: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(s.as_bytes()).and_then(|()| out.flush());
+}
+
+/// [`say`] for stderr.
+pub fn warn(s: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().lock().write_all(s.as_bytes());
+}
+
 /// `1.2s`, the format every timing line uses.
 pub fn elapsed(start: Instant) -> String {
     format!("{:.1}s", start.elapsed().as_secs_f64())
