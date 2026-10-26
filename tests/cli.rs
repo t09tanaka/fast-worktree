@@ -1390,7 +1390,7 @@ fn remove_delete_branch_refuses_an_unmerged_branch_before_removing() {
     // git agrees: `git branch -d` keeps it.
     assert!(!w.git_run(&main, &["branch", "-d", "feat"], &[]).ok());
 
-    // Without an upstream, HEAD decides, as for `git branch -d`.
+    // Without an upstream, origin's default branch and the local one decide.
     w.fw(&main, &["add", "../wt2", "-b", "local", "HEAD"])
         .assert_ok();
     let wt2 = w.base.join("wt2");
@@ -1398,7 +1398,8 @@ fn remove_delete_branch_refuses_an_unmerged_branch_before_removing() {
     let r = w.fw(&main, &["remove", "../wt2", "--delete-branch"]);
     r.assert_fails();
     assert!(
-        r.err().contains("branch local is not merged into HEAD"),
+        r.err()
+            .contains("branch local is not merged into origin/trunk or trunk; nothing was removed"),
         "{}",
         r.err()
     );
@@ -3589,4 +3590,44 @@ fn cache_ls_shows_an_older_layout_apart_and_prune_legacy_removes_it() {
     );
     assert!(!w.cache.join("app").exists());
     assert!(!w.fw(&main, &["cache", "ls"]).out().contains("LEGACY"));
+}
+
+#[test]
+fn remove_delete_branch_finds_a_branch_merged_on_origin_or_into_the_default_branch() {
+    let w = World::new();
+    let main = w.main();
+    // No upstream, merged on origin, while the main checkout is behind.
+    w.fw(&main, &["add", "../wt", "-b", "local", "HEAD"])
+        .assert_ok();
+    let wt = w.base.join("wt");
+    w.commit(&wt, &[("new.txt", "x")], "work");
+    let up = w.base.join("upstream");
+    w.git(
+        &up,
+        &["pull", "-q", "--ff-only", wt.to_str().unwrap(), "local"],
+    );
+    w.git(&main, &["fetch", "-q", "origin"]);
+    assert_ne!(
+        w.git(&main, &["rev-parse", "HEAD"]),
+        w.git(&main, &["rev-parse", "origin/trunk"]),
+        "the main checkout is behind"
+    );
+    let r = w.fw(&main, &["remove", "../wt", "--delete-branch"]);
+    r.assert_ok();
+    assert!(r.out().contains("deleted branch local"), "{}", r.out());
+    assert!(!wt.exists());
+    assert!(w.git(&main, &["branch", "--list", "local"]).is_empty());
+
+    // Merged into the local default branch, while the main checkout is on
+    // another branch and origin does not have it.
+    w.git(&main, &["switch", "-q", "-c", "elsewhere", "trunk"]);
+    w.fw(&main, &["add", "../wt2", "-b", "local2", "HEAD"])
+        .assert_ok();
+    let wt2 = w.base.join("wt2");
+    w.commit(&wt2, &[("other.txt", "y")], "more work");
+    w.git(&main, &["branch", "-f", "trunk", "local2"]);
+    let r = w.fw(&main, &["remove", "../wt2", "--delete-branch"]);
+    r.assert_ok();
+    assert!(r.out().contains("deleted branch local2"), "{}", r.out());
+    assert!(w.git(&main, &["branch", "--list", "local2"]).is_empty());
 }

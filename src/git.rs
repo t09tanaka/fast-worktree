@@ -163,43 +163,78 @@ pub fn tracked(root: &Path, pathspecs: &[&str]) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Whether `git branch -d <branch>`, run in `dir`, would find the branch
-/// merged: into its upstream when it has one that exists, else into `HEAD`.
-/// Returns the reference it was compared with when it is not merged, and
-/// `None` when it is merged or git cannot tell (then `git branch -d` itself
-/// decides).
-pub fn unmerged_into(dir: &Path, branch: &str) -> Option<String> {
-    // `<branch>@{upstream}` resolves only when the upstream ref exists,
-    // which is also when `git branch -d` compares with it.
+/// Whether a branch's work is in a branch that stays, for `remove
+/// --delete-branch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Merged {
+    /// Its commit (this one) is reachable from one of the references.
+    Yes(String),
+    /// It is reachable from none of these (short names).
+    No(Vec<String>),
+    /// Git cannot tell (the branch does not resolve): `git branch -d`
+    /// decides.
+    Unknown,
+}
+
+/// Whether the commit of the local `branch` is reachable, in the
+/// repository of `dir`, from its upstream (when that ref exists),
+/// `origin/<default>` or the local `<default>` branch, where `<default>`
+/// is origin's default branch as `refs/remotes/origin/HEAD` records it
+/// (nothing is fetched). Without that record, the `HEAD` of `dir` takes
+/// the place of the two, as for `git branch -d`. So a branch merged on the
+/// remote counts as merged even when the main checkout is behind or on
+/// another branch.
+pub fn merged(dir: &Path, branch: &str) -> Merged {
+    let Ok(sha) = output(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ],
+    ) else {
+        return Merged::Unknown;
+    };
+    let sha = sha.trim().to_string();
+    // `<branch>@{upstream}` resolves only when the upstream ref exists.
     let upstream = output(
         dir,
         &[
             "rev-parse",
             "--symbolic-full-name",
-            &format!("{branch}@{{upstream}}"),
+            &format!("refs/heads/{branch}@{{upstream}}"),
         ],
     )
     .ok()
     .map(|s| s.trim().to_string())
     .filter(|s| s.starts_with("refs/"));
-    let reference = upstream.unwrap_or_else(|| "HEAD".to_string());
-    let status = command(dir)
-        .args([
-            "merge-base",
-            "--is-ancestor",
-            &format!("refs/heads/{branch}"),
-            &reference,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
-    let short = reference
-        .strip_prefix("refs/remotes/")
-        .or_else(|| reference.strip_prefix("refs/heads/"))
-        .unwrap_or(&reference)
-        .to_string();
-    (status.code() == Some(1)).then_some(short)
+    let mut refs: Vec<String> = upstream.into_iter().collect();
+    match origin_head(dir) {
+        Some(d) => {
+            refs.push(format!("refs/remotes/origin/{d}"));
+            refs.push(format!("refs/heads/{d}"));
+        }
+        None => refs.push("HEAD".to_string()),
+    }
+    refs.dedup();
+    let exists = |r: &str| succeeds(dir, &["rev-parse", "--verify", "-q", r]);
+    let refs: Vec<String> = refs.into_iter().filter(|r| exists(r)).collect();
+    if refs
+        .iter()
+        .any(|r| succeeds(dir, &["merge-base", "--is-ancestor", &sha, r]))
+    {
+        return Merged::Yes(sha);
+    }
+    let short = |r: &str| {
+        r.strip_prefix("refs/remotes/")
+            .or_else(|| r.strip_prefix("refs/heads/"))
+            .unwrap_or(r)
+            .to_string()
+    };
+    let mut names: Vec<String> = refs.iter().map(|r| short(r)).collect();
+    names.dedup();
+    Merged::No(names)
 }
 
 /// The administrative directory of the worktree registered at `path`, for
@@ -353,25 +388,28 @@ pub fn fetch_quietly(dir: &Path, branch: &str, limit: Option<Duration>) -> Resul
 /// changed its default), ask the remote once with `git remote set-head
 /// origin -a` and read it again. Never guesses `main`.
 pub fn origin_default_branch(dir: &Path) -> Result<String> {
-    let read = || {
-        output(
-            dir,
-            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        )
-        .ok()
-        .and_then(|s| {
-            s.trim()
-                .strip_prefix("origin/")
-                .filter(|b| !b.is_empty())
-                .map(str::to_string)
-        })
-    };
-    if let Some(b) = read() {
+    if let Some(b) = origin_head(dir) {
         return Ok(b);
     }
     output(dir, &["remote", "set-head", "origin", "-a"])
         .map_err(|e| Error(format!("cannot resolve origin's default branch: {e}")))?;
-    read().ok_or_else(|| Error("cannot resolve origin's default branch".into()))
+    origin_head(dir).ok_or_else(|| Error("cannot resolve origin's default branch".into()))
+}
+
+/// Origin's default branch as `refs/remotes/origin/HEAD` records it, without
+/// asking the remote.
+fn origin_head(dir: &Path) -> Option<String> {
+    output(
+        dir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .and_then(|s| {
+        s.trim()
+            .strip_prefix("origin/")
+            .filter(|b| !b.is_empty())
+            .map(str::to_string)
+    })
 }
 
 #[cfg(test)]

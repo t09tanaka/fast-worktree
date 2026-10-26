@@ -141,15 +141,20 @@ pub fn run(opts: Opts) -> Result<i32> {
     let branch = me.and_then(|w| w.branch.clone());
     // Decide about the branch before anything is removed: `git branch -d`
     // failing afterwards would leave the worktree gone and the branch kept.
-    if opts.delete_branch {
-        if let Some(b) = &branch {
-            if let Some(reference) = git::unmerged_into(&main, b) {
-                bail!(
-                    "branch {b} is not merged into {reference}, so `git branch -d` would keep it; \
-                     nothing was removed. Merge it first, or run remove without --delete-branch"
-                );
+    let merged = match (&branch, opts.delete_branch) {
+        (Some(b), true) => git::merged(&main, b),
+        _ => git::Merged::Unknown,
+    };
+    if let (Some(b), git::Merged::No(refs)) = (&branch, &merged) {
+        bail!(
+            "branch {b} is not merged into {}; nothing was removed. \
+             Merge it first, or run remove without --delete-branch",
+            if refs.is_empty() {
+                "anything that stays".to_string()
+            } else {
+                refs.join(" or ")
             }
-        }
+        );
     }
     // Taken while the worktree is in place: after the move, git can no
     // longer tell which entry was this worktree's.
@@ -197,18 +202,34 @@ pub fn run(opts: Opts) -> Result<i32> {
     }
 
     if opts.delete_branch {
-        return Ok(delete_branch(&main, branch.as_deref()));
+        return Ok(delete_branch(&main, branch.as_deref(), &merged));
     }
     Ok(0)
 }
 
-/// `git branch -d`: a branch with commits that are not merged is kept.
-fn delete_branch(main: &Path, branch: Option<&str>) -> i32 {
+/// Delete the branch. One found merged ([`git::merged`]) is deleted with
+/// `git branch -D` if it is still at the commit that was checked (`-d`
+/// compares with `HEAD` or the upstream only, and would keep a branch that
+/// is merged into origin's default branch); otherwise `git branch -d`
+/// decides.
+fn delete_branch(main: &Path, branch: Option<&str>, merged: &git::Merged) -> i32 {
     let Some(b) = branch else {
         errln!("fast-worktree: the worktree had a detached HEAD; no branch to delete");
         return 0;
     };
-    match git::output(main, &["branch", "-d", b]) {
+    let flag = match merged {
+        git::Merged::Yes(sha)
+            if git::output(
+                main,
+                &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")],
+            )
+            .is_ok_and(|now| now.trim() == sha) =>
+        {
+            "-D"
+        }
+        _ => "-d",
+    };
+    match git::output(main, &["branch", flag, b]) {
         Ok(_) => {
             outln!("deleted branch {b}");
             0
