@@ -228,6 +228,7 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
     let key = cache_key(&lockfile, &nodev);
     if present {
         if is_current(&target, &lockfile, &key) {
+            write_key(&target, &key);
             return Ok(Report::done(format!("skip   {dir} (up to date)")));
         }
         trash::trash(&node_modules).map_err(|e| format!("cannot move node_modules away: {e}"))?;
@@ -331,12 +332,16 @@ fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
 }
 
 /// Whether the installed tree is the one this lockfile and Node version
-/// ask for. Trees installed by fast-worktree carry their key; for others,
-/// the tree is compared with the lockfile (the Node version is unknown).
+/// ask for. Trees installed by fast-worktree carry their key: a different
+/// Node version means installing again, a different lockfile only if the
+/// tree does not match it (someone ran `npm install` there). For trees
+/// without a key, only the lockfile can be compared.
 fn is_current(project: &Path, lockfile: &[u8], key: &str) -> bool {
+    let node = |k: &str| k.split_once('-').map(|(_, n)| n.to_string());
     match fs::read_to_string(project.join(KEY_FILE)) {
-        Ok(k) => k.trim() == key,
-        Err(_) => installed_tree_matches(project, lockfile),
+        Ok(k) if k.trim() == key => true,
+        Ok(k) if node(k.trim()) != node(key) => false,
+        _ => installed_tree_matches(project, lockfile),
     }
 }
 
@@ -555,12 +560,18 @@ mod tests {
         let p = t.path();
         let lock = br#"{"packages":{"node_modules/a":{"version":"1"}}}"#;
         fs::create_dir(p.join("node_modules")).unwrap();
-        assert!(!is_current(p, lock, "k1"), "nothing recorded");
+        assert!(!is_current(p, lock, "aaaa-v20"), "nothing recorded");
         fs::write(p.join(HIDDEN_LOCKFILE), lock).unwrap();
-        assert!(is_current(p, lock, "k1"), "no key: the tree decides");
-        write_key(p, "k1");
-        assert!(is_current(p, lock, "k1"));
-        assert!(!is_current(p, lock, "k2"), "the key decides when present");
+        assert!(is_current(p, lock, "aaaa-v20"), "no key: the tree decides");
+        write_key(p, "aaaa-v20");
+        assert!(is_current(p, lock, "aaaa-v20"));
+        assert!(!is_current(p, lock, "aaaa-v22"), "another Node version");
+        assert!(
+            is_current(p, lock, "bbbb-v20"),
+            "another lockfile, but the tree already matches it"
+        );
+        fs::write(p.join(HIDDEN_LOCKFILE), b"{\"packages\":{}}").unwrap();
+        assert!(!is_current(p, lock, "bbbb-v20"));
     }
 
     #[test]

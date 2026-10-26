@@ -86,9 +86,10 @@ latest cache entry, else with `npm ci --prefer-offline --no-audit
 are present is skipped; for npm that means `node_modules` has its
 `node_modules/.package-lock.json`, and a `node_modules` without one (an
 install that did not finish) is moved to the trash and installed again.
-With `--changed`, a project is installed again when its lockfile (or, for
-npm, its Node version) changed since fast-worktree last installed it. Then
-the `post_add` hooks run.
+With `--changed`, a project is installed again when its lockfile changed
+since fast-worktree last installed it (for npm: unless the installed tree
+already matches the new lockfile) or, for npm, when the project now
+resolves another Node version. Then the `post_add` hooks run.
 
 ```sh
 fast-worktree check [--quiet]
