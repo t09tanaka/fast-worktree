@@ -3,8 +3,9 @@
 //! Each test builds its own world in a temp directory: an upstream
 //! repository (default branch `trunk`, so nothing can assume `main`), a
 //! clone of it as the main checkout, and fake `npm` / `node` at the front
-//! of `PATH`. The fake `npm ci` writes `node_modules/.package-lock.json`
-//! from the lockfile, as the real one does; every `npm` call is logged.
+//! of `PATH` (`flutter` / `dart` too, for the tests that want them). The
+//! fake `npm ci` and `npm install` write `node_modules/.package-lock.json`
+//! from the lockfile, as the real ones do; every call is logged.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -23,10 +24,29 @@ case "$1" in
     cp package-lock.json node_modules/.package-lock.json
     echo cached > node_modules/.cache/tool
     echo dep > node_modules/dep/index.js
+    if [ -n "$FAKE_NPM_ABS_LINK" ]; then ln -s "$(pwd -P)" node_modules/dep/abs; fi
     ;;
-  run) ;;
+  install)
+    [ -d node_modules ] || { echo "fake npm: install without a tree" >&2; exit 1; }
+    if [ -n "$FAKE_NPM_INSTALL_REWRITES" ]; then echo '{"rewritten":1}' > package-lock.json; fi
+    if [ -z "$FAKE_NPM_INSTALL_STALE" ]; then cp package-lock.json node_modules/.package-lock.json; fi
+    echo updated > node_modules/dep/index.js
+    ;;
+  run)
+    if [ -n "$FAKE_NPM_RUN_FAIL" ]; then echo "script failed" >&2; exit 1; fi
+    ;;
   *) echo "fake npm: unexpected $*" >&2; exit 1 ;;
 esac
+"#;
+
+/// `flutter` or `dart`: `pub get` writes `.dart_tool/package_config.json`;
+/// `--offline` fails when `FAKE_PUB_OFFLINE_FAIL` is set.
+const FAKE_PUB: &str = r#"#!/bin/sh
+echo "$(basename "$0") $* $(pwd -P)" >> "$FAKE_PUB_LOG"
+case "$*" in
+  *--offline*) if [ -n "$FAKE_PUB_OFFLINE_FAIL" ]; then echo "offline: no cache" >&2; exit 1; fi ;;
+esac
+mkdir -p .dart_tool && echo '{}' > .dart_tool/package_config.json
 "#;
 
 const FAKE_NODE: &str = "#!/bin/sh\necho v20.0.0\n";
@@ -44,8 +64,13 @@ run = 'echo "pre_remove $FAST_WORKTREE_PATH|$FAST_WORKTREE_MAIN" >> "$HOOK_LOG";
 "#;
 
 fn lockfile(name: &str) -> String {
+    lockfile_v(name, "1.0.0")
+}
+
+/// A lockfile whose one dependency is at `version`.
+fn lockfile_v(name: &str, version: &str) -> String {
     format!(
-        r#"{{"name":"{name}","lockfileVersion":3,"requires":true,"packages":{{"":{{"name":"{name}"}},"node_modules/dep":{{"version":"1.0.0"}}}}}}"#
+        r#"{{"name":"{name}","lockfileVersion":3,"requires":true,"packages":{{"":{{"name":"{name}"}},"node_modules/dep":{{"version":"{version}"}}}}}}"#
     )
 }
 
@@ -129,6 +154,7 @@ impl World {
             .env("GIT_COMMITTER_EMAIL", "t@example.com")
             .env("FAST_WORKTREE_CACHE", &self.cache)
             .env("FAKE_NPM_LOG", self.base.join("npm.log"))
+            .env("FAKE_PUB_LOG", self.base.join("pub.log"))
             .env("HOOK_LOG", self.base.join("hook.log"));
     }
 
@@ -250,7 +276,7 @@ fn add_install_check_remove() {
     fs::remove_dir_all(wt2.join("lib/node_modules")).unwrap();
     let r = w.fw(&wt2.join("app"), &["check", "--quiet"]);
     r.assert_ok();
-    assert!(r.out().contains("missing deps: lib\n"), "{}", r.out());
+    assert!(r.out().contains("missing deps: lib (npm)\n"), "{}", r.out());
     assert!(!r.out().contains("missing deps: app"));
     let r = w.fw(&w.base, &["check"]);
     r.assert_ok();
@@ -369,7 +395,7 @@ fn install_only_named_projects() {
     assert!(!main.join("app/node_modules").exists());
     let r = w.fw(&main, &["install", "nope"]);
     r.assert_fails();
-    assert!(r.err().contains("no tracked project manifest in nope"));
+    assert!(r.err().contains("no tracked lockfile in nope"));
 }
 
 #[test]
@@ -419,7 +445,7 @@ fn no_config_and_no_lockfiles() {
     w.git(&main, &["commit", "-qam", "drop lockfiles"]);
     let r = w.fw(&main, &["install"]);
     r.assert_ok();
-    assert!(r.out().contains("no package-lock.json tracked"));
+    assert!(r.out().contains("no lockfile tracked"));
     assert_eq!(w.hook_log(), "");
     assert_eq!(w.fw(&main, &["check"]).out(), "");
 }
@@ -434,7 +460,7 @@ fn a_lockfile_at_the_repository_root_is_a_project() {
     w.git(&main, &["commit", "-qm", "root project"]);
 
     let r = w.fw(&main, &["check", "--quiet"]);
-    assert!(r.out().contains("missing deps: .\n"), "{}", r.out());
+    assert!(r.out().contains("missing deps: . (npm)\n"), "{}", r.out());
     let r = w.fw(&main, &["install", "."]);
     r.assert_ok();
     assert!(r.out().contains("npm ci . ("), "{}", r.out());
@@ -714,7 +740,7 @@ mod macos {
         r.assert_ok();
         assert!(
             r.out()
-                .contains("note   app: absolute symlink in node_modules, falling back to npm ci"),
+                .contains("note   app: absolute symlink in node_modules, not cloned"),
             "{}",
             r.out()
         );
@@ -734,5 +760,718 @@ mod macos {
             }
         }
         out
+    }
+}
+
+// ---- v0.2 ----
+
+impl World {
+    /// Write files under `dir` and commit everything.
+    fn commit(&self, dir: &Path, files: &[(&str, &str)], msg: &str) {
+        for (f, body) in files {
+            let p = dir.join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        }
+        self.git(dir, &["add", "-A"]);
+        self.git(dir, &["commit", "-qm", msg]);
+    }
+
+    /// Run git without asserting success, capturing its output (hooks
+    /// included).
+    fn git_run(&self, dir: &Path, args: &[&str], extra: &[(&str, &str)]) -> Run {
+        let mut c = Command::new("git");
+        self.env(&mut c);
+        for (k, v) in extra {
+            c.env(k, v);
+        }
+        Run(c.args(args).current_dir(dir).output().unwrap())
+    }
+
+    /// `PATH` with `dirs` (under the world) between the fake npm and the
+    /// system.
+    fn path_with(&self, dirs: &[&str]) -> String {
+        let mut parts = vec![self.base.join("bin").display().to_string()];
+        parts.extend(dirs.iter().map(|d| self.base.join(d).display().to_string()));
+        parts.push("/usr/bin:/bin:/usr/sbin:/sbin".into());
+        parts.join(":")
+    }
+
+    /// The cache entries of one project directory (slug) of the repository.
+    #[cfg(target_os = "macos")]
+    fn entries_in(&self, cache: &Path, slug: &str) -> Vec<PathBuf> {
+        let Some(repo) = fs::read_dir(cache)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|e| e.file_name() != "trash")
+        else {
+            return Vec::new();
+        };
+        let mut v: Vec<PathBuf> = fs::read_dir(repo.path().join(slug))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+impl Run {
+    /// stdout and stderr together.
+    fn all(&self) -> String {
+        format!("{}{}", self.out(), self.err())
+    }
+}
+
+#[track_caller]
+fn status_is_clean(w: &World, dir: &Path) {
+    assert_eq!(
+        w.git(dir, &["status", "--porcelain"]),
+        "",
+        "{}",
+        dir.display()
+    );
+}
+
+#[test]
+fn worktreeinclude_copies_only_ignored_matches() {
+    let w = World::new();
+    let main = w.main();
+    w.commit(
+        &main,
+        &[
+            (
+                ".gitignore",
+                "node_modules/\n.env\n.env.local\nconfig/\nlogs/\n",
+            ),
+            (
+                ".worktreeinclude",
+                "# copied into new worktrees\n.env*\nconfig/\n",
+            ),
+            (".env.example", "committed\n"),
+        ],
+        "include",
+    );
+    // A branch that tracks a file the main checkout has as ignored.
+    w.git(&main, &["switch", "-qc", "with-local"]);
+    fs::write(main.join(".env.local"), "from branch\n").unwrap();
+    w.git(&main, &["add", "-f", ".env.local"]);
+    w.git(&main, &["commit", "-qm", "track .env.local"]);
+    w.git(&main, &["switch", "-q", "trunk"]);
+    for (f, body) in [
+        (".env", "main env\n"),
+        (".env.local", "main local\n"),
+        (".env.draft", "untracked, not ignored\n"),
+        (".env.example", "modified, tracked\n"),
+        ("app/.env", "app env\n"),
+        ("config/db.json", "{}\n"),
+        ("logs/.env.old", "in a directory no pattern reaches\n"),
+        ("node_modules/pkg/.env", "a dependency's own\n"),
+    ] {
+        let p = main.join(f);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+
+    let r = w.fw(&main, &["add", "../wt", "-b", "x", "HEAD"]);
+    r.assert_ok();
+    let wt = w.base.join("wt");
+    for line in [
+        "copy   .env\n",
+        "copy   .env.local\n",
+        "copy   app/.env\n",
+        "copy   config\n",
+    ] {
+        assert!(r.out().contains(line), "{line}: {}", r.out());
+    }
+    let read = |p: &str| fs::read_to_string(wt.join(p)).unwrap();
+    assert_eq!(read(".env"), "main env\n");
+    assert_eq!(read(".env.local"), "main local\n");
+    assert_eq!(read("app/.env"), "app env\n");
+    assert_eq!(read("config/db.json"), "{}\n");
+    assert_eq!(read(".env.example"), "committed\n", "tracked: not copied");
+    assert!(!wt.join(".env.draft").exists(), "not ignored");
+    assert!(!wt.join("logs").exists());
+    assert!(!wt.join("node_modules").exists());
+    status_is_clean(&w, &wt);
+
+    // What the new worktree already has is kept.
+    let r = w.fw(&main, &["add", "../wt2", "-b", "y", "with-local"]);
+    r.assert_ok();
+    assert!(
+        r.out()
+            .contains("keep   .env.local (already in the worktree)"),
+        "{}",
+        r.out()
+    );
+    let wt2 = w.base.join("wt2");
+    assert_eq!(
+        fs::read_to_string(wt2.join(".env.local")).unwrap(),
+        "from branch\n"
+    );
+    assert_eq!(fs::read_to_string(wt2.join(".env")).unwrap(), "main env\n");
+    status_is_clean(&w, &wt2);
+}
+
+#[test]
+fn flutter_and_dart_projects() {
+    let w = World::new();
+    let main = w.main();
+    w.commit(
+        &main,
+        &[
+            (".gitignore", "node_modules/\n.dart_tool/\n"),
+            ("mobile/pubspec.yaml", "name: mobile\n"),
+            ("mobile/pubspec.lock", "packages: {}\n"),
+            // A path dependency of mobile: no lockfile, not a project.
+            ("mobile/pkg/pubspec.yaml", "name: pkg\n"),
+        ],
+        "mobile",
+    );
+    write_exe(&w.base.join("flutter-bin/flutter"), FAKE_PUB);
+    write_exe(&w.base.join("dart-bin/dart"), FAKE_PUB);
+    let flutter = w.path_with(&["flutter-bin", "dart-bin"]);
+    let dart = w.path_with(&["dart-bin"]);
+    let mobile = main.join("mobile");
+    let pub_log = || fs::read_to_string(w.base.join("pub.log")).unwrap_or_default();
+
+    let r = w.fw(&main, &["check", "--quiet"]);
+    assert!(
+        r.out().contains("missing deps: mobile (pub)\n"),
+        "{}",
+        r.out()
+    );
+    assert!(!r.out().contains("pkg"));
+
+    // No SDK: a note, not a failure.
+    let r = w.fw(&main, &["install", "mobile"]);
+    r.assert_ok();
+    assert!(
+        r.out()
+            .contains("note   mobile: neither flutter nor dart is installed, skipped"),
+        "{}",
+        r.out()
+    );
+
+    // flutter, offline first.
+    let r = w.fw_with(&main, &["install", "mobile"], &[("PATH", &flutter)]);
+    r.assert_ok();
+    assert!(r.out().contains("pub get mobile (flutter, "), "{}", r.out());
+    assert_eq!(
+        pub_log(),
+        format!("flutter pub get --offline {}\n", mobile.display())
+    );
+    assert!(mobile.join(".dart_tool/package_config.json").is_file());
+    assert!(!mobile.join("pkg/.dart_tool").exists());
+    assert!(!w.fw(&main, &["check", "--quiet"]).out().contains("mobile"));
+    let r = w.fw_with(&main, &["install", "mobile"], &[("PATH", &flutter)]);
+    assert!(r
+        .out()
+        .contains("skip   mobile (.dart_tool already present)"));
+
+    // The offline attempt fails: online.
+    fs::remove_dir_all(mobile.join(".dart_tool")).unwrap();
+    let r = w.fw_with(
+        &main,
+        &["install", "mobile"],
+        &[("PATH", &flutter), ("FAKE_PUB_OFFLINE_FAIL", "1")],
+    );
+    r.assert_ok();
+    assert!(
+        r.out().contains("pub get mobile (flutter, online, "),
+        "{}",
+        r.out()
+    );
+    assert!(pub_log().ends_with(&format!(
+        "flutter pub get --offline {0}\nflutter pub get {0}\n",
+        mobile.display()
+    )));
+
+    // dart only.
+    fs::remove_dir_all(mobile.join(".dart_tool")).unwrap();
+    let r = w.fw_with(&main, &["install", "mobile"], &[("PATH", &dart)]);
+    r.assert_ok();
+    assert!(r.out().contains("pub get mobile (dart, "), "{}", r.out());
+    assert!(pub_log().ends_with(&format!("dart pub get {}\n", mobile.display())));
+
+    // --changed: a new lockfile is fetched again, once.
+    w.commit(
+        &main,
+        &[("mobile/pubspec.lock", "packages: {a: 1}\n")],
+        "bump",
+    );
+    let r = w.fw_with(
+        &main,
+        &["install", "--changed", "mobile"],
+        &[("PATH", &dart)],
+    );
+    assert!(r.out().contains("pub get mobile (dart, "), "{}", r.out());
+    let r = w.fw_with(
+        &main,
+        &["install", "--changed", "mobile"],
+        &[("PATH", &dart)],
+    );
+    assert!(
+        r.out().contains("skip   mobile (up to date)"),
+        "{}",
+        r.out()
+    );
+}
+
+#[test]
+fn post_checkout_hook_clones_only_into_new_worktrees() {
+    let w = World::new();
+    let main = w.main();
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_fast-worktree"),
+        w.base.join("bin/fast-worktree"),
+    )
+    .unwrap();
+    // The hook as the README shows it.
+    write_exe(
+        &main.join(".git/hooks/post-checkout"),
+        "#!/bin/sh\ncommand -v fast-worktree >/dev/null 2>&1 && fast-worktree check --post-checkout \"$@\" || true\n",
+    );
+
+    // `add` tells the hook to stand aside and installs once.
+    let r = w.fw(&main, &["add", "../wt1", "-b", "a"]);
+    r.assert_ok();
+    assert_eq!(w.count("ci "), 2, "{}", w.npm_log());
+    assert!(!r.all().contains("missing deps"), "{}", r.all());
+
+    // A plain `git worktree add`: clones what it can, never installs.
+    let r = w.git_run(
+        &main,
+        &["worktree", "add", "../wt2", "-b", "b", "origin/trunk"],
+        &[],
+    );
+    r.assert_ok();
+    let wt2 = w.base.join("wt2");
+    if cfg!(target_os = "macos") {
+        assert!(r.all().contains("clone  app from "), "{}", r.all());
+        assert!(wt2.join("app/node_modules/.package-lock.json").is_file());
+        assert!(wt2.join("lib/node_modules/.package-lock.json").is_file());
+        assert!(!r.all().contains("missing deps"), "{}", r.all());
+    } else {
+        assert!(r.all().contains("missing deps: app (npm)"), "{}", r.all());
+        assert!(!wt2.join("app/node_modules").exists());
+    }
+    assert_eq!(w.count("ci "), 2, "{}", w.npm_log());
+    assert_eq!(w.count("install "), 0, "{}", w.npm_log());
+
+    // `git switch`: only lists.
+    let _ = fs::remove_dir_all(wt2.join("lib/node_modules"));
+    let npm_calls = w.npm_log().lines().count();
+    let r = w.git_run(&wt2, &["switch", "-qc", "c"], &[]);
+    r.assert_ok();
+    assert!(r.all().contains("missing deps: lib (npm)"), "{}", r.all());
+    assert!(!wt2.join("lib/node_modules").exists());
+    assert_eq!(w.npm_log().lines().count(), npm_calls, "{}", w.npm_log());
+
+    // CI, FAST_WORKTREE_SKIP: nothing at all.
+    for (k, v) in [("CI", "true"), ("FAST_WORKTREE_SKIP", "1")] {
+        let path = format!("../wt-{k}");
+        let r = w.git_run(
+            &main,
+            &["worktree", "add", &path, "-b", k, "origin/trunk"],
+            &[(k, v)],
+        );
+        r.assert_ok();
+        assert!(!r.all().contains("deps"), "{k}: {}", r.all());
+        assert!(!w.base.join(format!("wt-{k}/app/node_modules")).exists());
+    }
+
+    // A lockfile nothing can be cloned for: listed, not installed.
+    w.commit(
+        &main,
+        &[("app/package-lock.json", &lockfile_v("app", "2.0.0"))],
+        "bump",
+    );
+    let r = w.git_run(
+        &main,
+        &["worktree", "add", "../wt3", "-b", "d", "HEAD"],
+        &[],
+    );
+    r.assert_ok();
+    assert!(r.all().contains("missing deps: app (npm)"), "{}", r.all());
+    assert!(
+        r.all().contains("run `fast-worktree install`"),
+        "{}",
+        r.all()
+    );
+    assert!(!w.base.join("wt3/app/node_modules").exists());
+    assert_eq!(w.count("ci "), 2, "{}", w.npm_log());
+    assert_eq!(w.count("install "), 0, "{}", w.npm_log());
+
+    // Called directly, outside a repository, it still exits 0.
+    w.fw(&w.base, &["check", "--post-checkout", "0", "0", "1"])
+        .assert_ok();
+}
+
+#[test]
+fn cache_ls_and_prune() {
+    let w = World::new();
+    let main = w.main();
+    let r = w.fw(&main, &["cache", "ls"]);
+    r.assert_ok();
+    assert!(r.out().starts_with("cache is empty"), "{}", r.out());
+
+    let old = w.cache.join("app-1234abcd/_root/aaaaaaaaaaaaaaaa-v20.0.0");
+    let new = w
+        .cache
+        .join("app-1234abcd/packages__web/bbbbbbbbbbbbbbbb-v20.0.0");
+    fs::create_dir_all(&old).unwrap();
+    fs::create_dir_all(&new).unwrap();
+    fs::create_dir_all(w.cache.join("trash/1-1-1-x")).unwrap();
+    let old_marker = w
+        .cache
+        .join("app-1234abcd/_root/aaaaaaaaaaaaaaaa-v20.0.0.ok");
+    fs::write(&old_marker, "").unwrap();
+    // Noon, so that the UTC date is the same in every time zone.
+    let t = Command::new("touch")
+        .args(["-t", "202001011200"])
+        .arg(&old)
+        .status()
+        .unwrap();
+    assert!(t.success());
+
+    let r = w.fw(&main, &["cache", "ls"]);
+    r.assert_ok();
+    let out = r.out();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 4, "{out}");
+    assert!(lines[0].starts_with("REPO "), "{out}");
+    assert!(
+        lines[1].starts_with("app-1234abcd  .             aaaaaaaaaaaaaaaa-v20.0.0  2020-01-01 ("),
+        "{out}"
+    );
+    assert!(lines[2].contains("  packages/web  "), "{out}");
+    assert!(lines[3].starts_with("2 entries in "), "{out}");
+
+    let r = w.fw(&main, &["cache", "prune"]);
+    r.assert_ok();
+    assert!(
+        r.out()
+            .contains("pruned app-1234abcd/_root/aaaaaaaaaaaaaaaa-v20.0.0\n"),
+        "{}",
+        r.out()
+    );
+    assert!(r
+        .out()
+        .contains("pruned 1 entries unused for more than 7 days"));
+    assert!(!old.exists());
+    assert!(!old_marker.exists());
+    assert!(new.exists());
+
+    let r = w.fw(&main, &["cache", "prune", "--older-than", "0"]);
+    r.assert_ok();
+    assert!(r.out().contains("pruned 1 entries"), "{}", r.out());
+    assert!(w
+        .fw(&main, &["cache", "ls"])
+        .out()
+        .starts_with("cache is empty"));
+}
+
+#[test]
+fn remove_delete_branch_refuses_an_unmerged_branch_before_removing() {
+    let w = World::new();
+    let main = w.main();
+    w.fw(&main, &["add", "../wt", "-b", "feat"]).assert_ok();
+    let wt = w.base.join("wt");
+    w.commit(&wt, &[("new.txt", "x")], "work");
+    let r = w.fw(&main, &["remove", "../wt", "--delete-branch"]);
+    r.assert_fails();
+    assert!(
+        r.err()
+            .contains("branch feat is not merged into origin/trunk"),
+        "{}",
+        r.err()
+    );
+    assert!(r.err().contains("nothing was removed"), "{}", r.err());
+    assert!(wt.join("new.txt").is_file());
+    assert!(!w.hook_log().contains("pre_remove"), "refused before hooks");
+    w.fw(&main, &["remove", "../wt"]).assert_ok();
+    assert!(!wt.exists());
+    // git agrees: `git branch -d` keeps it.
+    assert!(!w.git_run(&main, &["branch", "-d", "feat"], &[]).ok());
+
+    // Without an upstream, HEAD decides, as for `git branch -d`.
+    w.fw(&main, &["add", "../wt2", "-b", "local", "HEAD"])
+        .assert_ok();
+    let wt2 = w.base.join("wt2");
+    w.commit(&wt2, &[("new.txt", "x")], "work");
+    let r = w.fw(&main, &["remove", "../wt2", "--delete-branch"]);
+    r.assert_fails();
+    assert!(
+        r.err().contains("branch local is not merged into HEAD"),
+        "{}",
+        r.err()
+    );
+    assert!(wt2.exists());
+    w.fw(&main, &["remove", "../wt2"]).assert_ok();
+    assert!(!w.git_run(&main, &["branch", "-d", "local"], &[]).ok());
+}
+
+#[test]
+fn install_changed_reinstalls_only_what_changed() {
+    let w = World::new();
+    let main = w.main();
+    w.fw(&main, &["add", "../wt", "-b", "a"]).assert_ok();
+    let wt = w.base.join("wt");
+    let bumped = lockfile_v("app", "1.1.0");
+    w.commit(&wt, &[("app/package-lock.json", &bumped)], "bump");
+
+    let r = w.fw(&wt, &["install"]);
+    assert!(r
+        .out()
+        .contains("skip   app (node_modules already present)"));
+    let r = w.fw(&wt, &["install", "--changed"]);
+    r.assert_ok();
+    assert!(
+        r.out()
+            .contains("note   app: lockfile or Node version changed, installing again"),
+        "{}",
+        r.out()
+    );
+    if cfg!(target_os = "macos") {
+        assert!(r.out().contains("delta  app from "), "{}", r.out());
+    } else {
+        assert!(r.out().contains("npm ci app ("), "{}", r.out());
+    }
+    assert!(r.out().contains("skip   lib (up to date)"), "{}", r.out());
+    assert_eq!(
+        fs::read_to_string(wt.join("app/node_modules/.package-lock.json")).unwrap(),
+        bumped
+    );
+    let r = w.fw(&wt, &["install", "--changed"]);
+    assert!(r.out().contains("skip   app (up to date)"), "{}", r.out());
+}
+
+#[cfg(target_os = "macos")]
+mod macos_v02 {
+    use super::*;
+
+    #[test]
+    fn a_changed_lockfile_is_installed_on_top_of_the_latest_entry() {
+        let w = World::new();
+        let main = w.main();
+        w.fw(&main, &["add", "../wt1", "-b", "a"]).assert_ok();
+        let v11 = lockfile_v("app", "1.1.0");
+        w.commit(&main, &[("app/package-lock.json", &v11)], "bump app");
+
+        let r = w.fw(&main, &["add", "../wt2", "-b", "b", "HEAD"]);
+        r.assert_ok();
+        let wt2 = w.base.join("wt2");
+        assert!(
+            r.out()
+                .contains(&format!("delta  app from {}/", w.cache.display())),
+            "{}",
+            r.out()
+        );
+        assert!(r.out().contains("clone  lib from "), "{}", r.out());
+        assert_eq!(w.count("ci "), 2, "{}", w.npm_log());
+        assert!(w.npm_log().contains(&format!(
+            "install --prefer-offline {}",
+            wt2.join("app").display()
+        )));
+        assert_eq!(
+            fs::read_to_string(wt2.join("app/node_modules/.package-lock.json")).unwrap(),
+            v11
+        );
+        assert_eq!(
+            fs::read_to_string(wt2.join("app/node_modules/dep/index.js")).unwrap(),
+            "updated\n"
+        );
+        let entries = w.entries_in(&w.cache, "app");
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        status_is_clean(&w, &wt2);
+
+        // The result was cached: the next worktree clones it.
+        let r = w.fw(&main, &["add", "../wt3", "-b", "c", "HEAD"]);
+        assert!(r.out().contains("clone  app from "), "{}", r.out());
+        assert_eq!(w.count("install "), 1);
+
+        // npm install rewrote the lockfile: npm ci, and the lockfile is back.
+        let v12 = lockfile_v("app", "1.2.0");
+        w.commit(&main, &[("app/package-lock.json", &v12)], "bump again");
+        let r = w.fw_with(
+            &main,
+            &["add", "../wt4", "-b", "d", "HEAD"],
+            &[("FAKE_NPM_INSTALL_REWRITES", "1")],
+        );
+        r.assert_ok();
+        assert!(
+            r.out().contains(
+                "note   app: npm install changed package-lock.json, falling back to npm ci"
+            ),
+            "{}",
+            r.out()
+        );
+        assert!(r.out().contains("npm ci app ("), "{}", r.out());
+        let wt4 = w.base.join("wt4");
+        assert_eq!(
+            fs::read_to_string(wt4.join("app/package-lock.json")).unwrap(),
+            v12
+        );
+        status_is_clean(&w, &wt4);
+        assert_eq!(w.count("ci "), 3);
+
+        // npm install left a tree that does not match: npm ci.
+        let v13 = lockfile_v("app", "1.3.0");
+        w.commit(&main, &[("app/package-lock.json", &v13)], "and again");
+        let r = w.fw_with(
+            &main,
+            &["add", "../wt5", "-b", "e", "HEAD"],
+            &[("FAKE_NPM_INSTALL_STALE", "1")],
+        );
+        r.assert_ok();
+        assert!(
+            r.out().contains(
+                "note   app: npm install left a tree that differs from package-lock.json, \
+                 falling back to npm ci"
+            ),
+            "{}",
+            r.out()
+        );
+        assert_eq!(w.count("ci "), 4);
+        assert_eq!(
+            fs::read_to_string(w.base.join("wt5/app/node_modules/.package-lock.json")).unwrap(),
+            v13
+        );
+    }
+
+    #[test]
+    fn skip_lifecycle_when_the_inputs_are_unchanged() {
+        let w = World::new();
+        let main = w.main();
+        let cfg = format!(
+            "{HOOKS}\n[[skip_lifecycle]]\ndir = \"app\"\nscript = \"postinstall\"\n\
+             if_equal = [[\"gen-input.txt\", \"node_modules/dep/index.js\"]]\n"
+        );
+        // The fake npm ci writes "dep\n" to node_modules/dep/index.js.
+        w.commit(
+            &main,
+            &[
+                (".fast-worktree.toml", &cfg),
+                ("app/gen-input.txt", "dep\n"),
+            ],
+            "skip rule",
+        );
+        w.fw(&main, &["add", "../wt1", "-b", "a", "HEAD"])
+            .assert_ok();
+        let r = w.fw(&main, &["add", "../wt2", "-b", "b", "HEAD"]);
+        r.assert_ok();
+        assert!(
+            r.out()
+                .contains("note   app: postinstall skipped, inputs unchanged"),
+            "{}",
+            r.out()
+        );
+        assert!(r.out().contains("clone  app from "), "{}", r.out());
+        assert_eq!(w.count("run "), 0, "{}", w.npm_log());
+
+        w.commit(
+            &main,
+            &[("app/gen-input.txt", "changed\n")],
+            "input changed",
+        );
+        let r = w.fw(&main, &["add", "../wt3", "-b", "c", "HEAD"]);
+        r.assert_ok();
+        assert!(!r.out().contains("skipped"), "{}", r.out());
+        assert_eq!(w.count("run postinstall"), 1, "{}", w.npm_log());
+    }
+
+    #[test]
+    fn cache_entries_are_scanned_once_when_stored() {
+        let w = World::new();
+        let main = w.main();
+        w.fw(&main, &["add", "../wt1", "-b", "a"]).assert_ok();
+        let entry = w.entries_in(&w.cache, "app").pop().unwrap();
+        let marker = PathBuf::from(format!("{}.ok", entry.display()));
+        assert!(marker.is_file());
+        let lib = &w.entries_in(&w.cache, "lib")[0];
+        assert!(PathBuf::from(format!("{}.ok", lib.display())).is_file());
+
+        // With the marker, a clone does not walk the tree: a symlink planted
+        // in the entry afterwards comes through.
+        std::os::unix::fs::symlink(&w.base, entry.join("dep/abs")).unwrap();
+        let r = w.fw(&main, &["add", "../wt2", "-b", "b"]);
+        r.assert_ok();
+        assert!(r.out().contains("clone  app from "), "{}", r.out());
+        assert!(w
+            .base
+            .join("wt2/app/node_modules/dep/abs")
+            .symlink_metadata()
+            .is_ok());
+
+        // Without it, the tree is walked and the clone refused.
+        fs::remove_file(&marker).unwrap();
+        let r = w.fw(&main, &["add", "../wt3", "-b", "c"]);
+        r.assert_ok();
+        assert!(
+            r.out()
+                .contains("note   app: absolute symlink in node_modules, not cloned"),
+            "{}",
+            r.out()
+        );
+        assert!(r.out().contains("npm ci app ("), "{}", r.out());
+        assert!(w
+            .base
+            .join("wt3/app/node_modules/dep/abs")
+            .symlink_metadata()
+            .is_err());
+
+        // A tree with an absolute symlink is not cached.
+        let cache2 = w.base.join("cache2");
+        w.commit(
+            &main,
+            &[("app/package-lock.json", &lockfile_v("app", "3.0.0"))],
+            "bump",
+        );
+        let r = w.fw_with(
+            &main,
+            &["add", "../wt4", "-b", "d", "HEAD"],
+            &[
+                ("FAST_WORKTREE_CACHE", cache2.to_str().unwrap()),
+                ("FAKE_NPM_ABS_LINK", "1"),
+            ],
+        );
+        r.assert_ok();
+        assert!(
+            r.out()
+                .contains("note   app: cache not saved: absolute symlink in node_modules"),
+            "{}",
+            r.out()
+        );
+        assert!(w.entries_in(&cache2, "app").is_empty());
+    }
+
+    #[test]
+    fn a_failing_lifecycle_script_discards_the_clone() {
+        let w = World::new();
+        let main = w.main();
+        w.fw(&main, &["add", "../wt1", "-b", "a"]).assert_ok();
+        let r = w.fw_with(
+            &main,
+            &["add", "../wt2", "-b", "b"],
+            &[("FAKE_NPM_RUN_FAIL", "1")],
+        );
+        r.assert_fails();
+        assert!(r.out().contains("FAILED app:"), "{}", r.out());
+        assert!(
+            r.out().contains("npm run postinstall failed after clone"),
+            "{}",
+            r.out()
+        );
+        let wt2 = w.base.join("wt2");
+        assert!(!wt2.join("app/node_modules").exists());
+        assert!(wt2.join("lib/node_modules").is_dir());
+        let r = w.fw(&wt2, &["install"]);
+        r.assert_ok();
+        assert!(r.out().contains("clone  app from "), "{}", r.out());
     }
 }

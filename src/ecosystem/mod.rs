@@ -1,11 +1,13 @@
-//! Package ecosystems. Each one finds its projects from tracked manifest
-//! files and knows how to make a project's dependencies present. v0.1 has
-//! npm only; another ecosystem is a new module plus a line in [`all`].
+//! Package ecosystems. Each one finds its projects from tracked lockfiles
+//! and knows how to make a project's dependencies present. Another
+//! ecosystem is a new module plus a line in [`all`].
 
+pub mod dart;
 pub mod npm;
 
 use crate::error::Result;
 use crate::git;
+use crate::hooks::SkipLifecycle;
 use std::path::{Path, PathBuf};
 
 /// What an install needs to know about its surroundings.
@@ -17,23 +19,59 @@ pub struct Ctx {
     pub worktrees: Vec<PathBuf>,
     /// This repository's directory in the cache.
     pub cache_repo: PathBuf,
+    /// `skip_lifecycle` rules from `.fast-worktree.toml`.
+    pub skip_lifecycle: Vec<SkipLifecycle>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Make missing dependencies present by any means; leave present ones.
+    Missing,
+    /// Like `Missing`, and also install again where the lockfile or the
+    /// Node version changed since the last install.
+    Changed,
+    /// Only what a clone (cache or another worktree) can provide: nothing
+    /// that downloads or builds. For the `post-checkout` hook.
+    CloneOnly,
+}
+
+/// The result of one project's install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// Lines to print.
+    pub lines: String,
+    /// `CloneOnly` found nothing to clone: the dependencies are still
+    /// missing.
+    pub missing: bool,
+}
+
+impl Report {
+    pub fn done(lines: impl Into<String>) -> Report {
+        Report {
+            lines: lines.into(),
+            missing: false,
+        }
+    }
 }
 
 pub trait Ecosystem: Sync {
-    /// The file whose tracked copies mark a project directory.
+    /// Short name shown next to a project, such as `npm`.
+    fn name(&self) -> &'static str;
+
+    /// The lockfile whose tracked copies mark a project directory.
     fn manifest(&self) -> &'static str;
 
     /// Whether the project's dependencies look present, for `check`. Must
     /// be cheap: no subprocesses.
     fn is_installed(&self, project: &Path) -> bool;
 
-    /// Make the dependencies of `ctx.root/<dir>` present. Returns the lines
-    /// to print, or on failure the log to show.
-    fn install(&self, ctx: &Ctx, dir: &str) -> std::result::Result<String, String>;
+    /// Make the dependencies of `ctx.root/<dir>` present. Returns what to
+    /// print, or on failure the log to show.
+    fn install(&self, ctx: &Ctx, dir: &str, mode: Mode) -> std::result::Result<Report, String>;
 }
 
 pub fn all() -> Vec<&'static dyn Ecosystem> {
-    vec![&npm::Npm]
+    vec![&npm::Npm, &dart::Dart]
 }
 
 /// `root/<dir>`, with `.` meaning `root` itself.
@@ -45,10 +83,18 @@ pub fn project_path(root: &Path, dir: &str) -> PathBuf {
     }
 }
 
+#[derive(Clone)]
 pub struct Project {
     pub ecosystem: &'static dyn Ecosystem,
     /// Relative to the worktree root; `.` for the root itself.
     pub dir: String,
+}
+
+impl Project {
+    /// `api (npm)`: how a project is named in `check`'s output.
+    pub fn label(&self) -> String {
+        format!("{} ({})", self.dir, self.ecosystem.name())
+    }
 }
 
 /// Tracked projects of every ecosystem, in path order, from one `git
@@ -70,7 +116,7 @@ pub fn discover(root: &Path) -> Result<Vec<Project>> {
         let Some(eco) = ecos.iter().find(|e| e.manifest() == base) else {
             continue;
         };
-        // A sparse checkout can track a manifest that is not on disk.
+        // A sparse checkout can track a lockfile that is not on disk.
         if !root.join(&f).is_file() {
             continue;
         }
@@ -79,7 +125,9 @@ pub fn discover(root: &Path) -> Result<Vec<Project>> {
             dir,
         });
     }
-    projects.sort_by(|a, b| a.dir.cmp(&b.dir));
-    projects.dedup_by(|a, b| a.dir == b.dir && a.ecosystem.manifest() == b.ecosystem.manifest());
+    projects.sort_by(|a, b| {
+        (a.dir.as_str(), a.ecosystem.name()).cmp(&(b.dir.as_str(), b.ecosystem.name()))
+    });
+    projects.dedup_by(|a, b| a.dir == b.dir && a.ecosystem.name() == b.ecosystem.name());
     Ok(projects)
 }

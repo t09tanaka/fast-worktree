@@ -132,6 +132,18 @@ pub fn run(opts: Opts) -> Result<i32> {
         }
     }
     let branch = me.and_then(|w| w.branch.clone());
+    // Decide about the branch before anything is removed: `git branch -d`
+    // failing afterwards would leave the worktree gone and the branch kept.
+    if opts.delete_branch {
+        if let Some(b) = &branch {
+            if let Some(reference) = git::unmerged_into(&main, b) {
+                bail!(
+                    "branch {b} is not merged into {reference}, so `git branch -d` would keep it; \
+                     nothing was removed. Merge it first, or run remove without --delete-branch"
+                );
+            }
+        }
+    }
     // Taken while the worktree is in place: after the move, git can no
     // longer tell which entry was this worktree's.
     let admin = git::admin_dir(&path)?;

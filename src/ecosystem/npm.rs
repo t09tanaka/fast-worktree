@@ -3,15 +3,22 @@
 //! `node_modules` is made present by the first of these that applies:
 //!
 //! 1. **Cache.** `<cache>/<repo>/<project>/<key>` holds a `node_modules`
-//!    from an earlier `npm ci` with the same key. Cloned in one
+//!    from an earlier install with the same key. Cloned in one
 //!    `clonefile(2)` call.
 //! 2. **Another worktree** of the same repository (the main checkout
 //!    included) whose lockfile is byte-identical, whose installed tree
 //!    matches that lockfile ([`tree_match`]), and whose `node -v` is the
 //!    same. A checkout that pulled a new lockfile but did not reinstall
 //!    fails the tree check and is not used.
-//! 3. `npm ci --prefer-offline --no-audit --no-fund`. The result is cloned
-//!    into the cache.
+//! 3. **Delta.** The project's most recently used cache entry for the same
+//!    Node version (an older lockfile) is cloned and `npm install
+//!    --prefer-offline --no-audit --no-fund` brings it up to date. The
+//!    result is used only if `package-lock.json` is byte-identical
+//!    afterwards and the installed tree matches it; otherwise it is thrown
+//!    away and step 4 runs.
+//! 4. `npm ci --prefer-offline --no-audit --no-fund`.
+//!
+//! What steps 2 to 4 produce is cloned into the cache.
 //!
 //! Only a tree whose `node_modules/.package-lock.json` matches the lockfile
 //! goes into the cache. A `node_modules` without `.package-lock.json` (an
@@ -21,43 +28,50 @@
 //! The key is the first 16 hex digits of the lockfile's sha256 plus the
 //! `node -v` that the project directory resolves (version managers pick
 //! it per directory). The Node version is part of the key and of the
-//! worktree test because native addons are built for one Node ABI.
+//! worktree test because native addons are built for one Node ABI. It is
+//! also written to `node_modules/.fast-worktree-key`, so `install
+//! --changed` can tell an outdated tree.
 //!
 //! After a clone, `node_modules/.cache` (tool caches that embed absolute
-//! paths) is deleted. If the tree contains a symlink with an absolute
-//! target, which could point into the source worktree, the clone is
-//! dropped and `npm ci` runs instead. Dependencies' own install scripts
-//! wrote their output inside `node_modules`, so the clone carries it; the
-//! project's own `preinstall` / `install` / `postinstall` / `prepare`
-//! (git hooks setup, code generation) may write outside it, so the ones
-//! present in its `package.json` are run again in the clone.
+//! paths) is deleted. A tree with a symlink whose target is absolute, which
+//! could point into the source worktree, is neither cached nor cloned from
+//! another worktree; `npm ci` runs instead. Cache entries are checked once,
+//! when stored ([`cache`]). Dependencies' own install scripts wrote their
+//! output inside `node_modules`, so the clone carries it; the project's own
+//! `preinstall` / `install` / `postinstall` / `prepare` (git hooks setup,
+//! code generation) may write outside it, so the ones present in its
+//! `package.json` are run again in the clone, except where a
+//! `skip_lifecycle` rule says their inputs are unchanged. If one fails,
+//! the clone is thrown away so that the next `install` does not skip a
+//! broken tree.
 //!
-//! Cache entries unused for [`CACHE_TTL_DAYS`] days are removed. Clones
-//! share blocks with their source, so an entry costs almost no disk while
-//! a worktree made from it exists.
-//!
-//! Only macOS can clone directories; elsewhere steps 1 and 2 are skipped.
+//! Only macOS can clone directories; elsewhere steps 1 to 3 are skipped.
 
 pub mod tree_match;
 
-use super::{Ctx, Ecosystem};
+use super::{Ctx, Ecosystem, Mode, Report};
+use crate::hooks::SkipLifecycle;
 use crate::paths::{hex, project_slug};
-use crate::{clone, trash, util};
+use crate::{cache, clone, trash, util};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
-pub const CACHE_TTL_DAYS: u64 = 7;
 const LOCKFILE: &str = "package-lock.json";
 const HIDDEN_LOCKFILE: &str = "node_modules/.package-lock.json";
+const KEY_FILE: &str = "node_modules/.fast-worktree-key";
 const OWN_LIFECYCLE: [&str; 4] = ["preinstall", "install", "postinstall", "prepare"];
+const NPM_FLAGS: [&str; 3] = ["--prefer-offline", "--no-audit", "--no-fund"];
 
 pub struct Npm;
 
 impl Ecosystem for Npm {
+    fn name(&self) -> &'static str {
+        "npm"
+    }
+
     fn manifest(&self) -> &'static str {
         LOCKFILE
     }
@@ -69,8 +83,8 @@ impl Ecosystem for Npm {
             || fs::read(project.join(LOCKFILE)).is_ok_and(|l| !has_dependencies(&l))
     }
 
-    fn install(&self, ctx: &Ctx, dir: &str) -> Result<String, String> {
-        install(ctx, dir)
+    fn install(&self, ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
+        install(ctx, dir, mode)
     }
 }
 
@@ -140,14 +154,17 @@ impl DonorProbe for FsProbe<'_> {
         fs::read(project.join(LOCKFILE)).is_ok_and(|b| b == self.lockfile)
     }
     fn tree_matches(&self, project: &Path) -> bool {
-        match fs::read(project.join(HIDDEN_LOCKFILE)) {
-            Ok(hidden) => tree_match::tree_matches(self.lockfile, &hidden).is_ok(),
-            Err(_) => false,
-        }
+        installed_tree_matches(project, self.lockfile)
     }
     fn node_version(&self, project: &Path) -> Option<String> {
         node_version(project).ok()
     }
+}
+
+/// Whether `project/node_modules` is the tree `lockfile` asks for.
+fn installed_tree_matches(project: &Path, lockfile: &[u8]) -> bool {
+    fs::read(project.join(HIDDEN_LOCKFILE))
+        .is_ok_and(|hidden| tree_match::tree_matches(lockfile, &hidden).is_ok())
 }
 
 fn node_version(project: &Path) -> Result<String, String> {
@@ -166,37 +183,65 @@ fn node_version(project: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn install(ctx: &Ctx, dir: &str) -> Result<String, String> {
+/// Where a clone came from.
+enum Source {
+    Cache(PathBuf),
+    Worktree(PathBuf),
+}
+
+fn install(ctx: &Ctx, dir: &str, mode: Mode) -> Result<Report, String> {
     let start = Instant::now();
     let target = super::project_path(&ctx.root, dir);
     let node_modules = target.join("node_modules");
     let mut lines = Vec::new();
-    if node_modules.symlink_metadata().is_ok() {
+    let mut present = node_modules.symlink_metadata().is_ok();
+    if present && mode != Mode::Changed {
         if Npm.is_installed(&target) {
-            return Ok(format!("skip   {dir} (node_modules already present)"));
+            return Ok(Report::done(format!(
+                "skip   {dir} (node_modules already present)"
+            )));
         }
         // Left by an install that did not finish, or made by hand: npm
         // writes `.package-lock.json` last.
+        let note = format!("note   {dir}: node_modules has no .package-lock.json");
+        if mode == Mode::CloneOnly {
+            return Ok(Report {
+                lines: note,
+                missing: true,
+            });
+        }
         trash::trash(&node_modules).map_err(|e| format!("cannot move node_modules away: {e}"))?;
-        lines.push(format!(
-            "note   {dir}: node_modules has no .package-lock.json, installing again"
-        ));
+        lines.push(format!("{note}, installing again"));
+        present = false;
     }
     let lockfile = fs::read(target.join(LOCKFILE)).map_err(|e| format!("{LOCKFILE}: {e}"))?;
     if !has_dependencies(&lockfile) {
-        return Ok(format!("skip   {dir} (no dependencies)"));
+        return Ok(Report::done(format!("skip   {dir} (no dependencies)")));
+    }
+    if mode == Mode::CloneOnly && !clone::SUPPORTED {
+        return Ok(Report {
+            lines: String::new(),
+            missing: true,
+        });
     }
     let nodev = node_version(&target)?;
-    let entry = ctx
-        .cache_repo
-        .join(project_slug(dir))
-        .join(cache_key(&lockfile, &nodev));
+    let key = cache_key(&lockfile, &nodev);
+    if present {
+        if is_current(&target, &lockfile, &key) {
+            return Ok(Report::done(format!("skip   {dir} (up to date)")));
+        }
+        trash::trash(&node_modules).map_err(|e| format!("cannot move node_modules away: {e}"))?;
+        lines.push(format!(
+            "note   {dir}: lockfile or Node version changed, installing again"
+        ));
+    }
+    let project_cache = ctx.cache_repo.join(project_slug(dir));
+    let entry = project_cache.join(&key);
 
     if clone::SUPPORTED {
-        let from_cache = entry.is_dir();
-        let src = if from_cache {
-            touch(&entry);
-            Some(entry.clone())
+        let src = if entry.is_dir() {
+            cache::touch(&entry);
+            Some(Source::Cache(entry.clone()))
         } else {
             find_donor(
                 &ctx.root,
@@ -207,77 +252,191 @@ fn install(ctx: &Ctx, dir: &str) -> Result<String, String> {
                     lockfile: &lockfile,
                 },
             )
+            .map(Source::Worktree)
         };
         if let Some(src) = src {
-            match clone_from(&src, &node_modules) {
+            let (path, checked) = match &src {
+                Source::Cache(p) => (p, cache::is_checked(p)),
+                Source::Worktree(p) => (p, false),
+            };
+            match clone_from(path, &node_modules, checked) {
                 Ok(()) => {
-                    run_own_lifecycle(&target)?;
-                    if !from_cache {
-                        if let Err(e) = cache_store(&node_modules, &entry, &lockfile) {
-                            lines.push(format!("note   {dir}: cache not saved: {e}"));
+                    match &src {
+                        // An entry from before markers existed, now checked.
+                        Source::Cache(p) if !checked => cache::mark_checked(p),
+                        Source::Cache(_) => {}
+                        // Stored before the project's own scripts touch it:
+                        // this is the donor's tree, just scanned.
+                        Source::Worktree(_) => {
+                            save(&node_modules, &entry, true, &lockfile, dir, &mut lines);
                         }
                     }
+                    lines.extend(after_clone(ctx, &target, dir, &key)?);
                     lines.push(format!(
                         "clone  {dir} from {} ({})",
-                        util::tilde(&src),
+                        util::tilde(path),
                         util::elapsed(start)
                     ));
-                    return Ok(lines.join("\n"));
+                    return Ok(Report::done(lines.join("\n")));
+                }
+                Err(why) => lines.push(format!("note   {dir}: {why}, not cloned")),
+            }
+        }
+    }
+
+    if mode == Mode::CloneOnly {
+        return Ok(Report {
+            lines: lines.join("\n"),
+            missing: true,
+        });
+    }
+
+    if clone::SUPPORTED {
+        if let Some(base) = cache::latest(&project_cache, &nodev, &entry) {
+            cache::touch(&base);
+            match delta(&base, &target, &lockfile) {
+                Ok(()) => {
+                    write_key(&target, &key);
+                    save(&node_modules, &entry, false, &lockfile, dir, &mut lines);
+                    cache::prune(
+                        &project_cache,
+                        Duration::from_secs(cache::TTL_DAYS * 86_400),
+                    );
+                    lines.push(format!(
+                        "delta  {dir} from {} ({})",
+                        util::tilde(&base),
+                        util::elapsed(start)
+                    ));
+                    return Ok(Report::done(lines.join("\n")));
                 }
                 Err(why) => lines.push(format!("note   {dir}: {why}, falling back to npm ci")),
             }
         }
     }
 
-    npm_ci(&target)?;
+    if let Err(log) = npm_ci(&target) {
+        discard(&node_modules);
+        return Err(log);
+    }
+    write_key(&target, &key);
     if clone::SUPPORTED && node_modules.is_dir() {
-        if let Err(e) = cache_store(&node_modules, &entry, &lockfile) {
-            lines.push(format!("note   {dir}: cache not saved: {e}"));
-        }
-        if let Some(parent) = entry.parent() {
-            cache_prune(parent, Duration::from_secs(CACHE_TTL_DAYS * 86_400));
-        }
+        save(&node_modules, &entry, false, &lockfile, dir, &mut lines);
+        cache::prune(
+            &project_cache,
+            Duration::from_secs(cache::TTL_DAYS * 86_400),
+        );
     }
     lines.push(format!("npm ci {dir} ({})", util::elapsed(start)));
-    Ok(lines.join("\n"))
+    Ok(Report::done(lines.join("\n")))
 }
 
-/// Clone `src` to `node_modules` and make it safe to use there. On error
-/// nothing is left at `node_modules`.
-fn clone_from(src: &Path, node_modules: &Path) -> Result<(), String> {
-    if let Err(e) = clone::clone_dir(src, node_modules) {
-        if node_modules.symlink_metadata().is_ok() {
-            let _ = trash::trash(node_modules);
+/// Whether the installed tree is the one this lockfile and Node version
+/// ask for. Trees installed by fast-worktree carry their key; for others,
+/// the tree is compared with the lockfile (the Node version is unknown).
+fn is_current(project: &Path, lockfile: &[u8], key: &str) -> bool {
+    match fs::read_to_string(project.join(KEY_FILE)) {
+        Ok(k) => k.trim() == key,
+        Err(_) => installed_tree_matches(project, lockfile),
+    }
+}
+
+fn write_key(project: &Path, key: &str) {
+    let _ = fs::write(project.join(KEY_FILE), format!("{key}\n"));
+}
+
+/// Store in the cache, noting a failure among `lines`. Only a tree whose
+/// `.package-lock.json` matches `lockfile` is stored: anything else (an
+/// install that wrote part of the tree) would be cloned into every later
+/// worktree, and marked as checked.
+fn save(
+    node_modules: &Path,
+    entry: &Path,
+    checked: bool,
+    lockfile: &[u8],
+    dir: &str,
+    lines: &mut Vec<String>,
+) {
+    let stored = match fs::read(node_modules.join(".package-lock.json")) {
+        Err(_) => Err("node_modules has no .package-lock.json".to_string()),
+        Ok(hidden) if tree_match::tree_matches(lockfile, &hidden).is_err() => {
+            Err("node_modules does not match package-lock.json".to_string())
         }
+        Ok(_) => cache::store(node_modules, entry, checked),
+    };
+    if let Err(e) = stored {
+        lines.push(format!("note   {dir}: cache not saved: {e}"));
+    }
+}
+
+/// Move a half-made `node_modules` away, so that the next `install` does
+/// not skip it as present.
+fn discard(node_modules: &Path) {
+    if node_modules.symlink_metadata().is_ok() {
+        let _ = trash::trash(node_modules);
+    }
+}
+
+/// The project's own lifecycle, then the key. A failure discards the clone.
+fn after_clone(ctx: &Ctx, target: &Path, dir: &str, key: &str) -> Result<Vec<String>, String> {
+    match run_own_lifecycle(target, dir, &ctx.skip_lifecycle) {
+        Ok(notes) => {
+            write_key(target, key);
+            Ok(notes)
+        }
+        Err(e) => {
+            discard(&target.join("node_modules"));
+            Err(e)
+        }
+    }
+}
+
+/// Clone `src` to `node_modules` and make it safe to use there. `checked`
+/// skips the symlink scan for a cache entry that was scanned when stored.
+/// On error nothing is left at `node_modules`.
+fn clone_from(src: &Path, node_modules: &Path, checked: bool) -> Result<(), String> {
+    if let Err(e) = clone::clone_dir(src, node_modules) {
+        discard(node_modules);
         return Err(format!("clone failed ({e})"));
     }
     let _ = fs::remove_dir_all(node_modules.join(".cache"));
-    if has_absolute_symlink(node_modules) {
-        let _ = trash::trash(node_modules);
+    if !checked && clone::has_absolute_symlink(node_modules) {
+        discard(node_modules);
         return Err("absolute symlink in node_modules".into());
     }
     Ok(())
 }
 
-/// Whether any symlink under `dir` (not followed) has an absolute target.
-pub fn has_absolute_symlink(dir: &Path) -> bool {
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&d) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_symlink() {
-                if fs::read_link(e.path()).is_ok_and(|t| t.is_absolute()) {
-                    return true;
-                }
-            } else if ft.is_dir() {
-                stack.push(e.path());
-            }
+/// Clone `base` (a cache entry for an older lockfile) into the project and
+/// bring it up to date with `npm install`. On error the tree is discarded
+/// and `package-lock.json` is as it was.
+fn delta(base: &Path, project: &Path, lockfile: &[u8]) -> Result<(), String> {
+    let node_modules = project.join("node_modules");
+    clone_from(base, &node_modules, cache::is_checked(base))?;
+    let out = Command::new("npm")
+        .arg("install")
+        .args(NPM_FLAGS)
+        .current_dir(project)
+        .stdin(Stdio::null())
+        .output();
+    let lock_path = project.join(LOCKFILE);
+    let rewritten = fs::read(&lock_path).map_or(true, |now| now != lockfile);
+    let why = match out {
+        Err(e) => Some(format!("cannot run npm: {e}")),
+        Ok(o) if !o.status.success() => Some("npm install failed".to_string()),
+        Ok(_) if rewritten => Some("npm install changed package-lock.json".to_string()),
+        Ok(_) if !installed_tree_matches(project, lockfile) => {
+            Some("npm install left a tree that differs from package-lock.json".to_string())
         }
+        Ok(_) => None,
+    };
+    let Some(why) = why else {
+        return Ok(());
+    };
+    if rewritten {
+        let _ = fs::write(&lock_path, lockfile);
     }
-    false
+    discard(&node_modules);
+    Err(why)
 }
 
 /// The project's own lifecycle scripts that exist in its `package.json`,
@@ -299,11 +458,25 @@ pub fn own_lifecycle_scripts(package_json: &[u8]) -> Vec<&'static str> {
         .collect()
 }
 
-fn run_own_lifecycle(project: &Path) -> Result<(), String> {
+/// Run the project's own lifecycle scripts, except those a rule skips.
+/// Returns a note per skipped script.
+fn run_own_lifecycle(
+    project: &Path,
+    dir: &str,
+    rules: &[SkipLifecycle],
+) -> Result<Vec<String>, String> {
     let Ok(pkg) = fs::read(project.join("package.json")) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
+    let mut notes = Vec::new();
     for script in own_lifecycle_scripts(&pkg) {
+        if rules
+            .iter()
+            .any(|r| r.applies_to(dir, script) && r.inputs_unchanged(project))
+        {
+            notes.push(format!("note   {dir}: {script} skipped, inputs unchanged"));
+            continue;
+        }
         let out = Command::new("npm")
             .args(["run", script])
             .current_dir(project)
@@ -319,13 +492,14 @@ fn run_own_lifecycle(project: &Path) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(notes)
 }
 
 /// `npm ci`. Its output is shown only when it fails.
 fn npm_ci(project: &Path) -> Result<(), String> {
     let out = Command::new("npm")
-        .args(["ci", "--prefer-offline", "--no-audit", "--no-fund"])
+        .arg("ci")
+        .args(NPM_FLAGS)
         .current_dir(project)
         .stdin(Stdio::null())
         .output()
@@ -339,71 +513,6 @@ fn npm_ci(project: &Path) -> Result<(), String> {
         String::from_utf8_lossy(&out.stderr)
     );
     Err(util::tail(&log, 30))
-}
-
-/// Clone `node_modules` into the cache at `entry`, unless it is there
-/// already. Only a tree whose `.package-lock.json` matches `lockfile` is
-/// stored: anything else (an install that wrote part of the tree) would be
-/// cloned into every later worktree. Built under a temporary name and
-/// renamed, so a concurrent run never sees a half-made entry.
-fn cache_store(node_modules: &Path, entry: &Path, lockfile: &[u8]) -> Result<(), String> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    if entry.exists() {
-        return Ok(());
-    }
-    let hidden = fs::read(node_modules.join(".package-lock.json"))
-        .map_err(|_| "node_modules has no .package-lock.json".to_string())?;
-    if tree_match::tree_matches(lockfile, &hidden).is_err() {
-        return Err("node_modules does not match package-lock.json".into());
-    }
-    let parent = entry.parent().ok_or("no parent")?;
-    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let name = entry.file_name().ok_or("no name")?.to_string_lossy();
-    let tmp = parent.join(format!(
-        "{name}.tmp-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    clone::clone_dir(node_modules, &tmp).map_err(|e| e.to_string())?;
-    let _ = fs::remove_dir_all(tmp.join(".cache"));
-    touch(&tmp);
-    if fs::rename(&tmp, entry).is_err() {
-        let _ = trash::trash(&tmp);
-    }
-    Ok(())
-}
-
-/// Remove cache entries in `dir` not used for longer than `ttl`.
-fn cache_prune(dir: &Path, ttl: Duration) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let now = SystemTime::now();
-    for e in entries.flatten() {
-        let Ok(meta) = e.metadata() else { continue };
-        if !meta.is_dir() {
-            continue;
-        }
-        let age = meta
-            .modified()
-            .ok()
-            .and_then(|m| now.duration_since(m).ok())
-            .unwrap_or_default();
-        if age > ttl {
-            let _ = trash::trash(&e.path());
-        }
-    }
-}
-
-/// Set a directory's modification time to now: the cache's "last used".
-fn touch(path: &Path) {
-    use std::os::unix::ffi::OsStrExt;
-    if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
-        // SAFETY: a valid NUL-terminated path; a null `times` means "now".
-        unsafe {
-            libc::utimes(c.as_ptr(), std::ptr::null());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -441,14 +550,37 @@ mod tests {
     }
 
     #[test]
-    fn finds_absolute_symlinks_without_following_links() {
+    fn a_tree_is_current_by_its_key_else_by_the_lockfile() {
         let t = tempfile::tempdir().unwrap();
-        let nm = t.path().join("node_modules");
-        fs::create_dir_all(nm.join("a/b")).unwrap();
-        std::os::unix::fs::symlink("../a", nm.join("rel")).unwrap();
-        assert!(!has_absolute_symlink(&nm));
-        std::os::unix::fs::symlink("/tmp", nm.join("a/b/abs")).unwrap();
-        assert!(has_absolute_symlink(&nm));
+        let p = t.path();
+        let lock = br#"{"packages":{"node_modules/a":{"version":"1"}}}"#;
+        fs::create_dir(p.join("node_modules")).unwrap();
+        assert!(!is_current(p, lock, "k1"), "nothing recorded");
+        fs::write(p.join(HIDDEN_LOCKFILE), lock).unwrap();
+        assert!(is_current(p, lock, "k1"), "no key: the tree decides");
+        write_key(p, "k1");
+        assert!(is_current(p, lock, "k1"));
+        assert!(!is_current(p, lock, "k2"), "the key decides when present");
+    }
+
+    #[test]
+    fn skipped_lifecycle_scripts_are_not_run() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path();
+        fs::write(p.join("package.json"), r#"{"scripts":{"postinstall":"x"}}"#).unwrap();
+        fs::write(p.join("in"), "same").unwrap();
+        fs::write(p.join("out"), "same").unwrap();
+        let rule = SkipLifecycle {
+            dir: "app".into(),
+            script: "postinstall".into(),
+            if_equal: vec![["in".into(), "out".into()]],
+        };
+        // No npm is spawned: the only script is skipped.
+        let notes = run_own_lifecycle(p, "app", std::slice::from_ref(&rule)).unwrap();
+        assert_eq!(
+            notes,
+            vec!["note   app: postinstall skipped, inputs unchanged"]
+        );
     }
 
     /// A probe over a table of candidate facts that records what was asked.
@@ -511,20 +643,5 @@ mod tests {
         );
         let only_me = vec![wt("me")];
         assert_eq!(find_donor(&wt("me"), &only_me, ".", "v20", &f), None);
-    }
-
-    #[test]
-    fn prune_removes_only_entries_older_than_the_ttl() {
-        let t = tempfile::tempdir().unwrap();
-        let cache = t.path().join("cache");
-        std::env::set_var("FAST_WORKTREE_CACHE", &cache);
-        let proj = cache.join("repo/app");
-        fs::create_dir_all(proj.join("old")).unwrap();
-        fs::create_dir_all(proj.join("new")).unwrap();
-        std::thread::sleep(Duration::from_millis(1100));
-        touch(&proj.join("new"));
-        cache_prune(&proj, Duration::from_secs(1));
-        assert!(!proj.join("old").exists());
-        assert!(proj.join("new").exists());
     }
 }

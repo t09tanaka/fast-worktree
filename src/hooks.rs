@@ -1,4 +1,4 @@
-//! Repository hooks from `.fast-worktree.toml` at the worktree root.
+//! Repository settings from `.fast-worktree.toml` at the worktree root.
 //!
 //! ```toml
 //! [[post_add]]          # after add / install, in the worktree root, in order
@@ -8,6 +8,11 @@
 //! [[pre_remove]]        # after remove's safety checks, before the move
 //! run = "docker compose -p \"$(basename \"$FAST_WORKTREE_PATH\")\" down -v"
 //! requires = "docker"
+//!
+//! [[skip_lifecycle]]    # after a clone, skip a project's own script when
+//! dir = "api"           # every pair of files is byte-identical
+//! script = "postinstall"
+//! if_equal = [["schema.json", "node_modules/.codegen/schema.json"]]
 //! ```
 //!
 //! fast-worktree itself knows nothing about the tools a repository uses;
@@ -28,12 +33,60 @@ pub struct Config {
     pub post_add: Vec<Hook>,
     #[serde(default)]
     pub pre_remove: Vec<Hook>,
+    #[serde(default)]
+    pub skip_lifecycle: Vec<SkipLifecycle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Hook {
     pub run: String,
     pub requires: Option<String>,
+}
+
+/// Do not run the project's own lifecycle `script` after a clone when each
+/// pair of files (relative to the project directory) is byte-identical. A
+/// missing file never counts as identical, so the script runs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SkipLifecycle {
+    #[serde(default = "root_dir")]
+    pub dir: String,
+    pub script: String,
+    pub if_equal: Vec<[String; 2]>,
+}
+
+fn root_dir() -> String {
+    ".".into()
+}
+
+impl SkipLifecycle {
+    /// Whether this rule is about `script` of the project at `dir`.
+    pub fn applies_to(&self, dir: &str, script: &str) -> bool {
+        self.script == script && normalize_dir(&self.dir) == normalize_dir(dir)
+    }
+
+    /// Whether every pair under `project` is byte-identical.
+    pub fn inputs_unchanged(&self, project: &Path) -> bool {
+        !self.if_equal.is_empty()
+            && self.if_equal.iter().all(|[a, b]| {
+                match (
+                    std::fs::read(project.join(a)),
+                    std::fs::read(project.join(b)),
+                ) {
+                    (Ok(x), Ok(y)) => x == y,
+                    _ => false,
+                }
+            })
+    }
+}
+
+/// `./a/b/` and `a/b` name the same project; `""` and `./` are the root.
+fn normalize_dir(d: &str) -> &str {
+    let d = d.trim_start_matches("./").trim_end_matches('/');
+    if d.is_empty() {
+        "."
+    } else {
+        d
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,40 +129,57 @@ impl Config {
     }
 }
 
+/// The keys each array of tables accepts.
+fn allowed_keys(section: &str) -> Option<&'static [&'static str]> {
+    match section {
+        "post_add" | "pre_remove" => Some(&["run", "requires"]),
+        "skip_lifecycle" => Some(&["dir", "script", "if_equal"]),
+        _ => None,
+    }
+}
+
 /// Parse the config, returning it with warnings about unknown keys.
 pub fn parse(text: &str) -> std::result::Result<(Config, Vec<String>), String> {
     let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
     let mut warnings = Vec::new();
     let mut known = toml::Table::new();
     for (k, v) in table {
-        match k.as_str() {
-            "post_add" | "pre_remove" => {
-                let Some(list) = v.as_array() else {
-                    return Err(format!("`{k}` must be an array of tables ([[{k}]])"));
-                };
-                let mut kept = Vec::new();
-                for (i, item) in list.iter().enumerate() {
-                    let Some(t) = item.as_table() else {
-                        return Err(format!("`{k}` must be an array of tables ([[{k}]])"));
-                    };
-                    let mut t = t.clone();
-                    let unknown: Vec<String> = t
-                        .keys()
-                        .filter(|x| !matches!(x.as_str(), "run" | "requires"))
-                        .cloned()
-                        .collect();
-                    for u in unknown {
-                        warnings.push(format!("unknown key `{u}` in {k}[{i}], ignored"));
-                        t.remove(&u);
-                    }
-                    kept.push(toml::Value::Table(t));
-                }
-                known.insert(k, toml::Value::Array(kept));
+        let Some(allowed) = allowed_keys(&k) else {
+            warnings.push(format!("unknown key `{k}`, ignored"));
+            continue;
+        };
+        let Some(list) = v.as_array() else {
+            return Err(format!("`{k}` must be an array of tables ([[{k}]])"));
+        };
+        let mut kept = Vec::new();
+        for (i, item) in list.iter().enumerate() {
+            let Some(t) = item.as_table() else {
+                return Err(format!("`{k}` must be an array of tables ([[{k}]])"));
+            };
+            let mut t = t.clone();
+            let unknown: Vec<String> = t
+                .keys()
+                .filter(|x| !allowed.contains(&x.as_str()))
+                .cloned()
+                .collect();
+            for u in unknown {
+                warnings.push(format!("unknown key `{u}` in {k}[{i}], ignored"));
+                t.remove(&u);
             }
-            _ => warnings.push(format!("unknown key `{k}`, ignored")),
+            kept.push(toml::Value::Table(t));
         }
+        known.insert(k, toml::Value::Array(kept));
     }
     let cfg = Config::deserialize(toml::Value::Table(known)).map_err(|e| e.to_string())?;
+    if let Some(i) = cfg
+        .skip_lifecycle
+        .iter()
+        .position(|r| r.if_equal.is_empty())
+    {
+        return Err(format!(
+            "skip_lifecycle[{i}]: `if_equal` must list at least one pair of files"
+        ));
+    }
     Ok((cfg, warnings))
 }
 
@@ -228,6 +298,75 @@ timeout = 5
             "run is required"
         );
         assert!(parse("not toml =").is_err());
+    }
+
+    #[test]
+    fn parses_skip_lifecycle() {
+        let (c, w) = parse(
+            r#"
+[[skip_lifecycle]]
+dir = "backend"
+script = "postinstall"
+if_equal = [["a", "node_modules/a"], ["b", "node_modules/b"]]
+[[skip_lifecycle]]
+script = "prepare"
+if_equal = [["x", "y"]]
+when = "never"
+"#,
+        )
+        .unwrap();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("`when` in skip_lifecycle[1]"));
+        assert_eq!(c.skip_lifecycle.len(), 2);
+        assert_eq!(
+            c.skip_lifecycle[0].if_equal[1],
+            ["b".to_string(), "node_modules/b".to_string()]
+        );
+        assert_eq!(c.skip_lifecycle[1].dir, ".", "dir defaults to the root");
+        assert!(c.skip_lifecycle[0].applies_to("./backend/", "postinstall"));
+        assert!(!c.skip_lifecycle[0].applies_to("backend", "prepare"));
+        assert!(!c.skip_lifecycle[0].applies_to("backend/sub", "postinstall"));
+        assert!(c.skip_lifecycle[1].applies_to(".", "prepare"));
+        assert!(c.skip_lifecycle[1].applies_to("", "prepare"));
+    }
+
+    #[test]
+    fn skip_lifecycle_rejects_bad_pairs() {
+        let bad = |s: &str| parse(&format!("[[skip_lifecycle]]\nscript = \"p\"\n{s}\n")).is_err();
+        assert!(bad("if_equal = []"), "at least one pair");
+        assert!(bad(r#"if_equal = [["a"]]"#), "a pair has two files");
+        assert!(bad(r#"if_equal = [["a", "b", "c"]]"#));
+        assert!(bad(""), "if_equal is required");
+        assert!(!bad(r#"if_equal = [["a", "b"]]"#));
+        assert!(
+            parse("[[skip_lifecycle]]\nif_equal = [[\"a\", \"b\"]]").is_err(),
+            "script is required"
+        );
+    }
+
+    #[test]
+    fn inputs_unchanged_needs_every_pair_present_and_equal() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path();
+        for (f, body) in [("a", "1"), ("a2", "1"), ("b", "2"), ("b2", "3")] {
+            std::fs::write(p.join(f), body).unwrap();
+        }
+        let rule = |pairs: &[[&str; 2]]| SkipLifecycle {
+            dir: ".".into(),
+            script: "postinstall".into(),
+            if_equal: pairs
+                .iter()
+                .map(|[x, y]| [x.to_string(), y.to_string()])
+                .collect(),
+        };
+        assert!(rule(&[["a", "a2"]]).inputs_unchanged(p));
+        assert!(!rule(&[["a", "a2"], ["b", "b2"]]).inputs_unchanged(p));
+        assert!(!rule(&[["a", "missing"]]).inputs_unchanged(p));
+        assert!(
+            !rule(&[["missing", "also-missing"]]).inputs_unchanged(p),
+            "absent files are not equal"
+        );
+        assert!(!rule(&[]).inputs_unchanged(p));
     }
 
     #[test]

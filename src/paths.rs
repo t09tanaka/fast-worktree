@@ -51,6 +51,16 @@ pub fn project_slug(dir: &str) -> String {
     }
 }
 
+/// The project directory a slug was made from (the inverse of
+/// [`project_slug`] for directories without `__` in their names).
+pub fn project_dir(slug: &str) -> String {
+    if slug == "_root" {
+        ".".to_string()
+    } else {
+        slug.replace("__", "/")
+    }
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -74,5 +84,8 @@ mod tests {
         assert_eq!(project_slug("."), "_root");
         assert_eq!(project_slug("packages/web"), "packages__web");
         assert_eq!(project_slug("api"), "api");
+        for d in [".", "packages/web", "api"] {
+            assert_eq!(project_dir(&project_slug(d)), d);
+        }
     }
 }

@@ -28,8 +28,14 @@ pub fn output(dir: &Path, args: &[&str]) -> Result<String> {
 /// Run git in `dir` with inherited stdout/stderr (for commands whose
 /// output the user should see, like `git worktree add`).
 pub fn run(dir: &Path, args: &[&str]) -> Result<()> {
+    run_with_env(dir, args, &[])
+}
+
+/// [`run`] with extra environment variables for git and its hooks.
+pub fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<()> {
     let status = command(dir)
         .args(args)
+        .envs(env.iter().copied())
         .status()
         .map_err(|e| Error(format!("cannot run git: {e}")))?;
     if !status.success() {
@@ -149,6 +155,45 @@ pub fn tracked(root: &Path, pathspecs: &[&str]) -> Result<Vec<String>> {
         .filter(|f| !f.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// Whether `git branch -d <branch>`, run in `dir`, would find the branch
+/// merged: into its upstream when it has one that exists, else into `HEAD`.
+/// Returns the reference it was compared with when it is not merged, and
+/// `None` when it is merged or git cannot tell (then `git branch -d` itself
+/// decides).
+pub fn unmerged_into(dir: &Path, branch: &str) -> Option<String> {
+    // `<branch>@{upstream}` resolves only when the upstream ref exists,
+    // which is also when `git branch -d` compares with it.
+    let upstream = output(
+        dir,
+        &[
+            "rev-parse",
+            "--symbolic-full-name",
+            &format!("{branch}@{{upstream}}"),
+        ],
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| s.starts_with("refs/"));
+    let reference = upstream.unwrap_or_else(|| "HEAD".to_string());
+    let status = command(dir)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            &format!("refs/heads/{branch}"),
+            &reference,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    let short = reference
+        .strip_prefix("refs/remotes/")
+        .or_else(|| reference.strip_prefix("refs/heads/"))
+        .unwrap_or(&reference)
+        .to_string();
+    (status.code() == Some(1)).then_some(short)
 }
 
 /// The remote's default branch, from `refs/remotes/origin/HEAD`. When that

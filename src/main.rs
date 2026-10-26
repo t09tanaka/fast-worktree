@@ -1,12 +1,14 @@
-//! fast-worktree: create a git worktree with its npm dependencies in
-//! seconds, and remove it in one.
+//! fast-worktree: create a git worktree with its dependencies in seconds,
+//! and remove it in one.
 
+mod cache;
 mod clone;
 mod cmd;
 mod ecosystem;
 mod error;
 mod git;
 mod hooks;
+mod include;
 mod paths;
 mod trash;
 mod util;
@@ -42,6 +44,10 @@ enum Cmd {
         /// Worktree to install into (default: the current one)
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
+        /// Also install again where the lockfile or Node version changed
+        /// since the last install
+        #[arg(long)]
+        changed: bool,
         /// Only these project directories
         projects: Vec<String>,
     },
@@ -50,6 +56,14 @@ enum Cmd {
         /// Print nothing when nothing is missing
         #[arg(long)]
         quiet: bool,
+        /// Run as a post-checkout hook, given the hook's three arguments
+        #[arg(
+            long,
+            num_args = 3,
+            value_names = ["PREV", "NEW", "FLAG"],
+            allow_hyphen_values = true
+        )]
+        post_checkout: Option<Vec<String>>,
     },
     /// Remove a clean worktree, deleting its files in the background
     Remove {
@@ -57,6 +71,23 @@ enum Cmd {
         /// Also delete its branch with `git branch -d`
         #[arg(long)]
         delete_branch: bool,
+    },
+    /// Inspect or clean the dependency cache
+    Cache {
+        #[command(subcommand)]
+        cmd: CacheCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCmd {
+    /// List cache entries with their repository, directory, key and last use
+    Ls,
+    /// Remove entries not used for a while (moved to the trash)
+    Prune {
+        /// Days without use (default: 7)
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u64>,
     },
 }
 
@@ -72,14 +103,32 @@ fn main() {
             branch,
             start_point,
         }),
-        Cmd::Install { root, projects } => cmd::install::run(cmd::install::Opts { root, projects }),
-        Cmd::Check { quiet } => Ok(cmd::check::run(quiet)),
+        Cmd::Install {
+            root,
+            changed,
+            projects,
+        } => cmd::install::run(cmd::install::Opts {
+            root,
+            projects,
+            changed,
+        }),
+        Cmd::Check {
+            quiet,
+            post_checkout,
+        } => Ok(match post_checkout.as_deref() {
+            Some([prev, new, flag]) => cmd::check::post_checkout(prev, new, flag),
+            _ => cmd::check::run(quiet),
+        }),
         Cmd::Remove {
             path,
             delete_branch,
         } => cmd::remove::run(cmd::remove::Opts {
             path,
             delete_branch,
+        }),
+        Cmd::Cache { cmd } => Ok(match cmd {
+            CacheCmd::Ls => cmd::cache::ls(),
+            CacheCmd::Prune { older_than } => cmd::cache::prune(older_than),
         }),
     };
     let code = match result {
