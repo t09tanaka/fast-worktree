@@ -7,38 +7,55 @@ use std::time::{Duration, SystemTime};
 pub fn ls() -> i32 {
     let root = paths::cache_root();
     let entries = cache::list(&root);
+    let legacy = cache::legacy(&root);
     if entries.is_empty() {
         outln!("cache is empty ({})", util::tilde(&root));
-        return 0;
+    } else {
+        let rows: Vec<[String; 4]> = entries
+            .iter()
+            .map(|e| {
+                [
+                    e.repo.clone(),
+                    e.dir.clone(),
+                    e.key.clone(),
+                    last_used(e.last_used),
+                ]
+            })
+            .collect();
+        out!("{}", table(&["REPO", "DIR", "KEY", "LAST USED"], &rows));
+        outln!("{} in {}", count(entries.len()), util::tilde(&root));
     }
-    let now = SystemTime::now();
-    let rows: Vec<[String; 4]> = entries
-        .iter()
-        .map(|e| {
-            let days = now
-                .duration_since(e.last_used)
-                .map(|d| d.as_secs() / 86_400)
-                .unwrap_or(0);
-            [
-                e.repo.clone(),
-                e.dir.clone(),
-                e.key.clone(),
-                format!("{} ({days}d ago)", cache::date(e.last_used)),
-            ]
-        })
-        .collect();
-    out!("{}", table(&["REPO", "DIR", "KEY", "LAST USED"], &rows));
-    outln!("{} in {}", count(entries.len()), util::tilde(&root));
+    if !legacy.is_empty() {
+        let rows: Vec<[String; 2]> = legacy
+            .iter()
+            .map(|l| [l.name.clone(), last_used(l.last_used)])
+            .collect();
+        outln!();
+        out!("{}", table(&["LEGACY", "LAST USED"], &rows));
+        outln!(
+            "{} of an older layout, not used any more; \
+             `fast-worktree cache prune --legacy` removes them",
+            directories(legacy.len())
+        );
+    }
     0
+}
+
+/// `2026-10-26 (0d ago)`.
+fn last_used(t: SystemTime) -> String {
+    let days = SystemTime::now()
+        .duration_since(t)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0);
+    format!("{} ({days}d ago)", cache::date(t))
 }
 
 pub fn prune(older_than_days: Option<u64>) -> i32 {
     let days = older_than_days.unwrap_or(cache::TTL_DAYS);
     let root = paths::cache_root();
     let removed = cache::prune_all(&root, Duration::from_secs(days * 86_400));
-    for p in &removed {
-        let rel = p.strip_prefix(&root).unwrap_or(p);
-        outln!("pruned {}", rel.display());
+    for e in &removed {
+        outln!("pruned {}  {}  {}", e.repo, e.dir, e.key);
     }
     outln!(
         "pruned {} unused for more than {days} days (deleting in background)",
@@ -47,9 +64,29 @@ pub fn prune(older_than_days: Option<u64>) -> i32 {
     0
 }
 
+/// `cache prune --legacy`: move the directories of an older layout to the
+/// trash.
+pub fn prune_legacy() -> i32 {
+    let root = paths::cache_root();
+    let removed = cache::prune_legacy(&root);
+    for l in &removed {
+        outln!("pruned {} (older layout)", l.name);
+    }
+    outln!(
+        "pruned {} of an older layout (deleting in background)",
+        directories(removed.len())
+    );
+    0
+}
+
 /// `1 entry`, `2 entries`.
 fn count(n: usize) -> String {
     format!("{n} {}", if n == 1 { "entry" } else { "entries" })
+}
+
+/// `1 directory`, `2 directories`.
+fn directories(n: usize) -> String {
+    format!("{n} {}", if n == 1 { "directory" } else { "directories" })
 }
 
 /// Left-aligned columns separated by two spaces.

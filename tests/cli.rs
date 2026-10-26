@@ -1347,7 +1347,7 @@ fn cache_ls_and_prune() {
     r.assert_ok();
     assert!(
         r.out()
-            .contains("pruned app-1234abcd/_root/aaaaaaaaaaaaaaaa-v20.0.0\n"),
+            .contains("pruned app-1234abcd  .  aaaaaaaaaaaaaaaa-v20.0.0\n"),
         "{}",
         r.out()
     );
@@ -3539,4 +3539,54 @@ fn install_takes_root_and_a_unique_last_directory_name() {
         r.err()
     );
     assert!(!main.join("other/lambda/node_modules").exists());
+}
+
+#[test]
+fn cache_ls_shows_an_older_layout_apart_and_prune_legacy_removes_it() {
+    let w = World::new();
+    let main = w.main();
+    let key = "0123456789abcdef-v20.0.0";
+    let current = w.cache.join("app-1234abcd/_root").join(key);
+    fs::create_dir_all(&current).unwrap();
+    // The older layout: no hash after the repository's name, and the root
+    // project's entries right in it, holding packages.
+    let old_root = w.cache.join("app").join(key);
+    fs::create_dir_all(old_root.join("left-pad")).unwrap();
+    fs::create_dir_all(w.cache.join("app/web").join(key)).unwrap();
+
+    let r = w.fw(&main, &["cache", "ls"]);
+    r.assert_ok();
+    let out = r.out();
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("REPO "), "{out}");
+    assert!(
+        lines[1].starts_with(&format!("app-1234abcd  .    {key}  ")),
+        "{out}"
+    );
+    assert_eq!(
+        lines[2],
+        format!("1 entry in {}", w.cache.display()),
+        "{out}"
+    );
+    assert!(!out.contains("left-pad"), "{out}");
+    assert!(out.contains("\nLEGACY  LAST USED\napp     "), "{out}");
+    assert!(
+        out.contains("1 directory of an older layout, not used any more; `fast-worktree cache prune --legacy` removes them"),
+        "{out}"
+    );
+
+    // A plain prune leaves it alone.
+    let r = w.fw(&main, &["cache", "prune", "--older-than", "0"]);
+    r.assert_ok();
+    assert!(old_root.join("left-pad").exists(), "{}", r.out());
+
+    let r = w.fw(&main, &["cache", "prune", "--legacy"]);
+    r.assert_ok();
+    assert!(
+        r.out().contains("pruned app (older layout)\n"),
+        "{}",
+        r.out()
+    );
+    assert!(!w.cache.join("app").exists());
+    assert!(!w.fw(&main, &["cache", "ls"]).out().contains("LEGACY"));
 }
