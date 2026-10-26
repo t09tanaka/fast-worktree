@@ -520,6 +520,48 @@ hook   post_add: echo "ready: $(basename "$FAST_WORKTREE_PATH")"
 ready: monorepo-c
 ```
 
+### Tools without a preset
+
+A tool fast-worktree has no preset for gets the same from a `[[clone]]`
+without one: the directory it installs into, the files and the tool
+version that decide whether a copy can be reused, and the command that
+brings a copy up to date. These have been tried:
+
+```toml
+[[clone]]                 # yarn classic (1.x)
+path = "node_modules"
+key = ["yarn.lock"]
+key_commands = ["node -v"]
+install = "yarn install --frozen-lockfile"
+after = ["yarn install --frozen-lockfile"]
+
+[[clone]]                 # Composer
+path = "vendor"
+key = ["composer.lock"]
+key_commands = ["php -v"]
+install = "composer install"
+after = ["composer install"]
+
+[[clone]]                 # Rust (Cargo)
+path = "target"
+key = ["Cargo.lock"]
+key_commands = ["rustc -V"]
+```
+
+- **yarn classic** checks the tree against `yarn.lock` itself, so the
+  `yarn install --frozen-lockfile` after a clone finds nothing to do and
+  returns at once.
+- **Composer** writes the PHP version into
+  `vendor/composer/platform_check.php`, hence `php -v` in the key; the
+  `composer install` after a clone writes the autoloader again for the
+  worktree it is in.
+- **Cargo** needs nothing after a clone: its fingerprints decide what is
+  current and rebuild the rest. Without an `install`, `target` comes only
+  from the cache or another worktree, and `remove` hands it to the next
+  worktree.
+- yarn berry, bun and pnpm keep their packages in a store of their own and
+  link them in; cloning their `node_modules` gained little.
+
 ### Leaving a project out: `[[ignore]]`
 
 A project that no worktree needs (a site built only in CI, a sample) is
