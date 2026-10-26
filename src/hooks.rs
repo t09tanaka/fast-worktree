@@ -20,6 +20,10 @@
 //! [[clone]]             # what each worktree gets; without any, the
 //! preset = "npm"        # tracked lockfiles are detected
 //! dir = "api"
+//!
+//! [[ignore]]            # a project left out on purpose, and why
+//! dir = "docs-site"
+//! reason = "built in CI only"
 //! ```
 //!
 //! `[[clone]]` is described in [`crate::ecosystem::target`].
@@ -51,6 +55,31 @@ pub struct Config {
     /// the tracked lockfiles.
     #[serde(default)]
     pub clone: Vec<CloneEntry>,
+    /// `[[ignore]]`: projects left out on purpose.
+    #[serde(default)]
+    pub ignore: Vec<Ignore>,
+}
+
+/// A project left out on purpose: auto-detection skips it, and `config
+/// check` does not report its lockfile as unlisted. `reason` is required.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Ignore {
+    /// The project directory, relative to the worktree root.
+    #[serde(default)]
+    pub dir: String,
+    /// Only this preset's lockfile there; every preset's without it.
+    pub preset: Option<String>,
+    /// Why it is left out.
+    #[serde(default)]
+    pub reason: String,
+}
+
+impl Ignore {
+    /// Whether this leaves out the project of `preset` at `dir`.
+    pub fn covers(&self, preset: &str, dir: &str) -> bool {
+        normalize_dir(&self.dir) == normalize_dir(dir)
+            && self.preset.as_deref().is_none_or(|p| p == preset)
+    }
 }
 
 /// One `[[clone]]` as written. Every field is optional here; what a preset
@@ -186,6 +215,7 @@ fn allowed_keys(section: &str) -> Option<&'static [&'static str]> {
         "post_add" | "pre_remove" => Some(&["run", "requires"]),
         "skip_lifecycle" => Some(&["dir", "script", "if_equal"]),
         "clone" => Some(&CLONE_KEYS),
+        "ignore" => Some(&["dir", "preset", "reason"]),
         _ => None,
     }
 }
@@ -267,6 +297,31 @@ pub fn parse(text: &str) -> std::result::Result<(Config, Vec<String>), String> {
         return Err(format!(
             "skip_lifecycle[{i}]: `if_equal` must list at least one pair of files"
         ));
+    }
+    for (i, ig) in cfg.ignore.iter().enumerate() {
+        if ig.dir.trim().is_empty() {
+            return Err(format!(
+                "ignore[{i}]: `dir` (the project directory to leave out) is required"
+            ));
+        }
+        if ig.reason.trim().is_empty() {
+            return Err(format!(
+                "ignore[{i}]: `reason` is required: say why `{}` is left out",
+                ig.dir
+            ));
+        }
+        if let Some(p) = ig.preset.as_deref() {
+            if crate::ecosystem::preset(p).is_none() {
+                let known: Vec<&str> = crate::ecosystem::presets()
+                    .iter()
+                    .map(|p| p.name())
+                    .collect();
+                return Err(format!(
+                    "ignore[{i}]: unknown preset `{p}` (known: {})",
+                    known.join(", ")
+                ));
+            }
+        }
     }
     Ok((cfg, warnings))
 }
@@ -518,6 +573,35 @@ when = "never"
         assert_eq!(w, vec!["unknown key `post_add`, ignored"]);
         assert_eq!(parse_user("").unwrap().0, None);
         assert!(parse_user("[pool]\nsize = \"two\"\n").is_err());
+    }
+
+    #[test]
+    fn parses_ignore_and_requires_a_reason() {
+        let (c, w) = parse(
+            r#"
+ignore = [{ dir = "./docs-site/", reason = "built in CI only" }]
+"#,
+        )
+        .unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        assert!(c.ignore[0].covers("npm", "docs-site"));
+        assert!(c.ignore[0].covers("bundler", "docs-site"));
+        assert!(!c.ignore[0].covers("npm", "docs"));
+        let (c, _) =
+            parse("[[ignore]]\ndir = \"web\"\npreset = \"bundler\"\nreason = \"x\"\nwhy = 1\n")
+                .unwrap();
+        assert!(c.ignore[0].covers("bundler", "web"));
+        assert!(!c.ignore[0].covers("npm", "web"), "another preset");
+        let e = parse("[[ignore]]\ndir = \"web\"\n").unwrap_err();
+        assert_eq!(
+            e,
+            "ignore[0]: `reason` is required: say why `web` is left out"
+        );
+        assert!(parse("[[ignore]]\ndir = \"web\"\nreason = \" \"\n").is_err());
+        let e = parse("[[ignore]]\nreason = \"x\"\n").unwrap_err();
+        assert!(e.contains("`dir`"), "{e}");
+        let e = parse("[[ignore]]\ndir = \"a\"\npreset = \"yarn\"\nreason = \"x\"\n").unwrap_err();
+        assert!(e.contains("unknown preset `yarn`"), "{e}");
     }
 
     #[test]

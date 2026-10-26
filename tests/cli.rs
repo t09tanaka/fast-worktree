@@ -5041,3 +5041,67 @@ fn config_init_and_check_know_gemfile_lock() {
     );
     w.fw(&main, &["config", "check"]).assert_ok();
 }
+
+// ---- 0.3: [[ignore]] ----
+
+#[test]
+fn an_ignored_project_is_left_out_and_config_check_knows_why() {
+    let w = World::new();
+    let main = w.main();
+    let up = w.base.join("upstream");
+    let ignore = "[[ignore]]\ndir = \"lib\"\nreason = \"built in CI only\"\n";
+    w.commit(
+        &up,
+        &[(".fast-worktree.toml", &format!("{HOOKS}\n{ignore}"))],
+        "ignore lib",
+    );
+    w.git(&main, &["pull", "-q", "--ff-only"]);
+    // Detected: lib is left out.
+    let r = w.fw(&main, &["add", "../wt", "-b", "a"]);
+    r.assert_ok();
+    let wt = w.base.join("wt");
+    assert!(r.out().contains("npm ci app ("), "{}", r.out());
+    assert!(!r.out().contains("lib"), "{}", r.out());
+    assert!(!wt.join("lib/node_modules").exists());
+    assert_eq!(w.fw(&wt, &["check"]).out(), "deps ok (1 projects)\n");
+    // config init lists app only, and config check is content.
+    let r = w.fw(&main, &["config", "init"]);
+    r.assert_ok();
+    assert!(
+        r.out()
+            .starts_with("add    [[clone]] preset = \"npm\", dir = \"app\"\n"),
+        "{}",
+        r.out()
+    );
+    assert!(!r.out().contains("lib"), "{}", r.out());
+    let r = w.fw(&main, &["config", "check"]);
+    r.assert_ok();
+    assert!(r.out().starts_with("config ok"), "{}", r.out());
+    // An [[ignore]] of a directory without a tracked lockfile.
+    let text = fs::read_to_string(main.join(".fast-worktree.toml")).unwrap();
+    fs::write(
+        main.join(".fast-worktree.toml"),
+        format!("{text}\n[[ignore]]\ndir = \"docs\"\nreason = \"gone\"\n"),
+    )
+    .unwrap();
+    let r = w.fw(&main, &["config", "check"]);
+    r.assert_fails();
+    assert_eq!(
+        r.out(),
+        "missing    ignore[1]: no tracked lockfile in docs\n1 problem in .fast-worktree.toml\n"
+    );
+    // Without a reason, nothing runs.
+    fs::write(
+        main.join(".fast-worktree.toml"),
+        "[[ignore]]\ndir = \"lib\"\n",
+    )
+    .unwrap();
+    let r = w.fw(&main, &["install"]);
+    r.assert_fails();
+    assert!(
+        r.err()
+            .contains("ignore[0]: `reason` is required: say why `lib` is left out"),
+        "{}",
+        r.err()
+    );
+}

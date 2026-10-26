@@ -352,7 +352,8 @@ size = 2
   clone; `npm ci` and `npm install` run scripts on their own.
 - `[[clone]]` lists what each worktree gets; see
   [below](#what-each-worktree-gets-clone). Without it, the projects are
-  found from the tracked lockfiles.
+  found from the tracked lockfiles. `[[ignore]]` leaves a project out on
+  purpose, with the reason ([below](#leaving-a-project-out-ignore)).
 - No file, no hooks. Unknown keys are warned about and ignored (`config
   check` reports them).
 
@@ -519,6 +520,29 @@ hook   post_add: echo "ready: $(basename "$FAST_WORKTREE_PATH")"
 ready: monorepo-c
 ```
 
+### Leaving a project out: `[[ignore]]`
+
+A project that no worktree needs (a site built only in CI, a sample) is
+left out with an `[[ignore]]`, which says why:
+
+```toml
+[[ignore]]
+dir = "docs-site"
+reason = "built in CI only"
+
+[[ignore]]                # only the Bundler side of a project that has npm too
+dir = "web"
+preset = "bundler"
+reason = "the Ruby tools are not used in worktrees"
+```
+
+`reason` is required: a file without one is an error, so the reason is
+always written next to what it leaves out. Without `preset`, every
+lockfile of `dir` is left out. Without any `[[clone]]`, the projects an
+`[[ignore]]` names are not detected; with `[[clone]]` entries, a project
+they do not list gets nothing anyway, and the `[[ignore]]` keeps `config
+check` from reporting it and `config init` from adding it.
+
 ### `config init` and `config check`
 
 ```sh
@@ -527,18 +551,21 @@ fast-worktree config check
 ```
 
 `config init` adds a `[[clone]]` with its preset for each tracked lockfile
-that no `[[clone]]` names yet, at the end of `.fast-worktree.toml` (made if
+that no `[[clone]]` or `[[ignore]]` names yet, at the end of `.fast-worktree.toml` (made if
 missing). What the file already says, comments included, is kept. With
 `--dry-run`, it prints the entries and writes nothing.
 
 `config check` exits 1 and lists what it finds:
 
 - `unlisted`: a tracked lockfile of a preset (`package-lock.json`,
-  `pubspec.lock`, `Gemfile.lock`) that no `[[clone]]` names;
-- `missing`: a `[[clone]]` whose lockfile or `key` file does not exist;
+  `pubspec.lock`, `Gemfile.lock`) that no `[[clone]]` or `[[ignore]]` names;
+- `missing`: a `[[clone]]` whose lockfile or `key` file does not exist, or
+  an `[[ignore]]` whose directory has no tracked lockfile (of its
+  `preset`, when it names one);
 - `invalid`: a mistake in the file, such as an unknown key, an unknown
-  preset, a `path` that does not fit its preset, or a `[[clone]]` without a
-  preset that lacks `path` or `key`.
+  preset, a `path` that does not fit its preset, a `[[clone]]` without a
+  preset that lacks `path` or `key`, or a project that both a `[[clone]]`
+  and an `[[ignore]]` name.
 
 It runs one `git ls-files` (the index, so a lockfile that is only staged
 counts) and looks at which files exist, so it is quick enough for a

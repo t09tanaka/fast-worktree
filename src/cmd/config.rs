@@ -2,12 +2,13 @@
 //! entries of `.fast-worktree.toml`.
 //!
 //! `init` adds a `[[clone]]` for each tracked lockfile that a preset knows
-//! and that has none yet, keeping what the file says (comments included).
-//! `check` is for a pre-commit hook or CI: one `git ls-files` and a look at
-//! which files exist, then exit 1 when a tracked lockfile is in no
-//! `[[clone]]`, a `[[clone]]` names a file that is not there, or the file
-//! has a mistake in it. Without any `[[clone]]` (targets are detected) it
-//! does nothing and exits 0.
+//! and that has none yet, nor an `[[ignore]]`, keeping what the file says
+//! (comments included). `check` is for a pre-commit hook or CI: one `git
+//! ls-files` and a look at which files exist, then exit 1 when a tracked
+//! lockfile is in no `[[clone]]` and no `[[ignore]]`, a `[[clone]]` names a
+//! file that is not there, an `[[ignore]]` names a directory without a
+//! tracked lockfile, or the file has a mistake in it. Without any
+//! `[[clone]]` (targets are detected) it does nothing and exits 0.
 
 use crate::ecosystem::target::{self, join, Target};
 use crate::error::{bail, Error, Result};
@@ -52,10 +53,13 @@ pub fn init(dry_run: bool) -> Result<i32> {
         .into_iter()
         .filter(|(p, dir)| root.join(join(dir, p.manifest())).is_file())
         .filter(|(p, dir)| !listed.iter().any(|(n, d)| n == p.name() && d == dir))
+        .filter(|(p, dir)| !cfg.ignore.iter().any(|i| i.covers(p.name(), dir)))
         .map(|(p, dir)| (p.name(), dir))
         .collect();
     if missing.is_empty() {
-        outln!("nothing to add: every tracked lockfile is in a [[clone]] of {FILE}");
+        outln!(
+            "nothing to add: every tracked lockfile is in a [[clone]] or an [[ignore]] of {FILE}"
+        );
         return Ok(0);
     }
     let mut doc: toml_edit::DocumentMut = text
@@ -113,6 +117,9 @@ pub enum Problem {
     Unlisted { lockfile: String, preset: String },
     /// A file a `[[clone]]` needs that is not there.
     Missing { entry: usize, file: String },
+    /// An `[[ignore]]` whose directory has no tracked lockfile (of its
+    /// preset, when it names one).
+    IgnoredMissing { entry: usize, what: String },
 }
 
 impl std::fmt::Display for Problem {
@@ -126,6 +133,9 @@ impl std::fmt::Display for Problem {
             ),
             Problem::Missing { entry, file } => {
                 write!(f, "missing    clone[{entry}]: {file} does not exist")
+            }
+            Problem::IgnoredMissing { entry, what } => {
+                write!(f, "missing    ignore[{entry}]: no tracked {what}")
             }
         }
     }
@@ -154,7 +164,17 @@ pub fn problems(
         out.extend(errors.into_iter().map(Problem::Invalid));
     }
     let listed = listed(&cfg);
+    for (i, ig) in cfg.ignore.iter().enumerate() {
+        if let Some((_, d)) = listed.iter().find(|(n, d)| ig.covers(n, d)) {
+            out.push(Problem::Invalid(format!(
+                "ignore[{i}]: `{d}` is also in a [[clone]]; leave it in one of them"
+            )));
+        }
+    }
     for (preset, dir) in tracked {
+        if cfg.ignore.iter().any(|i| i.covers(preset, dir)) {
+            continue;
+        }
         if !listed.iter().any(|(n, d)| n == preset && d == dir) {
             let lockfile = crate::ecosystem::preset(preset)
                 .map_or_else(String::new, |p| join(dir, p.manifest()));
@@ -179,6 +199,16 @@ pub fn problems(
             out.push(Problem::Missing { entry: i, file: f });
         }
     }
+    for (i, ig) in cfg.ignore.iter().enumerate() {
+        if !tracked.iter().any(|(p, d)| ig.covers(p, d)) {
+            let dir = target::normalize(&ig.dir);
+            let what = match ig.preset.as_deref().and_then(crate::ecosystem::preset) {
+                Some(p) => join(&dir, p.manifest()),
+                None => format!("lockfile in {dir}"),
+            };
+            out.push(Problem::IgnoredMissing { entry: i, what });
+        }
+    }
     Some(out)
 }
 
@@ -199,7 +229,8 @@ pub fn check() -> Result<i32> {
     };
     if found.is_empty() {
         outln!(
-            "config ok: every tracked lockfile is in a [[clone]], and every file they name exists"
+            "config ok: every tracked lockfile is in a [[clone]] or an [[ignore]], \
+             and every file they name exists"
         );
         return Ok(0);
     }
@@ -301,6 +332,59 @@ path = "app/.dart_tool"
                 entry: 0,
                 file: "api/package-lock.json".into()
             }]
+        );
+    }
+
+    #[test]
+    fn ignored_projects_are_not_unlisted_and_must_exist() {
+        let text = r#"
+[[clone]]
+preset = "npm"
+dir = "api"
+
+[[ignore]]
+dir = "docs-site"
+reason = "built in CI only"
+
+[[ignore]]
+dir = "web"
+preset = "bundler"
+reason = "the Ruby side is not used here"
+
+[[ignore]]
+dir = "gone"
+reason = "removed"
+
+[[ignore]]
+dir = "web"
+preset = "dart"
+reason = "no Flutter"
+
+[[ignore]]
+dir = "api"
+reason = "listed too"
+"#;
+        let t = tracked(&[
+            ("npm", "api"),
+            ("npm", "docs-site"),
+            ("bundler", "docs-site"),
+            ("npm", "web"),
+            ("bundler", "web"),
+        ]);
+        let shown: Vec<String> = problems(text, &t, |_| true)
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                "invalid    ignore[4]: `api` is also in a [[clone]]; leave it in one of them",
+                "unlisted   web/package-lock.json (npm) is in no [[clone]]; \
+                 `fast-worktree config init` adds it",
+                "missing    ignore[2]: no tracked lockfile in gone",
+                "missing    ignore[3]: no tracked web/pubspec.lock",
+            ]
         );
     }
 

@@ -49,6 +49,12 @@ change bumps the minor version).
   `BUNDLE_PATH=<path> bundle install` runs and its result is cached. A
   `BUNDLE_PATH` outside the worktree is not cloned: `bundle check`, else
   `bundle install`.
+- `[[ignore]]` in `.fast-worktree.toml` (`dir`, an optional `preset`, and
+  a required `reason`) leaves a project out on purpose: auto-detection
+  skips it, `config init` does not add it, and `config check` does not
+  report its lockfile as unlisted. `config check` reports an `[[ignore]]`
+  whose directory has no tracked lockfile as missing, and one that a
+  `[[clone]]` also lists as invalid.
 
 ## [0.2.1] - 2026-10-27
 

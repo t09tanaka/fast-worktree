@@ -306,10 +306,13 @@ fn resolve_one(e: &CloneEntry) -> std::result::Result<Target, Vec<String>> {
 }
 
 /// What the worktree at `root` gets: the `[[clone]]` entries of `cfg`, or,
-/// without any, the projects [`discover`] finds.
+/// without any, the projects [`discover`] finds, but those `[[ignore]]`
+/// leaves out.
 pub fn targets(root: &Path, cfg: &Config) -> Result<Vec<Target>> {
     if cfg.clone.is_empty() {
-        return discover(root);
+        let mut found = discover(root)?;
+        found.retain(|t| !cfg.ignore.iter().any(|i| i.covers(t.preset.name(), &t.dir)));
+        return Ok(found);
     }
     resolve(&cfg.clone).map_err(|e| Error(format!("{}: {}", crate::hooks::FILE, e.join("; "))))
 }
