@@ -404,8 +404,9 @@ after = ["echo pods ready"]             # optional: after a clone or an install
   preset is (below): from the cache, else from a worktree, else with
   `BUNDLE_PATH=<path> bundle install`. After a clone, `bundle check` runs
   with `BUNDLE_PATH` set to the clone, and a clone it turns down is thrown
-  away. Nothing is rewritten after a clone: the only files with the
-  worktree's path in them are the build logs (`gem_make.out`). A
+  away. Nothing is rewritten after a clone: the worktree's path is only in
+  the build logs (`gem_make.out`) and in the debug information of the
+  compiled extensions, which load from the clone all the same. A
   `BUNDLE_PATH` outside the worktree holds gems every checkout shares:
   nothing is cloned there, `bundle check` decides and `bundle install`
   runs when it fails. `.bundle/config` is usually ignored by git, and
@@ -559,8 +560,7 @@ key_commands = ["rustc -V"]
   current and rebuild the rest. Without an `install`, `target` comes only
   from the cache or another worktree, and `remove` hands it to the next
   worktree.
-- yarn berry, bun and pnpm keep their packages in a store of their own and
-  link them in; cloning their `node_modules` gained little.
+- For yarn berry, bun and pnpm, cloning `node_modules` gained little.
 
 ### Leaving a project out: `[[ignore]]`
 
