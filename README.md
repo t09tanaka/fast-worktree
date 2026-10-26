@@ -42,7 +42,8 @@ and removing the worktree again means deleting tens of thousands of files.
   kept only if `package-lock.json` is byte-identical afterwards and the
   tree matches it; otherwise it is thrown away and `npm ci` runs.
 - **`npm ci` only when nothing matches.** Projects are handled in
-  parallel.
+  parallel; their install scripts, which may write the repository's
+  `.git/config`, [one at a time](#install-scripts).
 - **Flutter and Dart too.** A tracked `pubspec.lock` is a project: `flutter
   pub get --offline` (then online), or `dart pub get` without Flutter.
 - **Ignored files come along.** `.env` and other gitignored files listed
@@ -85,17 +86,24 @@ prompt (as in [`hook create`](#claude-code-hooks)) and is stopped after
 branch starts from origin's default branch as last fetched, with a note on
 stderr; only when there is no such ref does `add` fail. `git worktree add`
 runs with `FAST_WORKTREE_SKIP=1`, so a [post-checkout hook](#post-checkout-hook)
-stays out of the way.
+stays out of the way, and with `--quiet`, so that git's own messages and
+its `Updating files` progress stay out of the output (its errors do not).
 
 ```sh
 fast-worktree install [--root <dir>] [--changed] [<project-dir>...]
 ```
 
 For every tracked `package-lock.json` and `pubspec.lock` (or only the
-given project directories), makes the dependencies present. npm projects:
+given project directories), makes the dependencies present. A project is
+named by its directory (relative to the current directory or to the
+worktree root); `root` names the one at the root (`.`), unless a project
+directory is called `root`, and the last part of a directory alone
+(`lambda` for `provision/lambda`) names it when no other project's
+directory ends the same way (otherwise the error lists them). npm projects:
 from the cache, else from a matching worktree, else incrementally from the
 latest cache entry, else with `npm ci --prefer-offline --no-audit
---no-fund`. Dart projects: `pub get` as above; with neither `flutter` nor
+--no-fund` (without its scripts first, see [install
+scripts](#install-scripts)). Dart projects: `pub get` as above; with neither `flutter` nor
 `dart` installed, a note and nothing else. A project whose dependencies
 are present is skipped; for npm that means `node_modules` has its
 `node_modules/.package-lock.json`, and a `node_modules` without one (an
@@ -137,8 +145,12 @@ changes, and a worktree with submodules. Changes are what `git status
 --porcelain --untracked-files=all --ignore-submodules=none` prints, so
 `status.showUntrackedFiles=no` hides nothing; ignored files do not count,
 and a `git status` that fails counts as changes. With `--delete-branch`, it
-also refuses a branch that `git branch -d` would keep: one not merged into
-its upstream (or into `HEAD` when it has none). And it refuses a worktree
+also refuses a branch whose commit is not reachable from any of its
+upstream, `origin/<default>` and the local `<default>` branch, where
+`<default>` is origin's default branch as `refs/remotes/origin/HEAD`
+records it (nothing is fetched; without that record, the main checkout's
+`HEAD` is used, as `git branch -d` does). So a branch merged on origin can
+be deleted while the main checkout is behind or on another branch. And it refuses a worktree
 that cannot be renamed (its parent directory is not writable, or it is a
 mount point). All of this is decided before any hook runs and before
 anything is removed.
@@ -147,7 +159,8 @@ Otherwise stops the background install of [`hook create`](#claude-code-hooks)
 if one is still running in it (as `hook remove` does), runs the
 `pre_remove` hooks, renames the worktree away, deletes
 its entry under `.git/worktrees/`, deletes the files in the background
-and, with `--delete-branch`, runs `git branch -d`. It does not run `git
+and, with `--delete-branch`, deletes the branch (`git branch -D`, if it is
+still at the commit that was checked). It does not run `git
 worktree prune`, which would also unregister other worktrees that are only
 out of sight, such as one on a volume that is not mounted. If the rename
 still fails after the hooks ran, it says so and exits 1; the worktree stays
@@ -155,12 +168,15 @@ where it was, registered.
 
 ```sh
 fast-worktree cache ls
-fast-worktree cache prune [--older-than <days>]
+fast-worktree cache prune [--older-than <days> | --legacy]
 ```
 
-`ls` lists the cache entries with their repository, project directory, key
-and last use. `prune` moves the entries not used for `<days>` (default 7)
-to the trash.
+`ls` lists the cache entries with their repository, project directory
+(`.` for the root), key and last use. Directories that versions before
+0.2.0 made (a repository's name without the hash), which nothing reads any
+more, are listed apart under `LEGACY`. `prune` moves the entries not used
+for `<days>` (default 7) to the trash, and prints each as `ls` names it;
+`prune --legacy` moves the `LEGACY` directories to the trash instead.
 
 ```sh
 fast-worktree kept ls
@@ -194,9 +210,6 @@ checkout, on an Apple Silicon Mac:
 
 ```console
 $ fast-worktree add ../monorepo-a -b feature/a
-Preparing worktree (new branch 'feature/a')
-branch 'feature/a' set up to track 'origin/main'.
-HEAD is now at e949c07 init
 worktree added in 0.0s
 copy   .env
 npm ci api (0.5s)
@@ -214,9 +227,6 @@ generated from:
 
 ```console
 $ fast-worktree add ../monorepo-b -b feature/b
-Preparing worktree (new branch 'feature/b')
-branch 'feature/b' set up to track 'origin/main'.
-HEAD is now at e949c07 init
 worktree added in 0.0s
 copy   .env
 note   api: postinstall skipped, inputs unchanged
@@ -242,8 +252,6 @@ with `npm install`:
 $ (cd web && npm install --package-lock-only --no-audit --no-fund ms@2.1.2)
 $ git commit -qam "web: ms 2.1.2"
 $ fast-worktree add ../monorepo-c -b feature/c HEAD
-Preparing worktree (new branch 'feature/c')
-HEAD is now at 4cf433c web: ms 2.1.2
 worktree added in 0.0s
 copy   .env
 note   api: postinstall skipped, inputs unchanged
@@ -282,7 +290,7 @@ monorepo-fc34b8e7  web  a1fd1fb4cf620116-v20.13.1  2026-10-26 (0d ago)
 3 entries in ~/Library/Caches/fast-worktree
 $ git -C ../monorepo-a commit -q --allow-empty -m "work in progress"
 $ fast-worktree remove ../monorepo-a --delete-branch
-fast-worktree: branch feature/a is not merged into origin/main, so `git branch -d` would keep it; nothing was removed. Merge it first, or run remove without --delete-branch
+fast-worktree: branch feature/a is not merged into origin/main or main; nothing was removed. Merge it first, or run remove without --delete-branch
 $ fast-worktree remove ../monorepo-b --delete-branch
 hook   pre_remove: echo "bye: $(basename "$FAST_WORKTREE_PATH")"
 bye: monorepo-b
@@ -632,9 +640,6 @@ to `~`:
 
 ```console
 $ echo '{"name":"demo","cwd":"'"$PWD"'"}' | fast-worktree hook create
-Preparing worktree (new branch 'worktree-demo')
-branch 'worktree-demo' set up to track 'origin/main'.
-HEAD is now at 50c46ff move on
 worktree added in 0.0s
 copy   .env
 note   api: postinstall skipped, inputs unchanged
@@ -729,12 +734,42 @@ inside `node_modules`, so the clone carries it. After cloning:
   next `install` does not take a broken tree for an installed one.
 - Those scripts often write the repository's shared `.git/config` (`git
   config core.hooksPath ...`), which git lets only one process write at a
-  time. So every run of a project's own lifecycle (`npm ci`, `npm install`
-  and the scripts above, in any fast-worktree command of the repository)
-  holds a lock, `<cache>/<repo>-<hash>/lifecycle.lock`, and they run one
-  at a time; projects that need `npm ci` are installed one after another.
-  A run that still fails with `could not lock config file` (something
-  else had it) is tried again, at most twice.
+  time, so they run one at a time ([install scripts](#install-scripts)).
+
+## Install scripts
+
+A project's own `preinstall`, `install`, `postinstall` and `prepare`, and
+its dependencies' install scripts (a native addon's build, a tool that
+installs git hooks), may write the repository's shared `.git/config`,
+which git lets only one process write at a time. So every run of them, in
+any fast-worktree command of the repository, holds a lock,
+`<cache>/<repo>-<hash>/lifecycle.lock`, and they run one at a time. The
+downloads do not:
+
+- `npm ci` runs with `--ignore-scripts`, for every project at once. Then,
+  holding the lock, `npm rebuild <names>` runs the install scripts of the
+  dependencies that have one (`hasInstallScript` in
+  `node_modules/.package-lock.json`), and `npm run <script>` the project's
+  own scripts, in npm's order. The tree, `.package-lock.json` included, is
+  the one `npm ci` makes. (A plain `npm rebuild` runs the project's own
+  scripts in another order and leaves out `prepare`.)
+- An incremental install runs `npm install --ignore-scripts`, then the
+  same, for the dependencies that are new or changed only.
+- Until the scripts are done, `node_modules/.fast-worktree-scripts-pending`
+  is there, and the tree does not count as installed (an install that was
+  stopped in between is done again).
+- A lockfile with a git dependency or a link (workspaces), whose scripts
+  npm runs in ways `npm rebuild` does not repeat, gets `npm ci` (or `npm
+  install`) with its scripts, holding the lock. So does a project whose
+  `npm rebuild` failed (an optional dependency whose build fails, which
+  `npm ci` lets pass), with a note.
+- With npm's `ignore-scripts` set (in an `.npmrc` or the environment), no
+  script runs, as with `npm ci`.
+
+The time a step waited for the lock is shown apart from the time it took:
+`clone  . from … (0.3s, waited 4.1s for lifecycle lock)`. A run that still
+fails with `could not lock config file` (something else had it) is tried
+again, at most twice.
 
 ## Platforms
 

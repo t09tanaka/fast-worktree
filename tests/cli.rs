@@ -3473,7 +3473,7 @@ fn everything_works_with_relative_worktree_paths() {
     assert_eq!(w.git(&main, &["worktree", "prune", "-n", "-v"]), "");
 }
 
-// ---- v0.2.1 ----
+// ---- after 0.2.0 ----
 
 impl World {
     /// Run fast-worktree on a pseudo-terminal (`script`), where git shows

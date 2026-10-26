@@ -61,7 +61,8 @@ enum Cmd {
         /// since the last install
         #[arg(long)]
         changed: bool,
-        /// Only these project directories
+        /// Only these projects: a directory, `root` for the one at the
+        /// root, or the last part of a directory when only one ends so
         projects: Vec<String>,
         /// Run as the background install of `hook create`
         #[arg(long, hide = true)]
@@ -84,7 +85,8 @@ enum Cmd {
     /// Remove a clean worktree, deleting its files in the background
     Remove {
         path: PathBuf,
-        /// Also delete its branch with `git branch -d`
+        /// Also delete its branch, when it is merged into its upstream,
+        /// origin's default branch or the local default branch
         #[arg(long)]
         delete_branch: bool,
     },
