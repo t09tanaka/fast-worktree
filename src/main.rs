@@ -120,7 +120,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
-    /// Show where each target's files would come from, changing nothing
+    /// Show where each target's files would come from. Installs nothing,
+    /// but runs the key_commands and verify
     Plan {
         /// An existing worktree (default: a new one with the files of the
         /// current worktree)
@@ -138,7 +139,12 @@ enum ConfigCmd {
     },
     /// Exit 1 when a tracked lockfile is in no [[clone]], a [[clone]]
     /// names a file that does not exist, or the file has a mistake
-    Check,
+    Check {
+        /// Check what is staged (the index), not the files on disk: for a
+        /// pre-commit hook
+        #[arg(long)]
+        staged: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -258,7 +264,7 @@ fn main() {
         Cmd::Wait { path } => cmd::hook::wait(path.as_deref()),
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Init { dry_run } => cmd::config::init(dry_run),
-            ConfigCmd::Check => cmd::config::check(),
+            ConfigCmd::Check { staged } => cmd::config::check(staged),
         },
         Cmd::Plan { path } => cmd::plan::run(path.as_deref()),
     };

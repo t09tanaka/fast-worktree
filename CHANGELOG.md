@@ -5,6 +5,27 @@ based on [Keep a Changelog](https://keepachangelog.com/), and this project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking
 change bumps the minor version).
 
+## [0.3.1] - 2026-10-27
+
+### Added
+
+- `config check --staged` checks what the next commit has, for a
+  pre-commit hook: `.fast-worktree.toml` is read from the index, and a file
+  exists when it is in the index. A partly staged commit (a new lockfile
+  without its `[[clone]]`, or a `[[clone]]` whose lockfile is not staged)
+  no longer passes because the files on disk are complete.
+
+### Changed
+
+- `config check` says why it has nothing to report: without any
+  `[[clone]]` (the projects are detected, so no lockfile is unlisted), or
+  without a `.fast-worktree.toml`. It used to exit 0 without a word.
+- `plan --help` says that `plan` runs the `key_commands` and `verify`, as
+  the README does, instead of "changing nothing".
+- The README says that the `dart` preset never clones `.dart_tool`, and why.
+- The pre-commit example uses `--staged`, and shows how to take the exit
+  code under `sh -e` (husky): with `|| rc=$?`, not `; rc=$?`.
+
 ## [0.3.0] - 2026-10-27
 
 ### Added
