@@ -11,7 +11,7 @@ fast-worktree remove ../app-feature             # gone at once, deleted in the b
 fast-worktree pool status                       # worktrees made ahead of time, if you want them
 fast-worktree hook print-config                 # Claude Code's worktrees, made by fast-worktree
 fast-worktree plan                              # where each project's files would come from
-fast-worktree config check                      # every lockfile listed in .fast-worktree.toml?
+fast-worktree config check [--staged]           # every lockfile listed in .fast-worktree.toml?
 ```
 
 ## What & why
@@ -392,7 +392,10 @@ after = ["echo pods ready"]             # optional: after a clone or an install
   tree check against `node_modules/.package-lock.json`, the project's own
   install scripts after a clone, `skip_lifecycle`). `dart` is a `pub get`
   as above, with `path = "<dir>/.dart_tool"` and `key =
-  ["<dir>/pubspec.lock"]`. `bundler` is below. `dir` defaults to `.`, the
+  ["<dir>/pubspec.lock"]`; it never clones `.dart_tool`: the packages live
+  in pub's shared cache, so `pub get --offline` is quick, and most of
+  `.dart_tool` is build output that holds the path of the worktree it was
+  made in. `bundler` is below. `dir` defaults to `.`, the
   root.
 - **`bundler`** gets `key = ["<dir>/Gemfile.lock"]` and `key_commands =
   ["ruby -v", "ruby -e 'print RUBY_PLATFORM'"]`: native extensions are
@@ -627,7 +630,7 @@ check` from reporting it and `config init` from adding it.
 
 ```sh
 fast-worktree config init [--dry-run]
-fast-worktree config check
+fast-worktree config check [--staged]
 ```
 
 `config init` adds a `[[clone]]` with its preset for each tracked lockfile
@@ -655,9 +658,17 @@ missing). What the file already says, comments included, is kept. With
 It runs a few `git ls-files` (the index, so a lockfile that is only
 staged counts) and looks at which files exist, so it is quick enough for
 a pre-commit hook. In a repository without any `[[clone]]` it does not
-compare the lockfiles, but still reports the other mistakes; without a
-`.fast-worktree.toml` it exits 0. After a new project was added in the
-example:
+compare the lockfiles, but still reports the other mistakes, and says
+that the projects are detected; without a `.fast-worktree.toml` it says
+so and exits 0.
+
+With `--staged`, it checks what the next commit has: `.fast-worktree.toml`
+is read from the index, and a file "exists" when it is in the index. A
+commit that stages a new lockfile but not the `[[clone]]` added for it,
+or the other way round, fails, where the files on disk would pass. What
+fast-worktree would refuse to touch (a symlink out of the worktree,
+tracked files under a `path`) is still looked at on disk. After a new
+project was added in the example:
 
 ```console
 $ mkdir tools && cp web/package.json web/package-lock.json tools/ && git add tools
@@ -672,7 +683,23 @@ manager runs), skipped where fast-worktree is not installed:
 ```sh
 #!/bin/sh
 command -v fast-worktree >/dev/null 2>&1 || exit 0
-exec fast-worktree config check
+exec fast-worktree config check --staged
+```
+
+When the hook goes on after the check, take its exit code with `||`. Some
+hook managers (husky among them) run the file with `sh -e`, where
+`fast-worktree config check --staged; rc=$?` stops the whole hook at the
+failing command, before `rc` is set. A version of fast-worktree without
+`config check --staged` exits 2 (a usage error), which such a hook can
+let through:
+
+```sh
+rc=0
+fast-worktree config check --staged || rc=$?
+if [ "$rc" -eq 1 ]; then
+  exit 1
+fi
+# 2: an older fast-worktree that does not know the command; go on
 ```
 
 In CI (GitHub Actions):

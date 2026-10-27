@@ -13,13 +13,18 @@
 //! no `[[ignore]]`, a `[[clone]]` names a file that is not there or not
 //! tracked, or an `[[ignore]]` names a directory without a tracked
 //! lockfile. Without any `[[clone]]` (targets are detected) the lockfiles
-//! are not compared, but the rest is checked.
+//! are not compared, but the rest is checked, and it says so. With
+//! `--staged`, the file and which files exist come from the index, so that
+//! a pre-commit hook checks what is committed, not what is on disk; what
+//! `install` would refuse (symlinks, tracked files under a `path`) is still
+//! looked at on disk.
 
 use crate::ecosystem::target::{self, join, Target};
 use crate::error::{bail, Error, Result};
 use crate::hooks::{self, FILE};
 use crate::util::outln;
 use crate::{git, util};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 fn root_here() -> Result<PathBuf> {
@@ -277,22 +282,51 @@ fn ignored_missing(cfg: &hooks::Config, tracked: &[(&str, String)]) -> Vec<Probl
     out
 }
 
-/// `config check`.
-pub fn check() -> Result<i32> {
+/// Every path in the index.
+fn index_files(root: &Path) -> Result<HashSet<String>> {
+    Ok(git::tracked(root, &[])?.into_iter().collect())
+}
+
+/// `config check [--staged]`.
+pub fn check(staged: bool) -> Result<i32> {
     let root = root_here()?;
-    let text = read(&root.join(FILE))?;
-    // No file: nothing to check, not even git runs.
+    let index = if staged {
+        Some(index_files(&root)?)
+    } else {
+        None
+    };
+    let text = match &index {
+        Some(files) if !files.contains(FILE) => String::new(),
+        Some(_) => git::output(&root, &["cat-file", "blob", &format!(":{FILE}")])?,
+        None => read(&root.join(FILE))?,
+    };
+    let place = if staged { " in the index" } else { "" };
     if text.trim().is_empty() {
+        outln!(
+            "nothing to check: no {FILE}{place}, so every tracked lockfile is a project \
+             (`fast-worktree config init` lists them in [[clone]] entries)"
+        );
         return Ok(0);
     }
     let tracked: Vec<(&str, String)> = target::tracked_lockfiles(&root)?
         .into_iter()
         .map(|(p, d)| (p.name(), d))
         .collect();
-    let exists = |f: &str| root.join(f).is_file();
+    let exists = |f: &str| match &index {
+        Some(files) => files.contains(f),
+        None => root.join(f).is_file(),
+    };
     // One `git ls-files`, by where each file really is (a file through a
-    // symlink is one `check_fs` reports).
+    // symlink is one `check_fs` reports). With the index, what exists is
+    // tracked.
     let in_git = |files: &[String]| -> Vec<String> {
+        if let Some(index) = &index {
+            return files
+                .iter()
+                .filter(|f| index.contains(*f))
+                .cloned()
+                .collect();
+        }
         let real: Vec<(String, String)> = files
             .iter()
             .filter_map(|f| target::real_rel(&root, f).ok().map(|r| (f.clone(), r)))
@@ -315,6 +349,10 @@ pub fn check() -> Result<i32> {
         fs: &fs_check,
     };
     let Some(found) = problems(&text, &tracked, &disk) else {
+        outln!(
+            "config ok: no [[clone]] in {FILE}{place}, so every tracked lockfile is a project \
+             and none is reported as unlisted (`fast-worktree config init` lists them)"
+        );
         return Ok(0);
     };
     if found.is_empty() {

@@ -1,6 +1,6 @@
 [package]
 name = "fast-worktree"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.89"
 description = "Create a git worktree with its dependencies in seconds, and remove it in one"

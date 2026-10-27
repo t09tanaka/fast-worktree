@@ -4622,10 +4622,25 @@ fn config_init_adds_what_is_missing_and_keeps_the_rest() {
 fn config_check_reports_unlisted_lockfiles_missing_files_and_mistakes() {
     let w = World::new();
     let main = w.main();
-    // Detected, not listed: nothing to check.
+    // Without [[clone]]: detected, and it says so.
     let r = w.fw(&main, &["config", "check"]);
     r.assert_ok();
-    assert_eq!(r.out(), "");
+    assert!(
+        r.out()
+            .starts_with("config ok: no [[clone]] in .fast-worktree.toml,"),
+        "{}",
+        r.out()
+    );
+    // No file: nothing to check, and it says so.
+    fs::remove_file(main.join(".fast-worktree.toml")).unwrap();
+    let r = w.fw(&main, &["config", "check"]);
+    r.assert_ok();
+    assert!(
+        r.out()
+            .starts_with("nothing to check: no .fast-worktree.toml,"),
+        "{}",
+        r.out()
+    );
     let write = |s: &str| fs::write(main.join(".fast-worktree.toml"), s).unwrap();
     write("[[clone]]\npreset = \"npm\"\ndir = \"app\"\n");
     let r = w.fw(&main, &["config", "check"]);
@@ -4672,6 +4687,74 @@ fn config_check_reports_unlisted_lockfiles_missing_files_and_mistakes() {
         r.err().contains("clone[0]: path `app/vendor`"),
         "{}",
         r.err()
+    );
+}
+
+#[test]
+fn config_check_staged_reads_the_index() {
+    let w = World::new();
+    let main = w.main();
+    let file = main.join(".fast-worktree.toml");
+    let both =
+        "[[clone]]\npreset = \"npm\"\ndir = \"app\"\n[[clone]]\npreset = \"npm\"\ndir = \"lib\"\n";
+    // Only on disk: nothing in the index to check.
+    w.git(&main, &["rm", "-q", "--cached", ".fast-worktree.toml"]);
+    fs::write(&file, both).unwrap();
+    let r = w.fw(&main, &["config", "check", "--staged"]);
+    r.assert_ok();
+    assert!(
+        r.out()
+            .starts_with("nothing to check: no .fast-worktree.toml in the index,"),
+        "{}",
+        r.out()
+    );
+    // The index has a [[clone]] for app only; the file on disk has both.
+    fs::write(&file, "[[clone]]\npreset = \"npm\"\ndir = \"app\"\n").unwrap();
+    w.git(&main, &["add", ".fast-worktree.toml"]);
+    fs::write(&file, both).unwrap();
+    w.fw(&main, &["config", "check"]).assert_ok();
+    let r = w.fw(&main, &["config", "check", "--staged"]);
+    r.assert_fails();
+    assert_eq!(
+        r.out(),
+        "unlisted   lib/package-lock.json (npm) is in no [[clone]]; \
+         `fast-worktree config init` adds it\n1 problem in .fast-worktree.toml\n"
+    );
+    w.git(&main, &["add", ".fast-worktree.toml"]);
+    w.fw(&main, &["config", "check", "--staged"]).assert_ok();
+    // A key file on disk that is not staged is missing from the commit.
+    fs::write(
+        &file,
+        format!("{both}[[clone]]\npath = \"ios/Pods\"\nkey = [\"ios/Podfile.lock\"]\n"),
+    )
+    .unwrap();
+    fs::create_dir_all(main.join("ios")).unwrap();
+    fs::write(main.join("ios/Podfile.lock"), "PODS: []\n").unwrap();
+    w.git(&main, &["add", ".fast-worktree.toml"]);
+    let r = w.fw(&main, &["config", "check"]);
+    r.assert_fails();
+    assert!(r.out().starts_with("untracked  clone[2]"), "{}", r.out());
+    let r = w.fw(&main, &["config", "check", "--staged"]);
+    r.assert_fails();
+    assert!(
+        r.out()
+            .starts_with("missing    clone[2]: ios/Podfile.lock does not exist"),
+        "{}",
+        r.out()
+    );
+    w.git(&main, &["add", "ios/Podfile.lock"]);
+    w.fw(&main, &["config", "check", "--staged"]).assert_ok();
+    // A lockfile removed from the index only: its [[clone]] names a file
+    // the commit does not have.
+    w.git(&main, &["rm", "-q", "--cached", "lib/package-lock.json"]);
+    w.fw(&main, &["config", "check"]).assert_fails();
+    let r = w.fw(&main, &["config", "check", "--staged"]);
+    r.assert_fails();
+    assert!(
+        r.out()
+            .starts_with("missing    clone[1]: lib/package-lock.json does not exist"),
+        "{}",
+        r.out()
     );
 }
 
