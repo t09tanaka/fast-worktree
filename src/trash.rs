@@ -144,14 +144,37 @@ pub fn can_move(path: &Path) -> Result<(), String> {
 /// not wait for it: it outlives this process and ignores the terminal's
 /// Ctrl-C.
 pub fn spawn_rm(path: &Path) {
-    let _ = Command::new("rm")
-        .arg("-rf")
-        .arg(path)
-        .stdin(Stdio::null())
+    let dir = paths::trash_dir();
+    let lock = fs::create_dir_all(&dir).ok().map(|()| dir.join(".lock"));
+    spawn_rm_queued(path, lock.as_deref());
+}
+
+/// The deleter runs at the lowest CPU priority and, on macOS, behind the
+/// deleters before it (`lockf` on `lock`), across processes. Several
+/// worktrees removed together had their `rm -rf` side by side, each taking a
+/// core, and as many again in fseventsd and the kernel. Only the CPU
+/// priority is lowered: `taskpolicy -b` also throttled the disk, and on a
+/// busy machine deleted a thousand files in two minutes.
+fn spawn_rm_queued(path: &Path, lock: Option<&Path>) {
+    let mut cmd = Command::new("nice");
+    cmd.args(["-n", "19"]);
+    if let (true, Some(lock)) = (cfg!(target_os = "macos"), lock) {
+        cmd.args(["lockf", "-k"]).arg(lock);
+    }
+    cmd.args(["rm", "-rf"]).arg(path);
+    if spawn_detached(cmd).is_err() {
+        let mut rm = Command::new("rm");
+        rm.arg("-rf").arg(path);
+        let _ = spawn_detached(rm);
+    }
+}
+
+fn spawn_detached(mut cmd: Command) -> io::Result<std::process::Child> {
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0)
-        .spawn();
+        .spawn()
 }
 
 /// Delete again whatever an earlier, interrupted deleter left in the trash,
@@ -278,6 +301,25 @@ mod tests {
         if !root {
             assert!(r.unwrap_err().contains("not writable"));
         }
+    }
+
+    #[test]
+    fn queued_deleters_all_finish() {
+        let t = tempfile::tempdir().unwrap();
+        let lock = t.path().join(".lock");
+        let dirs: Vec<_> = (0..8).map(|i| t.path().join(format!("d{i}"))).collect();
+        for d in &dirs {
+            fs::create_dir_all(d.join("sub")).unwrap();
+            fs::write(d.join("sub/f"), "x").unwrap();
+            spawn_rm_queued(d, Some(&lock));
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while dirs.iter().any(|d| d.exists()) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(dirs.iter().all(|d| !d.exists()));
+        // `.lock` is not ours to sweep.
+        assert!(!is_stale(".lock", u64::MAX / 2));
     }
 
     #[test]

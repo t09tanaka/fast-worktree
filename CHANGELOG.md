@@ -5,6 +5,16 @@ based on [Keep a Changelog](https://keepachangelog.com/), and this project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking
 change bumps the minor version).
 
+## [0.3.2] - 2026-11-04
+
+### Changed
+
+- What is moved to the trash is deleted at the lowest CPU priority
+  (`nice -n 19`) and, on macOS, one deletion at a time across processes
+  (`lockf` on `.lock` in the trash). Several worktrees removed together had
+  their `rm -rf` running side by side, each taking a core, and as many again
+  in fseventsd and the kernel, from the builds and tests still running.
+
 ## [0.3.1] - 2026-10-27
 
 ### Added
